@@ -35,6 +35,15 @@ target. Then:
 
 `ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK.
 
+## Releases and CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the tests and builds every target on each push and pull
+request: Linux x86-64 and aarch64, Windows x86-64 and ARM64, macOS (universal `.app`) and Android arm64.
+Pushing a tag such as `v0.2.0` publishes a GitHub release with all binaries and `SHA256SUMS`.
+
+To sign the Android APK with your own key instead of a throw-away debug key, add the repository secrets
+`ANDROID_KEYSTORE_B64` (base64 of the keystore), `ANDROID_KS_PASS` and `ANDROID_KS_ALIAS`.
+
 ## Performance design
 
 - **Streaming directory listing** on a worker thread: the first chunk is painted in ~1 ms; 300,000
