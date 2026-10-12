@@ -1,74 +1,110 @@
-# Archivos
+# filebrowser
 
-Gestor de archivos multiplataforma (Linux / Windows / macOS) en Rust, pensado para carpetas con
-cientos de miles de elementos y miniaturas.
+A fast, lightweight, cross-platform file manager written in Rust with
+[egui](https://github.com/emilk/egui). It runs on Linux, Windows, macOS and Android and is designed to
+stay responsive in folders with hundreds of thousands of entries.
 
-## Compilar y ejecutar
+The application window and package are labelled **Archivos** (Spanish for "files"); the crate, the
+binary and the library are called `filebrowser`. The interface is available in 10 languages
+(English, Spanish, French, German, Portuguese, Italian, Russian, Chinese, Japanese, Korean) and follows
+the system language by default.
 
-    cargo run --release [-- /ruta/inicial]
+## Build and run
 
-## Diseño de rendimiento
+```sh
+cargo run --release [-- /initial/path]
+```
 
-- **Listado en streaming** en un hilo: el primer bloque se pinta en ~1 ms; 300 000 entradas en ~0,25 s.
-- **Orden/filtro sólo sobre índices `u32`** en un hilo aparte; la UI nunca se bloquea.
-- **Cuadrícula/lista virtualizada**: sólo se dibujan las filas visibles (+1 de prefetch).
-- **Miniaturas**: cola "lo visible primero" que se reemplaza cada frame (desplazarse rápido descarta
-  trabajo obsoleto), pool de hilos, JPEG con escalado DCT (1/2–1/8), caché LRU de texturas.
-- **Iconos vectoriales** dibujados con el painter: sin imágenes ni fuentes de iconos.
-- Sin repintado continuo: CPU 0 % en reposo.
+### Windows (cross-compiled from Linux)
 
-## Atajos
+```sh
+cargo install cargo-xwin
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo xwin build --release --target x86_64-pc-windows-msvc
+```
 
-| Tecla | Acción |
+The result is a single self-contained `.exe`.
+
+### Android
+
+Requires the Android SDK (build-tools 34, platform 34), the NDK and the `aarch64-linux-android` Rust
+target. Then:
+
+```sh
+./android/build-apk.sh        # produces target-android/Archivos.apk (signed with the debug key)
+```
+
+`ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK.
+
+## Performance design
+
+- **Streaming directory listing** on a worker thread: the first chunk is painted in ~1 ms; 300,000
+  entries load in ~0.25 s.
+- **Sorting and filtering work on `u32` indices** on a separate thread, so the UI never blocks.
+- **Virtualised grid/list**: only visible rows are drawn (plus one row of prefetch).
+- **Thumbnails**: a "visible first" queue that is replaced every frame (scrolling fast drops stale
+  work), a thread pool, JPEG decoding with DCT downscaling (1/2–1/8) and an LRU texture cache.
+- **Vector icons** drawn with the painter: no image or icon fonts needed.
+- **No continuous repainting**: 0 % CPU at idle.
+
+## Features
+
+- **Views**: icon grid and list. In the list, columns are configurable in *Options → Columns*
+  (modified, size, type, extension, permissions, owner, group, item count, created, last access,
+  octal mode, link target); they can be reordered and hidden columns drop out first on narrow windows.
+- **Tabs** and a **split view** (two panes, side by side or stacked), with the full view saved per tab
+  and restored at startup.
+- **Menu bar / hamburger menu**, **command palette** (`Shift+Space`) and **remappable shortcuts**.
+- **File operations**: copy, move, rename (including batch rename), duplicate, new file/folder, trash
+  (browsable on Linux and Windows) and permanent delete, **undo/redo**, an operation queue with
+  progress, speed, ETA and cancel, and a conflict dialog (replace / keep both / skip; replaced items go
+  to the trash).
+- **Properties** with recursive size computed in the background; name, modification time and
+  permissions can be edited in place.
+- **Tools**: ZIP compress/extract, hashes (MD5, SHA-1, SHA-256), duplicate finder, search in
+  subfolders, "Open with…".
+- **Quick preview** (`Space`) for images, text and video (video needs `ffmpeg`/`ffplay`), optionally in
+  a separate window. Extra thumbnail formats (SVG, HEIC, video…) via `ffmpeg` or ImageMagick when
+  installed.
+- **Integrated terminal** (`F12`) with a real PTY and VT100 emulation (Linux/macOS).
+- **Network locations** (Linux): connect to SMB/SFTP/FTP/WebDAV servers through gvfs, choose which
+  share to mount, and unmount from the sidebar.
+- **System icon theme** (freedesktop on Linux, Shell on Windows) or built-in vector icons.
+- **Light/dark theme** that follows the system, with a smooth transition when switching.
+- **Android**: touch-first UI with safe-area handling, a phone layout, long-press context menus,
+  corner-tap selection and single-tap open (configurable on every platform).
+- **Hidden files**: toggle them, and names listed in a folder's `.hidden` file are hidden too.
+
+## Keyboard shortcuts
+
+| Key | Action |
 |---|---|
-| Espacio | Vista rápida (←/→ navegan, Esc/Espacio cierran, Enter abre) |
-| Enter / doble clic | Abrir |
-| Retroceso, Alt+↑ | Subir · Alt+←/→ atrás/adelante |
-| F2 | Renombrar · Supr papelera · Mayús+Supr borrar |
-| Ctrl+C/X/V | Copiar/cortar/pegar · Ctrl+A seleccionar todo |
-| Ctrl+L | Editar ruta · Ctrl+F filtrar · Ctrl+D marcador |
-| Ctrl+H | Ocultos · Ctrl+Mayús+N nueva carpeta · F5 actualizar |
-| Teclear | Salta al primer nombre que empiece por lo escrito |
+| `Space` | Quick preview (←/→ navigate, `Esc`/`Space` close, `Enter` opens) |
+| `Enter` / double click | Open |
+| `Backspace`, `Alt+↑` | Parent folder · `Alt+←/→` back/forward |
+| `F2` | Rename · `Del` trash · `Shift+Del` delete permanently |
+| `Ctrl+C/X/V` | Copy/cut/paste · `Ctrl+A` select all |
+| `Ctrl+L` | Edit path · `Ctrl+F` filter · `Ctrl+D` bookmark |
+| `Ctrl+H` | Hidden files · `Ctrl+Shift+N` new folder · `F5` refresh |
+| `Ctrl+B` | Show/hide the sidebar |
+| `Ctrl+T` / `Ctrl+W` | New / close tab · `Ctrl+Tab` switch · `Ctrl+Shift+T` reopen |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `F9` | Split view · `Tab` switch pane · `F6`/`F7` copy/move to the other pane |
+| `F12` | Terminal |
+| Type a name | Jump to the first entry starting with it |
 
-Arrastra elementos sobre una carpeta o sobre la barra lateral para moverlos; arrastra en vacío
-para selección por lazo.
+Drag items onto a folder or onto the sidebar to move them; drag on empty space for a rubber-band
+selection. Dropping files from another application onto the window copies them to the current folder.
 
-## Novedades
+## Known limitations
 
-- **Menú** (Archivo / Editar / Ver / Ir / Herramientas / Ayuda) con las operaciones habituales: nuevo archivo, duplicar, renombrar en lote, propiedades (tamaño recursivo en segundo plano), comprimir/extraer ZIP, buscar en subcarpetas, opciones.
-- **Pestañas**: `Ctrl+T` nueva, `Ctrl+W` cerrar, `Ctrl+Tab` / `Ctrl+Mayús+Tab` cambiar, clic central para cerrar.
-- **Iconos del sistema** (tema de iconos freedesktop en Linux, Shell en Windows; en macOS se usan los vectoriales). Se desactivan en Opciones.
-- **Terminal integrada** opcional en la parte inferior (`F12` o `Ctrl+\``): PTY real + emulación VT100.
-- La sección **Marcadores** sólo aparece si hay marcadores.
-- Miniaturas: rotación EXIF, SVG, vídeo/HEIC y otros formatos mediante `ffmpeg` o ImageMagick si están instalados.
-- Fechas en hora local con segundos.
-- **Soltar archivos** desde otra aplicación sobre la ventana los copia a la carpeta actual.
-- **Portapapeles de archivos** compatible con otros gestores en Linux si hay `wl-copy`/`xclip` (`wl-paste`/`xclip` para pegar; con sólo archivos en el portapapeles hay que usar el menú «Pegar», porque Ctrl+V del sistema sólo llega con texto).
+- Dragging files **out** of the application into other apps is not supported on Linux (winit does not
+  provide a drag source). Use copy and paste instead.
+- On Windows and macOS, the file clipboard shared with other apps is not implemented (only paths as
+  text). On Linux it needs `wl-copy`/`xclip`.
+- Network locations rely on gvfs and are Linux-only.
+- The Windows and macOS builds have received much less testing than Linux and Android.
 
-### Limitaciones conocidas
+## License
 
-- **Arrastrar archivos desde la aplicación hacia otras apps** no está soportado (winit no ofrece origen de arrastre y soltar en Linux). Alternativa: copiar y pegar.
-- En Windows/macOS el portapapeles de archivos con otras apps no está implementado (sólo texto con rutas).
-- La compilación para Windows se ha comprobado con `cargo check`; no se ha ejecutado en Windows ni macOS.
-
-## Novedades (v3)
-
-- **Barra de título integrada** con botones de ventana propios (opción para usar la nativa).
-- **Menú hamburguesa** (☰, F10) con todas las funciones en submenús; se puede ocultar desde el propio menú u Opciones.
-- **Pestañas**: la barra solo aparece con 2 o más; Ctrl+T crea la nueva pestaña junto a la actual.
-- **Reproductor de vídeo** integrado (requiere `ffmpeg` y `ffplay` en el PATH): Espacio/Enter reproduce o pausa, ←/→ salta 5 s, barra de búsqueda.
-- **Idiomas**: español, inglés, francés, alemán, portugués, italiano, ruso, chino, japonés y coreano; «Usar el idioma del sistema» en Opciones. Árabe e hindi no se incluyen porque egui no soporta aún RTL/shaping. CJK usa una fuente del sistema.
-
-## Novedades (v4)
-
-- **Ventana con esquinas redondeadas** (transparente; se desactiva al maximizar o con barra nativa).
-- **`.hidden`**: los nombres listados en un archivo `.hidden` de la carpeta se ocultan.
-- **Deshacer / rehacer** (Ctrl+Z / Ctrl+Y): renombrar, mover, copiar, crear, papelera, ZIP.
-- **Cola de operaciones** con botón Cancelar y **diálogo de conflictos** (reemplazar / mantener ambos / omitir; lo reemplazado va a la papelera).
-- **Abrir con…**, **papelera navegable** (Ir → Papelera; Linux y Windows), **hash** MD5/SHA-1/SHA-256, **buscador de duplicados**.
-- **Autocompletado de ruta** (Tab, ↑/↓, clic), **clic central** abre carpeta en pestaña nueva, **Ctrl+Mayús+T** reabre pestaña, **restaurar pestañas** al iniciar, **Nueva ventana** (Ctrl+N).
-- Vista dividida (F9): dos paneles, lado a lado o apilados; cada pestaña guarda su vista completa (una o dos carpetas) y su título suma ambos nombres («A | B»).
-- Paleta de comandos (Mayús+Espacio) y atajos reasignables.
-- Ajustes de vista (rueda dentada, a la derecha): ordenar, mostrar ocultos y tema.
-
-- **Visor en ventana aparte** (opcional): Opciones → "Abrir el visor en una ventana aparte". La ventana es independiente, redimensionable y admite las mismas teclas (Espacio/Esc, flechas, Enter, O).
+MIT — see [LICENSE](LICENSE).
