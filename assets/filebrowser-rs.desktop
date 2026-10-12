@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Archivos
+Comment=Gestor de archivos rápido y ligero
+Exec=filebrowser-rs %U
+Icon=filebrowser-rs
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+StartupWMClass=filebrowser-rs

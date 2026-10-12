@@ -1,0 +1,49 @@
+[package]
+name = "filebrowser"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "filebrowser"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "filebrowser"
+path = "src/main.rs"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = { version = "0.36.2", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png", "gif", "webp", "bmp"] }
+jpeg-decoder = "0.3.2"
+md-5 = "0.11.0"
+portable-pty = "0.9.0"
+resvg = { version = "0.48.1", default-features = false }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+vt100 = "0.16.2"
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 2
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+trash = "5.2.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "android-native-activity", "default_fonts"] }
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+log = "0.4"
+jni = "0.21"

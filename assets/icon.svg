@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3f7bea"/>
+      <stop offset="1" stop-color="#2d63cc"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b6d3fb"/>
+      <stop offset="1" stop-color="#86b3f2"/>
+    </linearGradient>
+  </defs>
+  <!-- parte trasera con la pestaña -->
+  <path d="M8 56c0-27 21-48 48-48h140c15 0 28 6 37 17l24 29h199c27 0 48 21 48 48v60H8z" fill="url(#back)"/>
+  <!-- hoja asomando -->
+  <rect x="48" y="92" width="416" height="170" rx="14" fill="#f4f7fd"/>
+  <!-- frente -->
+  <path d="M8 176c0-27 21-48 48-48h400c27 0 48 21 48 48v280c0 27-21 48-48 48H56c-27 0-48-21-48-48z" fill="url(#front)"/>
+  <rect x="8" y="176" width="496" height="14" rx="7" fill="#ffffff" opacity=".35"/>
+</svg>
