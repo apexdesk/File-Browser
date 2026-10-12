@@ -26,5 +26,5 @@ if [ ! -f "$KS" ]; then
     -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey \
-  --out target-android/Archivos.apk "$OUT/aligned.apk"
-echo "APK: $(pwd)/target-android/Archivos.apk"
+  --out target-android/FileBrowser.apk "$OUT/aligned.apk"
+echo "APK: $(pwd)/target-android/FileBrowser.apk"

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Archivos
+Name=File Browser
 Comment=Gestor de archivos rápido y ligero
 Exec=filebrowser-rs %U
 Icon=filebrowser-rs

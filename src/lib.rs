@@ -23,7 +23,7 @@ fn window_icon() -> egui::IconData {
 
 fn options(cfg: &config::Config) -> eframe::NativeOptions {
     let mut vb = egui::ViewportBuilder::default()
-        .with_title("Archivos")
+        .with_title("File Browser")
         .with_decorations(cfg.native_deco)
         .with_transparent(!cfg.native_deco)
         .with_app_id("filebrowser-rs")
@@ -40,7 +40,7 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
 }
 
 fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result {
-    eframe::run_native("Archivos", opts, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
+    eframe::run_native("File Browser", opts, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
 }
 
 /// Punto de entrada de escritorio.
