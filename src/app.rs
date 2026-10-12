@@ -3489,9 +3489,12 @@ impl App {
         if let Some(u) = connect {
             self.connect_uri(u);
         }
+        #[cfg(target_os = "linux")]
         if let Some(p) = unmount {
             self.unmount(p);
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = unmount;
         if let Some(i) = remove {
             self.cfg.bookmarks.remove(i);
             self.cfg.save();
