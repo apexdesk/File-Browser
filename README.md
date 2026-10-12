@@ -4,8 +4,7 @@ A fast, lightweight, cross-platform file manager written in Rust with
 [egui](https://github.com/emilk/egui). It runs on Linux, Windows, macOS and Android and is designed to
 stay responsive in folders with hundreds of thousands of entries.
 
-The application window and package are labelled **Archivos** (Spanish for "files"); the crate, the
-binary and the library are called `filebrowser`. The interface is available in 10 languages
+The crate, the binary and the library are called `filebrowser`. The interface is available in 10 languages
 (English, Spanish, French, German, Portuguese, Italian, Russian, Chinese, Japanese, Korean) and follows
 the system language by default.
 
@@ -31,7 +30,7 @@ Requires the Android SDK (build-tools 34, platform 34), the NDK and the `aarch64
 target. Then:
 
 ```sh
-./android/build-apk.sh        # produces target-android/Archivos.apk (signed with the debug key)
+./android/build-apk.sh        # produces target-android/FileBrowser.apk (signed with the debug key)
 ```
 
 `ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK.

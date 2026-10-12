@@ -5541,7 +5541,7 @@ impl App {
         let w = (ui.available_width() - btn_w * 3.0 - 4.0).max(10.0);
         let (r, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click_and_drag());
         let title = format!(
-            "{} — Archivos",
+            "{} — File Browser",
             self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.cwd.display().to_string())
         );
         if show_title {
@@ -6675,7 +6675,7 @@ impl App {
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                     .show(ctx, |ui| {
                         ui.set_min_width(300.0);
-                        ui.label(egui::RichText::new(t("Archivos")).size(22.0).strong());
+                        ui.label(egui::RichText::new("File Browser").size(22.0).strong());
                         ui.label(egui::RichText::new(tf("Versión {}", &[&env!("CARGO_PKG_VERSION")])).color(pal.subtle));
                         ui.add_space(8.0);
                         ui.label(t("Gestor de archivos ligero y rápido, escrito en Rust con egui."));
@@ -7207,7 +7207,7 @@ impl eframe::App for App {
 
         // título de ventana
         let title = format!(
-            "{} — Archivos",
+            "{} — File Browser",
             self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.cwd.display().to_string())
         );
         if title != self.last_title {
