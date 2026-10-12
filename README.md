@@ -1,4 +1,4 @@
-# filebrowser
+# File Browser
 
 A fast, lightweight, cross-platform file manager written in Rust with
 [egui](https://github.com/emilk/egui). It runs on Linux, Windows, macOS and Android and is designed to
