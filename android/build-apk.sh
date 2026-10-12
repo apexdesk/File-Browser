@@ -19,12 +19,14 @@ cp assets/icon-512.png "$OUT/res/mipmap-xxxhdpi/ic_launcher.png"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" --manifest android/AndroidManifest.xml "$OUT"/compiled/*.flat
 (cd "$OUT" && zip -q -r base.apk lib)
 "$BT/zipalign" -f -p 4 "$OUT/base.apk" "$OUT/aligned.apk"
-KS=$HOME/.android/debug.keystore
+KS=${ANDROID_KEYSTORE:-$HOME/.android/debug.keystore}
+KS_PASS=${ANDROID_KS_PASS:-android}
+KS_ALIAS=${ANDROID_KS_ALIAS:-androiddebugkey}
 if [ ! -f "$KS" ]; then
   mkdir -p "$HOME/.android"
   keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \
     -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
-"$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey \
+"$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" \
   --out target-android/FileBrowser.apk "$OUT/aligned.apk"
 echo "APK: $(pwd)/target-android/FileBrowser.apk"

@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
+      - run: cargo test --release --lib
+
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { name: linux-aarch64,  os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, os: windows-latest,  target: aarch64-pc-windows-msvc }
+          - { name: macos,          os: macos-latest,     target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}${{ matrix.name == 'macos' && ',x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release --bin filebrowser --target ${{ matrix.target }}
+          mkdir -p stage out
+          cp target/${{ matrix.target }}/release/filebrowser stage/
+          cp assets/filebrowser-rs.desktop LICENSE stage/
+          cp assets/icon-256.png stage/filebrowser-rs.png
+          tar -C stage -czf out/filebrowser-${{ matrix.name }}.tar.gz .
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --bin filebrowser --target ${{ matrix.target }}
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/filebrowser.exe out/filebrowser-${{ matrix.name }}.exe
+
+      - name: Build (macOS universal app bundle)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --bin filebrowser --target aarch64-apple-darwin
+          cargo build --release --bin filebrowser --target x86_64-apple-darwin
+          APP="File Browser.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" out
+          lipo -create -output "$APP/Contents/MacOS/filebrowser" \
+            target/aarch64-apple-darwin/release/filebrowser target/x86_64-apple-darwin/release/filebrowser
+          mkdir icon.iconset
+          sips -z 128 128 assets/icon-512.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256 assets/icon-512.png --out icon.iconset/icon_256x256.png
+          cp assets/icon-512.png icon.iconset/icon_512x512.png
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>File Browser</string>
+            <key>CFBundleDisplayName</key><string>File Browser</string>
+            <key>CFBundleIdentifier</key><string>io.github.apexdesk.filebrowser</string>
+            <key>CFBundleExecutable</key><string>filebrowser</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$(cargo pkgid | sed 's/.*[#@]//')</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict></plist>
+          PLIST
+          codesign --force --deep -s - "$APP"
+          ditto -c -k --keepParent "$APP" out/filebrowser-macos-universal.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filebrowser-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  android:
+    name: Build Android (arm64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - name: Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" "platforms;android-34" "ndk;27.3.13750724"
+          echo "NDK=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
+      - name: Signing key (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "ANDROID_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "ANDROID_KS_PASS=${{ secrets.ANDROID_KS_PASS }}" >> "$GITHUB_ENV"
+            echo "ANDROID_KS_ALIAS=${{ secrets.ANDROID_KS_ALIAS }}" >> "$GITHUB_ENV"
+          fi
+      - run: ./android/build-apk.sh
+      - run: mkdir -p out && cp target-android/FileBrowser.apk out/filebrowser-android-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filebrowser-android-arm64
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build, android]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum filebrowser-* > SHA256SUMS && cat SHA256SUMS
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "File Browser ${tag}" --generate-notes
+          fi
