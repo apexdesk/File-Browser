@@ -10,6 +10,7 @@ use crate::sysicons::SysIcons;
 use crate::terminal::Terminal;
 use crate::theme::{self, Glyph, Pal};
 use crate::thumbs::{Request, Thumbs};
+use crate::system;
 use crate::tools;
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -132,6 +133,8 @@ struct OpenWithDlg {
     path: PathBuf,
     apps: Vec<extras::App>,
     cmd: String,
+    /// Solo el campo de comando (las aplicaciones están en el submenú «Abrir con»).
+    custom_only: bool,
 }
 
 struct TrashDlg {
@@ -180,7 +183,6 @@ enum Dlg {
     /// Lista completa de errores de una operación con varios fallos.
     Errors(Vec<String>),
     /// Programa ejecutable (ELF o script con shebang) al que se ha hecho doble clic.
-    Exec(PathBuf),
     Options,
     About,
     Keys,
@@ -395,6 +397,10 @@ pub struct App {
     cursor: Option<u32>,
     band: Option<Band>,
     drag_items: bool,
+    /// Rutas enviadas por otras invocaciones del programa.
+    inbox: system::Inbox,
+    /// Aplicaciones del submenú «Abrir con» para el último archivo consultado.
+    ow_cache: Option<(PathBuf, Vec<extras::App>)>,
     scroll_to: Option<u32>,
     cols: usize,
     page_rows: usize,
@@ -916,7 +922,27 @@ impl App {
         theme::apply_style(&ctx, &pal, cfg.dark);
         let (load_tx, load_rx) = channel();
         let (sort_tx, sort_rx) = channel();
-        let cli_dir = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
+        // Rutas de la línea de órdenes: carpetas → pestañas; archivos → su carpeta con el archivo seleccionado.
+        let mut cli_dirs: Vec<PathBuf> = Vec::new();
+        let mut cli_select: Vec<String> = Vec::new();
+        for p in system::initial_targets() {
+            if p.is_dir() {
+                if !cli_dirs.contains(&p) {
+                    cli_dirs.push(p);
+                }
+            } else if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                if p.exists() && parent.is_dir() {
+                    if cli_dirs.is_empty() {
+                        cli_select.push(name.to_string_lossy().into_owned());
+                    }
+                    let parent = parent.to_path_buf();
+                    if !cli_dirs.contains(&parent) {
+                        cli_dirs.push(parent);
+                    }
+                }
+            }
+        }
+        let cli_dir = cli_dirs.first().cloned();
         let mut start = cli_dir
             .clone()
             .or_else(|| cfg.last_dir.clone())
@@ -925,6 +951,9 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut tabs_init: Vec<TabState> = Vec::new();
         let mut cur_init = 0;
+        if cli_dirs.len() > 1 {
+            tabs_init = cli_dirs.iter().map(|p| TabState::new(p.clone())).collect();
+        }
         if cli_dir.is_none() && cfg.restore_tabs && (cfg.tabs.len() > 1 || !cfg.tabs2.is_empty()) {
             for (n, p) in cfg.tabs.iter().enumerate() {
                 if !p.is_dir() {
@@ -944,6 +973,7 @@ impl App {
         if tabs_init.is_empty() {
             tabs_init.push(TabState::new(start.clone()));
         }
+        let ctx_for_inbox = ctx.clone();
         let mut app = App {
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
@@ -997,6 +1027,11 @@ impl App {
             cursor: None,
             band: None,
             drag_items: false,
+            inbox: system::listen({
+                let c = ctx_for_inbox;
+                move || c.request_repaint()
+            }),
+            ow_cache: None,
             scroll_to: None,
             cols: 1,
             page_rows: 10,
@@ -1034,7 +1069,7 @@ impl App {
             op: None,
             msg: None,
             confirm_delete: None,
-            pending_select: vec![],
+            pending_select: cli_select,
             pending_rename: false,
             typeahead: (String::new(), Instant::now()),
             vmode: VMode::Dir,
@@ -1678,7 +1713,7 @@ impl App {
         if e.is_dir() {
             self.navigate(p);
         } else if is_program(&p) {
-            self.dlg = Dlg::Exec(p);
+            self.run_program(&p);
         } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text) {
             self.open_preview_at(i);
         } else {
@@ -4654,10 +4689,18 @@ impl App {
                         ui.close();
                     }
                 } else if self.sel_count == 1 {
-                    if ui.button(t("Abrir con…")).clicked() {
-                        self.open_with();
-                        ui.close();
+                    if is_program(&self.cwd.join(&*e.name)) {
+                        let p = self.cwd.join(&*e.name);
+                        if ui.button(t("Ejecutar")).clicked() {
+                            self.run_program(&p);
+                            ui.close();
+                        }
+                        if ui.button(t("Ejecutar en el terminal")).clicked() {
+                            self.run_in_terminal(&p);
+                            ui.close();
+                        }
                     }
+                    self.open_with_menu(ui);
                     if ui.button(t("Calcular hash…")).clicked() {
                         self.open_hash();
                         ui.close();
@@ -5054,12 +5097,30 @@ impl App {
             // la ventana nueva se abre desplazada para que no tape exactamente a la actual
             let pos = self.ctx.input(|i| i.viewport().outer_rect).map(|r| format!("{},{}", r.min.x + 40.0, r.min.y + 40.0));
             let mut cmd = std::process::Command::new(exe);
-            cmd.arg(&self.cwd);
+            cmd.arg("--new-window").arg(&self.cwd);
             if let Some(p) = pos {
                 cmd.env("FB_POS", p);
             }
             let _ = cmd.spawn();
         }
+    }
+
+    /// Abre lo que pidan otras invocaciones: carpetas en pestañas nuevas, archivos en su carpeta.
+    fn drain_inbox(&mut self) {
+        let items: Vec<PathBuf> = std::mem::take(&mut *self.inbox.lock().unwrap());
+        if items.is_empty() {
+            return;
+        }
+        for p in items {
+            if p.is_dir() {
+                self.new_tab(p);
+            } else if let (Some(parent), Some(name)) = (p.parent().map(|x| x.to_path_buf()), p.file_name()) {
+                let name = name.to_string_lossy().into_owned();
+                self.new_tab(parent);
+                self.pending_select = vec![name];
+            }
+        }
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn new_tab(&mut self, path: PathBuf) {
@@ -5343,8 +5404,10 @@ impl App {
                 if mi(ui, t("Vista previa"), t("Espacio"), true) {
                     self.toggle_preview();
                 }
-                if mi(ui, t("Abrir con…"), "", self.sel_count == 1) {
-                    self.open_with();
+                if self.sel_count == 1 {
+                    self.open_with_menu(ui);
+                } else {
+                    ui.add_enabled(false, egui::Button::new(t("Abrir con")));
                 }
                 if mi(ui, t("Propiedades"), "Alt+Enter", true) {
                     self.open_props();
@@ -5882,7 +5945,70 @@ impl App {
             return;
         }
         let apps = extras::apps_for(&path);
-        self.dlg = Dlg::OpenWith(OpenWithDlg { path, apps, cmd: String::new() });
+        self.dlg = Dlg::OpenWith(OpenWithDlg { path, apps, cmd: String::new(), custom_only: false });
+    }
+
+    /// Ejecuta un programa directamente, en su carpeta y sin ventana.
+    fn run_program(&mut self, p: &Path) {
+        let mut c = std::process::Command::new(p);
+        c.current_dir(p.parent().unwrap_or(Path::new("/")))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(e) = c.spawn() {
+            self.say(format!("{}: {e}", t("No se pudo abrir")), true);
+        }
+    }
+
+    /// Ejecuta un programa dentro del terminal integrado.
+    fn run_in_terminal(&mut self, p: &Path) {
+        self.cfg.term_open = true;
+        self.ensure_term();
+        let dir = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let line = format!(
+            "{}'{}'\r",
+            shell_quote(&dir).trim_end_matches('\r').to_string() + " && ",
+            p.display().to_string().replace('\'', "'\\''")
+        );
+        if let Some(t) = &mut self.term {
+            t.send(line.as_bytes());
+            self.term_focus = true;
+        }
+        self.cfg.save();
+    }
+
+    /// Submenú «Abrir con» del archivo seleccionado: aplicaciones asociadas y «Otra aplicación…».
+    fn open_with_menu(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.selected_paths().into_iter().next() else { return };
+        let mut run: Option<usize> = None;
+        let mut other = false;
+        ui.menu_button(t("Abrir con"), |ui| {
+            ui.set_min_width(200.0);
+            if self.ow_cache.as_ref().map(|(p, _)| p != &path).unwrap_or(true) {
+                self.ow_cache = Some((path.clone(), extras::apps_for(&path)));
+            }
+            let apps = &self.ow_cache.as_ref().unwrap().1;
+            for (i, a) in apps.iter().enumerate() {
+                if ui.button(&a.name).clicked() {
+                    run = Some(i);
+                    ui.close();
+                }
+            }
+            if !apps.is_empty() {
+                ui.separator();
+            }
+            if ui.button(t("Otra aplicación…")).clicked() {
+                other = true;
+                ui.close();
+            }
+        });
+        if let Some(i) = run {
+            if let Some((p, apps)) = &self.ow_cache {
+                extras::launch(Some(&apps[i]), "", p);
+            }
+        } else if other {
+            self.dlg = Dlg::OpenWith(OpenWithDlg { path, apps: Vec::new(), cmd: String::new(), custom_only: true });
+        }
     }
 
     fn open_hash(&mut self) {
@@ -6330,62 +6456,6 @@ impl App {
                 }
                 keep = pick.is_none() && !cancel;
             }
-            Dlg::Exec(path) => {
-                let mut act = 0; // 1 ejecutar, 2 terminal, 3 abrir, 4 cancelar
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                egui::Window::new(t("Ejecutar"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(tf("«{}» es un programa ejecutable.", &[&name]));
-                        ui.add_space(8.0);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button(t("Ejecutar")).clicked() {
-                                act = 1;
-                            }
-                            if ui.button(t("Ejecutar en el terminal")).clicked() {
-                                act = 2;
-                            }
-                            if ui.button(t("Abrir")).clicked() {
-                                act = 3;
-                            }
-                            if ui.button(t("Cancelar")).clicked() {
-                                act = 4;
-                            }
-                        });
-                    });
-                if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                    act = 4;
-                }
-                let p = path.clone();
-                match act {
-                    1 => {
-                        let mut c = std::process::Command::new(&p);
-                        c.current_dir(p.parent().unwrap_or(Path::new("/")))
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null());
-                        if let Err(e) = c.spawn() {
-                            self.say(format!("{}: {e}", t("No se pudo abrir")), true);
-                        }
-                    }
-                    2 => {
-                        self.cfg.term_open = true;
-                        self.ensure_term();
-                        let dir = p.parent().unwrap_or(Path::new("/")).to_path_buf();
-                        let line = format!("{}'{}'\r", shell_quote(&dir).trim_end_matches('\r').to_string() + " && ", p.display().to_string().replace('\'', "'\\''"));
-                        if let Some(t) = &mut self.term {
-                            t.send(line.as_bytes());
-                            self.term_focus = true;
-                        }
-                        self.cfg.save();
-                    }
-                    3 => fsys::open_external(&p),
-                    _ => {}
-                }
-                keep = act == 0;
-            }
             Dlg::Rename(old, text) => {
                 let mut act = 0; // 1 aceptar, 2 cancelar
                 egui::Window::new(t("Renombrar"))
@@ -6578,6 +6648,7 @@ impl App {
                 let mut changed = false;
                 let mut theme_change = None;
                 let mut res_sort = false;
+                let mut install_sys = false;
                 egui::Window::new(t("Opciones"))
                     .open(&mut open)
                     .collapsible(false)
@@ -6617,6 +6688,12 @@ impl App {
                         let mut dark = self.cfg.dark;
                         if ui.checkbox(&mut dark, t("Tema oscuro")).changed() {
                             theme_change = Some(dark);
+                        }
+                        if system::can_install() {
+                            ui.add_space(6.0);
+                            if ui.button(t("Usar como gestor de archivos del sistema")).clicked() {
+                                install_sys = true;
+                            }
                         }
                         ui.add_space(6.0);
                         let mut auto = self.cfg.lang == "auto";
@@ -6664,6 +6741,12 @@ impl App {
                 if changed {
                     self.cfg.save();
                 }
+                if install_sys {
+                    match system::install() {
+                        Ok(_) => self.say(t("Registrado como gestor de archivos del sistema").into(), false),
+                        Err(e) => self.say(format!("{}: {e}", t("No se pudo registrar")), true),
+                    }
+                }
                 keep = open;
             }
             Dlg::About => {
@@ -6696,7 +6779,7 @@ impl App {
                         let name = d.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         ui.label(egui::RichText::new(name).strong());
                         ui.add_space(6.0);
-                        if d.apps.is_empty() {
+                        if d.apps.is_empty() && !d.custom_only {
                             ui.label(egui::RichText::new(t("No se encontraron aplicaciones")).color(pal.subtle));
                         }
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -7030,7 +7113,6 @@ impl App {
                         self.start_rename();
                     }
                 }
-                "exec" => self.dlg = Dlg::Exec(PathBuf::from("android/build-apk.sh")),
                 "selmode" => {
                     self.touch = true;
                     self.sel_mode = true;
@@ -7164,6 +7246,7 @@ impl eframe::App for App {
             self.swap_pane();
         }
         self.tick_theme();
+        self.drain_inbox();
         if self.cfg.theme_mode == 0 {
             if let Some(dark) = self.system_dark() {
                 if dark != self.cfg.dark {

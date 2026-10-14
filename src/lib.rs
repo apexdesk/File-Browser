@@ -8,6 +8,7 @@ pub mod i18n;
 pub mod i18n_table;
 pub mod preview;
 pub mod sysicons;
+pub mod system;
 pub mod terminal;
 pub mod theme;
 pub mod tools;
@@ -46,6 +47,9 @@ fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result 
 /// Punto de entrada de escritorio.
 #[cfg(not(target_os = "android"))]
 pub fn run() -> eframe::Result {
+    if let system::Cli::Exit(code) = system::start() {
+        std::process::exit(code);
+    }
     let cfg = config::Config::load();
     run_with(options(&cfg), cfg)
 }
