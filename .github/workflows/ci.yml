@@ -100,6 +100,12 @@ jobs:
             <key>CFBundleExecutable</key><string>filebrowser</string>
             <key>CFBundleIconFile</key><string>icon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleDocumentTypes</key><array><dict>
+              <key>CFBundleTypeName</key><string>Folder</string>
+              <key>CFBundleTypeRole</key><string>Viewer</string>
+              <key>LSHandlerRank</key><string>Alternate</string>
+              <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+            </dict></array>
             <key>CFBundleShortVersionString</key><string>$(cargo pkgid | sed 's/.*[#@]//')</string>
             <key>NSHighResolutionCapable</key><true/>
             <key>LSMinimumSystemVersion</key><string>11.0</string>

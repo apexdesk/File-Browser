@@ -42,6 +42,24 @@ trash = "5.2.9"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Arrastre de archivos hacia otras aplicaciones (Wayland y X11)
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", default-features = false, features = ["client_system"] }
+x11rb = { version = "0.13", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["all"] }
+objc2-app-kit = { version = "0.2", features = ["all"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-core = "0.62"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "android-native-activity", "default_fonts"] }
 android-activity = { version = "0.6.1", features = ["native-activity"] }
