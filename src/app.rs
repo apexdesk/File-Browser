@@ -7789,7 +7789,8 @@ impl eframe::App for App {
             self.term_focus = false;
         }
 
-        if self.cfg.show_sidebar && !phone {
+        // en escritorio, la barra lateral se oculta sola si la ventana queda muy estrecha
+        if self.cfg.show_sidebar && !phone && ctx.content_rect().width() >= 760.0 {
             egui::Panel::left("sidebar")
                 .frame(egui::Frame::new().fill(bgfill).inner_margin(egui::Margin { left: 10, right: 6, top: 2, bottom: 4 }))
                 .default_size(210.0)
