@@ -236,9 +236,10 @@ pub type Inbox = Arc<Mutex<Vec<PathBuf>>>;
 
 /// Empieza a escuchar a otras invocaciones; `wake` despierta a la interfaz.
 #[cfg(all(unix, not(target_os = "android")))]
-pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
+pub fn listen(wake: impl Fn() + Send + Sync + 'static) -> Inbox {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
+    let wake = Arc::new(wake);
     use std::os::unix::net::{UnixListener, UnixStream};
     let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
     let path = socket_path();
@@ -248,6 +249,11 @@ pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
     }
     let _ = std::fs::remove_file(&path);
     let Ok(l) = UnixListener::bind(&path) else { return inbox };
+    #[cfg(target_os = "linux")]
+    {
+        let (q, w) = (inbox.clone(), wake.clone());
+        std::thread::spawn(move || dbus_service(q, w));
+    }
     let q = inbox.clone();
     std::thread::spawn(move || {
         for c in l.incoming() {
@@ -264,6 +270,41 @@ pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
         }
     });
     inbox
+}
+
+/// `org.freedesktop.FileManager1`: es lo que usan navegadores, mensajería y demás para «Mostrar en la carpeta».
+#[cfg(target_os = "linux")]
+fn dbus_service(inbox: Inbox, wake: Arc<dyn Fn() + Send + Sync>) {
+    struct Fm(Inbox, Arc<dyn Fn() + Send + Sync>);
+    impl Fm {
+        fn push(&self, uris: Vec<String>) {
+            let mut g = self.0.lock().unwrap();
+            g.extend(uris.iter().filter_map(|u| parse_target(u)));
+            drop(g);
+            (self.1)();
+        }
+    }
+    #[zbus::interface(name = "org.freedesktop.FileManager1")]
+    impl Fm {
+        fn show_folders(&self, uris: Vec<String>, _startup_id: String) {
+            self.push(uris);
+        }
+        fn show_items(&self, uris: Vec<String>, _startup_id: String) {
+            self.push(uris);
+        }
+        fn show_item_properties(&self, uris: Vec<String>, _startup_id: String) {
+            self.push(uris);
+        }
+    }
+    let Ok(conn) = zbus::blocking::connection::Builder::session()
+        .and_then(|b| b.name("org.freedesktop.FileManager1"))
+        .and_then(|b| b.serve_at("/org/freedesktop/FileManager1", Fm(inbox, wake)))
+        .and_then(|b| b.build())
+    else {
+        return;
+    };
+    // la conexión debe seguir viva mientras dure el proceso
+    std::mem::forget(conn);
 }
 
 #[cfg(windows)]
@@ -376,6 +417,14 @@ pub fn install() -> Result<String, String> {
             .map(|s| s.success())
             .unwrap_or(false)
     };
+    // «Mostrar en la carpeta» de otras aplicaciones (D-Bus FileManager1)
+    let svc = data.join("dbus-1/services");
+    if std::fs::create_dir_all(&svc).is_ok() {
+        let _ = std::fs::write(
+            svc.join("org.freedesktop.FileManager1.service"),
+            format!("[D-BUS Service]\nName=org.freedesktop.FileManager1\nExec=\"{exec}\"\n"),
+        );
+    }
     run("update-desktop-database", &[&apps.display().to_string()]);
     run("gtk-update-icon-cache", &["-q", "-t", &data.join("icons/hicolor").display().to_string()]);
     let ok = run("xdg-mime", &["default", "filebrowser-rs.desktop", "inode/directory"]);
@@ -390,7 +439,7 @@ pub fn install() -> Result<String, String> {
 pub fn uninstall() -> Result<String, String> {
     let data = dirs::data_dir().ok_or("no data directory")?;
     let mut n = 0;
-    for f in [data.join("applications/filebrowser-rs.desktop"), data.join("icons/hicolor/256x256/apps/filebrowser-rs.png")] {
+    for f in [data.join("applications/filebrowser-rs.desktop"), data.join("dbus-1/services/org.freedesktop.FileManager1.service"), data.join("icons/hicolor/256x256/apps/filebrowser-rs.png")] {
         if std::fs::remove_file(&f).is_ok() {
             n += 1;
         }
