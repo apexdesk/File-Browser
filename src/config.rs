@@ -27,6 +27,8 @@ pub struct Config {
     pub preview_window: bool,
     /// Columnas de la vista de lista (aparte del nombre), de izquierda a derecha: date, size, kind.
     pub columns: Vec<String>,
+    /// Anchuras personalizadas de columnas de la lista: (id, ancho).
+    pub col_w: Vec<(String, f32)>,
     /// Abrir con un solo clic/toque; `None` = según la plataforma (sí en Android, no en PC).
     pub single_click: Option<bool>,
     pub split: bool,
@@ -64,6 +66,7 @@ impl Default for Config {
             restore_tabs: true,
             preview_window: true,
             columns: vec!["date".into(), "size".into(), "kind".into()],
+            col_w: Vec::new(),
             single_click: None,
             split: false,
             keys: Vec::new(),
