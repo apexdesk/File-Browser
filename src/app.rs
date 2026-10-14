@@ -437,6 +437,8 @@ pub struct App {
     addr_edit: Option<String>,
     /// al abrir la edición de la ruta (Ctrl+L, clic en las migas) se selecciona todo el texto
     addr_select: bool,
+    /// fotogramas restantes en los que se reaplica «seleccionar todo» (el foco puede tardar o perderse un instante)
+    addr_select_n: u8,
     addr_hl: Option<usize>,
     addr_cache: (String, Vec<String>),
     addr_sugg_rect: Option<Rect>,
@@ -1070,6 +1072,7 @@ impl App {
             bm_drop: false,
             addr_edit: None,
             addr_select: false,
+            addr_select_n: 0,
             addr_hl: None,
             addr_cache: (String::new(), Vec::new()),
             addr_sugg_rect: None,
@@ -3152,6 +3155,9 @@ impl App {
                 return;
             }
             let te = egui::TextEdit::singleline(&mut buf)
+                // id fijo: con el teclado del móvil cambian los márgenes y un id automático podría variar,
+                // perdiendo el foco (y ocultando el teclado) y la selección
+                .id(egui::Id::new("addr_edit"))
                 .font(FontId::proportional(14.0))
                 .desired_width(rect.width() - 8.0)
                 .min_size(vec2(rect.width() - 8.0, rect.height()))
@@ -3166,10 +3172,18 @@ impl App {
                 r.request_focus();
             }
             if std::mem::take(&mut self.addr_select) {
-                let mut st = egui::TextEdit::load_state(ui.ctx(), r.id).unwrap_or_default();
-                let end = egui::text::CCursor::new(buf.chars().count());
-                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
-                st.store(ui.ctx(), r.id);
+                self.addr_select_n = 12;
+            }
+            if self.addr_select_n > 0 {
+                if r.changed() {
+                    self.addr_select_n = 0;
+                } else if r.has_focus() {
+                    self.addr_select_n -= 1;
+                    let mut st = egui::TextEdit::load_state(ui.ctx(), r.id).unwrap_or_default();
+                    let end = egui::text::CCursor::new(buf.chars().count());
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+                    st.store(ui.ctx(), r.id);
+                }
                 ui.ctx().request_repaint();
             }
             let mut sugg_rect = None;
@@ -7382,6 +7396,13 @@ impl App {
 
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if cfg!(target_os = "android") {
+            // Al salir el teclado, Android quita un instante el foco a la ventana. egui sólo pide el
+            // teclado (IME) a un campo de texto si la ventana tiene el foco, así que el teclado se
+            // ocultaba solo y volvía a salir con el texto deseleccionado: se ignora esa pérdida.
+            raw.focused = true;
+            raw.events.retain(|e| !matches!(e, egui::Event::WindowFocused(false)));
+        }
         if std::mem::take(&mut self.release_inject) {
             let pos = self.last_ptr.unwrap_or(Pos2::ZERO);
             raw.events.push(egui::Event::PointerButton {
