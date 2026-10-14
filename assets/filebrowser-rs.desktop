@@ -1,10 +1,18 @@
 [Desktop Entry]
 Type=Application
 Name=File Browser
-Comment=Gestor de archivos rápido y ligero
+GenericName=File Manager
+Comment=Fast, lightweight file manager
+Comment[es]=Gestor de archivos rápido y ligero
 Exec=filebrowser-rs %U
 Icon=filebrowser-rs
 Terminal=false
 Categories=System;FileTools;FileManager;
 MimeType=inode/directory;
 StartupWMClass=filebrowser-rs
+Keywords=files;folders;explorer;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New window
+Exec=filebrowser-rs --new-window
