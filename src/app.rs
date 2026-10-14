@@ -2680,6 +2680,7 @@ const DEFAULT_COLS: [&str; 3] = ["date", "size", "kind"];
 struct PCol {
     def: &'static ColDef,
     right: f32,
+    w: f32,
 }
 
 struct ListCols {
@@ -2689,12 +2690,13 @@ struct ListCols {
 }
 
 /// Columnas visibles según el ancho disponible: entran por prioridad y se colocan en el orden del usuario.
-fn list_cols(w: f32, order: &[String]) -> ListCols {
+fn list_cols(w: f32, order: &[String], widths: &[(String, f32)]) -> ListCols {
+    let cw = |d: &ColDef| widths.iter().find(|(i, _)| i == d.id).map(|(_, v)| v.clamp(40.0, 400.0)).unwrap_or(d.w);
     let mut fit: Vec<&str> = Vec::new();
     let mut used = 16.0;
     for d in COLS {
-        if order.iter().any(|o| o == d.id) && w - (used + d.w + 14.0) >= 170.0 {
-            used += d.w + 14.0;
+        if order.iter().any(|o| o == d.id) && w - (used + cw(d) + 14.0) >= 170.0 {
+            used += cw(d) + 14.0;
             fit.push(d.id);
         }
     }
@@ -2702,8 +2704,9 @@ fn list_cols(w: f32, order: &[String]) -> ListCols {
     let mut cur = 16.0;
     for c in order.iter().rev() {
         if let Some(d) = COLS.iter().find(|d| d.id == c && fit.contains(&d.id)) {
-            cols.push(PCol { def: d, right: cur });
-            cur += d.w + 14.0;
+            let w = cw(d);
+            cols.push(PCol { def: d, right: cur, w });
+            cur += w + 14.0;
         }
     }
     ListCols { cols, reserve: cur.max(8.0) }
@@ -3804,9 +3807,10 @@ impl App {
 
     fn list_header(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal;
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-        let p = ui.painter();
-        let lc = list_cols(rect.width(), &self.cfg.columns);
+        let (full, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+        // misma geometría que las filas (sangría de 6 px a cada lado y 4 px del borde del área)
+        let rect = Rect::from_min_max(pos2(full.left() + 6.0, full.top()), pos2(full.right() - 10.0, full.bottom()));
+        let lc = list_cols(rect.width(), &self.cfg.columns, &self.cfg.col_w);
         let mut cols: Vec<(Option<SortKey>, &str, f32, Align2)> =
             vec![(Some(SortKey::Name), t("Nombre"), rect.left() + 46.0, Align2::LEFT_CENTER)];
         for pc in &lc.cols {
@@ -3814,9 +3818,42 @@ impl App {
             if d.right {
                 cols.push((d.sort, t(d.head), rect.right() - pc.right, Align2::RIGHT_CENTER));
             } else {
-                cols.push((d.sort, t(d.head), rect.right() - pc.right - d.w, Align2::LEFT_CENTER));
+                cols.push((d.sort, t(d.head), rect.right() - pc.right - pc.w, Align2::LEFT_CENTER));
             }
         }
+        // tiradores para cambiar la anchura: borde izquierdo de cada columna
+        let mut set_w: Option<(&'static str, f32)> = None;
+        let mut reset: Option<&'static str> = None;
+        for pc in &lc.cols {
+            let x = rect.right() - pc.right - pc.w - 7.0;
+            let hr = Rect::from_center_size(pos2(x, rect.center().y), vec2(10.0, rect.height() - 6.0));
+            let hr_resp = ui.interact(hr, egui::Id::new(("col_w", pc.def.id, self.live_side)), Sense::click_and_drag());
+            if hr_resp.hovered() || hr_resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ui.painter().line_segment([pos2(x, hr.top() + 4.0), pos2(x, hr.bottom() - 4.0)], Stroke::new(1.5, pal.accent));
+            }
+            if hr_resp.dragged() {
+                set_w = Some((pc.def.id, (pc.w - hr_resp.drag_delta().x).clamp(40.0, 400.0)));
+            }
+            if hr_resp.double_clicked() {
+                reset = Some(pc.def.id);
+            }
+            if hr_resp.drag_stopped() {
+                self.cfg.save();
+            }
+        }
+        if let Some((id, w)) = set_w {
+            match self.cfg.col_w.iter_mut().find(|(i, _)| i == id) {
+                Some(e) => e.1 = w,
+                None => self.cfg.col_w.push((id.to_string(), w)),
+            }
+        }
+        if let Some(id) = reset {
+            self.cfg.col_w.retain(|(i, _)| i != id);
+            self.cfg.save();
+        }
+        let p = ui.painter();
+        let rect = full;
         let ptr = ui.input(|i| i.pointer.hover_pos());
         for (i, (k, label, x, al)) in cols.iter().enumerate() {
             let active = *k == Some(self.cfg.sort);
@@ -4463,7 +4500,7 @@ impl App {
                     }
                     let cy = r.center().y;
                     let name_x = r.left() + 46.0;
-                    let lc = list_cols(r.width(), &self.cfg.columns);
+                    let lc = list_cols(r.width(), &self.cfg.columns, &self.cfg.col_w);
                     let name_w = (r.right() - lc.reserve - name_x).max(40.0);
                     if renaming {
                         let lr = Rect::from_min_size(pos2(name_x - 4.0, r.top() + 2.0), vec2(name_w, r.height() - 4.0));
@@ -4508,11 +4545,11 @@ impl App {
                                 continue;
                             }
                             let mut job = egui::text::LayoutJob::simple_singleline(txt, FontId::proportional(12.5), sub);
-                            job.wrap.max_width = pc.def.w;
+                            job.wrap.max_width = pc.w;
                             job.wrap.max_rows = 1;
                             job.wrap.break_anywhere = true;
                             let g = painter.layout_job(job);
-                            let x = if pc.def.right { r.right() - pc.right - g.size().x } else { r.right() - pc.right - pc.def.w };
+                            let x = if pc.def.right { r.right() - pc.right - g.size().x } else { r.right() - pc.right - pc.w };
                             painter.galley(pos2(x, cy - g.size().y / 2.0), g, sub);
                         }
                     }
