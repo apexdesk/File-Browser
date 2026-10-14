@@ -397,6 +397,13 @@ pub struct App {
     cursor: Option<u32>,
     band: Option<Band>,
     drag_items: bool,
+    /// Arrastre hacia otras aplicaciones (origen de DnD del sistema).
+    dragout: Option<crate::dragout::DragOut>,
+    dragout_tried: bool,
+    /// Tras iniciar el arrastre del sistema, hay que soltar el botón en egui (el compositor se queda el evento).
+    release_inject: bool,
+    last_ptr: Option<Pos2>,
+    ext_dropped: Vec<PathBuf>,
     /// Rutas enviadas por otras invocaciones del programa.
     inbox: system::Inbox,
     /// Aplicaciones del submenú «Abrir con» para el último archivo consultado.
@@ -974,6 +981,8 @@ impl App {
             tabs_init.push(TabState::new(start.clone()));
         }
         let ctx_for_inbox = ctx.clone();
+        #[cfg(target_os = "macos")]
+        let ctx_for_mac = ctx.clone();
         let mut app = App {
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
@@ -1027,6 +1036,11 @@ impl App {
             cursor: None,
             band: None,
             drag_items: false,
+            dragout: None,
+            dragout_tried: false,
+            release_inject: false,
+            last_ptr: None,
+            ext_dropped: Vec::new(),
             inbox: system::listen({
                 let c = ctx_for_inbox;
                 move || c.request_repaint()
@@ -1116,6 +1130,8 @@ impl App {
         if std::env::var("FB_LIST").is_ok() {
             app.cfg.grid = false;
         }
+        #[cfg(target_os = "macos")]
+        system::hook_open_files(app.inbox.clone(), move || ctx_for_mac.request_repaint());
         app.load(start, false);
         let split_dir = if std::env::var_os("FB_SPLIT").is_some() {
             Some(std::env::var_os("FB_SPLIT").map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| app.cwd.clone()))
@@ -1710,7 +1726,9 @@ impl App {
     fn open_index(&mut self, i: u32) {
         let Some(e) = self.entries.get(i as usize) else { return };
         let p = self.cwd.join(&*e.name);
-        if e.is_dir() {
+        if e.is_dir() && cfg!(target_os = "macos") && p.extension().map(|x| x == "app").unwrap_or(false) {
+            fsys::open_external(&p);
+        } else if e.is_dir() {
             self.navigate(p);
         } else if is_program(&p) {
             self.run_program(&p);
@@ -4119,7 +4137,12 @@ impl App {
                 let origin = ui.input(|i| i.pointer.press_origin());
                 let on_item = origin.and_then(|q| hit(q)).is_some();
                 if on_item {
-                    self.drag_items = self.sel_count > 0;
+                    if self.sel_count == 0 {
+                        if let Some(idx) = origin.and_then(|q| hit(q)).and_then(|pos| self.order.get(pos).copied()) {
+                            self.select_only(idx);
+                        }
+                    }
+                    self.drag_items = self.sel_count > 0 || self.sel.iter().any(|&b| b != 0);
                 } else if let Some(o) = origin {
                     self.band = Some(Band { start: o - rect.min, base: if ctrl { self.sel.clone() } else { vec![0; self.sel.len()] } });
                 }
@@ -4962,10 +4985,23 @@ fn is_program(p: &Path) -> bool {
     }
     let mut head = [0u8; 4];
     let Ok(n) = std::fs::File::open(p).and_then(|mut f| f.read(&mut head)) else { return false };
-    n >= 2 && (head[..2] == *b"#!" || head == [0x7f, b'E', b'L', b'F'])
+    n >= 2
+        && (head[..2] == *b"#!"
+            || head == [0x7f, b'E', b'L', b'F']
+            // Mach-O (macOS): 32/64 bits y binarios universales
+            || head == [0xcf, 0xfa, 0xed, 0xfe]
+            || head == [0xce, 0xfa, 0xed, 0xfe]
+            || head == [0xca, 0xfe, 0xba, 0xbe])
 }
 
-#[cfg(not(all(unix, not(target_os = "android"))))]
+/// Windows: ejecutables y scripts de lote.
+#[cfg(windows)]
+fn is_program(p: &Path) -> bool {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "exe" | "bat" | "cmd" | "com") && p.is_file()
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "android")))))]
 fn is_program(_: &Path) -> bool {
     false
 }
@@ -5102,6 +5138,48 @@ impl App {
                 cmd.env("FB_POS", p);
             }
             let _ = cmd.spawn();
+        }
+    }
+
+    /// Arrastre del sistema: al sacar la selección de la ventana pasa a ser un arrastre hacia otras aplicaciones.
+    fn drag_out_tick(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.dragout.is_none() && !self.dragout_tried && !self.touch {
+            self.dragout_tried = true;
+            self.dragout = crate::dragout::DragOut::new(frame, ctx);
+        }
+        let (pos, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+        if pos.is_some() {
+            self.last_ptr = pos;
+        }
+        let outside = pos.map(|p| !ctx.content_rect().contains(p)).unwrap_or(true);
+        let want = self.drag_items && down && outside && self.sel_count > 0;
+        let paths = if want { self.selected_paths() } else { Vec::new() };
+        let Some(d) = self.dragout.as_mut() else { return };
+        d.pump();
+        let mut dropped = d.take_dropped();
+        let done = d.take_done();
+        let mut started = false;
+        if want && !paths.is_empty() && d.start(&paths) {
+            started = true;
+        }
+        if d.active() {
+            ctx.request_repaint_after(Duration::from_millis(10));
+        }
+        self.ext_dropped.append(&mut dropped);
+        if started {
+            self.drag_items = false;
+            self.bm_drop = false;
+            self.side_drop = None;
+            self.release_inject = true;
+            ctx.request_repaint();
+        }
+        if done {
+            self.release_inject = true;
+            self.refresh();
+            ctx.request_repaint();
+        }
+        if !self.ext_dropped.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -5960,8 +6038,23 @@ impl App {
         }
     }
 
-    /// Ejecuta un programa dentro del terminal integrado.
+    /// Ejecuta un programa dentro del terminal integrado (en Windows, en una consola nueva).
     fn run_in_terminal(&mut self, p: &Path) {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", "cmd", "/K"])
+                .arg(p)
+                .current_dir(p.parent().unwrap_or(Path::new("\\")))
+                .spawn();
+            return;
+        }
+        #[cfg(not(windows))]
+        self.run_in_terminal_pty(p);
+    }
+
+    #[cfg(not(windows))]
+    fn run_in_terminal_pty(&mut self, p: &Path) {
         self.cfg.term_open = true;
         self.ensure_term();
         let dir = p.parent().unwrap_or(Path::new("/")).to_path_buf();
@@ -5988,12 +6081,14 @@ impl App {
                 self.ow_cache = Some((path.clone(), extras::apps_for(&path)));
             }
             let apps = &self.ow_cache.as_ref().unwrap().1;
-            for (i, a) in apps.iter().enumerate() {
-                if ui.button(&a.name).clicked() {
-                    run = Some(i);
-                    ui.close();
+            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([true, true]).show(ui, |ui| {
+                for (i, a) in apps.iter().enumerate() {
+                    if ui.button(&a.name).clicked() {
+                        run = Some(i);
+                        ui.close();
+                    }
                 }
-            }
+            });
             if !apps.is_empty() {
                 ui.separator();
             }
@@ -6007,7 +6102,13 @@ impl App {
                 extras::launch(Some(&apps[i]), "", p);
             }
         } else if other {
-            self.dlg = Dlg::OpenWith(OpenWithDlg { path, apps: Vec::new(), cmd: String::new(), custom_only: true });
+            // En Windows, el selector nativo «Abrir con»; en el resto, un campo de comando.
+            #[cfg(windows)]
+            extras::launch(None, "", &path);
+            #[cfg(not(windows))]
+            {
+                self.dlg = Dlg::OpenWith(OpenWithDlg { path, apps: Vec::new(), cmd: String::new(), custom_only: true });
+            }
         }
     }
 
@@ -7234,8 +7335,22 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if std::mem::take(&mut self.release_inject) {
+            let pos = self.last_ptr.unwrap_or(Pos2::ZERO);
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            });
+            raw.events.push(egui::Event::PointerGone);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.drag_out_tick(&ctx, frame);
         let pal = self.pal;
         self.thumbs.pump(&ctx);
         self.sys.begin_frame();
@@ -7355,6 +7470,8 @@ impl eframe::App for App {
                 !i.raw.hovered_files.is_empty(),
             )
         });
+        let mut dropped = dropped;
+        dropped.append(&mut self.ext_dropped);
         if !dropped.is_empty() {
             let dst = self.cwd.clone();
             self.start_copy(dropped, dst, false);

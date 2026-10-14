@@ -153,7 +153,80 @@ fn forward(targets: &[PathBuf]) -> bool {
     s.write_all(&buf).is_ok()
 }
 
-#[cfg(not(all(unix, not(target_os = "android"))))]
+#[cfg(windows)]
+mod win_ipc {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn state_file() -> Option<PathBuf> {
+        dirs::data_local_dir().map(|d| d.join("filebrowser-rs").join("instance"))
+    }
+
+    pub fn forward(targets: &[PathBuf]) -> bool {
+        let Some(txt) = state_file().and_then(|f| std::fs::read_to_string(f).ok()) else { return false };
+        let mut it = txt.split_whitespace();
+        let (Some(port), Some(token)) = (it.next().and_then(|p| p.parse::<u16>().ok()), it.next()) else { return false };
+        let Ok(mut s) = TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(500))
+        else {
+            return false;
+        };
+        let mut buf = format!("{token}\n");
+        for t in targets {
+            buf.push_str(&t.to_string_lossy());
+            buf.push('\n');
+        }
+        s.write_all(buf.as_bytes()).is_ok()
+    }
+
+    pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
+        use std::hash::{BuildHasher, Hasher};
+        let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
+        let Some(file) = state_file() else { return inbox };
+        // ¿otra instancia viva?
+        if let Ok(txt) = std::fs::read_to_string(&file) {
+            if let Some(port) = txt.split_whitespace().next().and_then(|p| p.parse::<u16>().ok()) {
+                if TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(300)).is_ok() {
+                    return inbox;
+                }
+            }
+        }
+        let Ok(l) = TcpListener::bind(("127.0.0.1", 0)) else { return inbox };
+        let Ok(addr) = l.local_addr() else { return inbox };
+        let token = format!("{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish());
+        if let Some(d) = file.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&file, format!("{} {}", addr.port(), token));
+        let q = inbox.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = String::new();
+                if c.read_to_string(&mut buf).is_err() {
+                    continue;
+                }
+                let mut lines = buf.lines();
+                if lines.next() != Some(token.as_str()) {
+                    continue;
+                }
+                let mut g = q.lock().unwrap();
+                g.extend(lines.filter(|l| !l.is_empty()).map(PathBuf::from));
+                drop(g);
+                wake();
+            }
+        });
+        inbox
+    }
+}
+
+#[cfg(windows)]
+fn forward(targets: &[PathBuf]) -> bool {
+    win_ipc::forward(targets)
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "android")))))]
 fn forward(_: &[PathBuf]) -> bool {
     false
 }
@@ -193,9 +266,79 @@ pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
     inbox
 }
 
-#[cfg(not(all(unix, not(target_os = "android"))))]
+#[cfg(windows)]
+pub fn listen(wake: impl Fn() + Send + 'static) -> Inbox {
+    win_ipc::listen(wake)
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "android")))))]
 pub fn listen(_wake: impl Fn() + Send + 'static) -> Inbox {
     Arc::new(Mutex::new(Vec::new()))
+}
+
+// ---------------------------------------------------------------------------
+// macOS: «Abrir con» / soltar sobre el icono llegan como eventos de Apple, no como argumentos
+// ---------------------------------------------------------------------------
+
+/// Añade `application:openFiles:` y `application:openURLs:` al delegado de winit para recibir las
+/// carpetas y archivos que macOS abre con la aplicación ya en marcha.
+#[cfg(target_os = "macos")]
+pub fn hook_open_files(inbox: Inbox, wake: impl Fn() + Send + Sync + 'static) {
+    use objc2::ffi::class_addMethod;
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use objc2::{msg_send, sel};
+    use std::ffi::{c_char, CStr};
+
+    static STATE: OnceLock<(Inbox, Box<dyn Fn() + Send + Sync>)> = OnceLock::new();
+    if STATE.set((inbox, Box::new(wake))).is_err() {
+        return;
+    }
+
+    unsafe fn push(s: *mut AnyObject) {
+        if s.is_null() {
+            return;
+        }
+        let c: *const c_char = unsafe { msg_send![s, UTF8String] };
+        if c.is_null() {
+            return;
+        }
+        let p = PathBuf::from(unsafe { CStr::from_ptr(c) }.to_string_lossy().into_owned());
+        if let Some((q, wake)) = STATE.get() {
+            q.lock().unwrap().push(p);
+            wake();
+        }
+    }
+
+    extern "C" fn open_files(_this: *mut AnyObject, _cmd: Sel, _app: *mut AnyObject, files: *mut AnyObject) {
+        unsafe {
+            let n: usize = msg_send![files, count];
+            for i in 0..n {
+                let s: *mut AnyObject = msg_send![files, objectAtIndex: i];
+                push(s);
+            }
+        }
+    }
+
+    extern "C" fn open_urls(_this: *mut AnyObject, _cmd: Sel, _app: *mut AnyObject, urls: *mut AnyObject) {
+        unsafe {
+            let n: usize = msg_send![urls, count];
+            for i in 0..n {
+                let u: *mut AnyObject = msg_send![urls, objectAtIndex: i];
+                let s: *mut AnyObject = msg_send![u, path];
+                push(s);
+            }
+        }
+    }
+
+    let Some(cls) = AnyClass::get("WinitApplicationDelegate") else { return };
+    let cls = cls as *const AnyClass as *mut AnyClass;
+    type Imp = unsafe extern "C" fn();
+    unsafe {
+        let f: extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject) = open_files;
+        class_addMethod(cls.cast(), sel!(application:openFiles:).as_ptr(), Some(std::mem::transmute::<_, Imp>(f)), c"v@:@@".as_ptr());
+        let g: extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject) = open_urls;
+        class_addMethod(cls.cast(), sel!(application:openURLs:).as_ptr(), Some(std::mem::transmute::<_, Imp>(g)), c"v@:@@".as_ptr());
+    }
 }
 
 // ---------------------------------------------------------------------------

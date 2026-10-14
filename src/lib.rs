@@ -1,6 +1,13 @@
 //! Gestor de archivos ligero (escritorio y Android).
 pub mod app;
 pub mod commands;
+pub mod dragout;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+mod dragout_linux;
+#[cfg(windows)]
+mod dragout_windows;
+#[cfg(target_os = "macos")]
+mod dragout_macos;
 pub mod config;
 pub mod extras;
 pub mod fsys;
