@@ -5291,7 +5291,7 @@ impl App {
             let active = i == self.cur_tab;
             let fill = if active {
                 pal.sel
-            } else if resp.hovered() {
+            } else if resp.hovered() || ui.input(|i| i.pointer.hover_pos()).map_or(false, |q| r.contains(q)) {
                 pal.hover
             } else {
                 pal.surface.gamma_multiply(0.55)
@@ -5318,7 +5318,10 @@ impl App {
                 None => theme::draw_folder(&p, Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(15.0, 15.0))),
             }
             p.text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, title, font.clone(), col);
-            if can_close && (active || resp.hovered()) {
+            let over = ui.input(|i| i.pointer.hover_pos()).map_or(false, |q| r.contains(q));
+            if can_close && (active || over || self.touch) {
+                // no depende de `resp.hovered()` de la pestaña: deja de estar «hovered» al pasar sobre la X,
+                // lo que hacía parpadear el botón y perder los clics en pestañas inactivas
                 let xr = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(20.0, 20.0));
                 let xresp = ui.interact(xr, id.with("x"), Sense::click());
                 if xresp.hovered() {
