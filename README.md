@@ -108,6 +108,7 @@ selection. Dropping files from another application onto the window copies them t
 
 - **Command line**: `filebrowser [-n|--new-window] [PATH...]`. Folders open as tabs; a file opens its folder with the file selected. A second launch forwards its paths to the running instance (use `-n` to force a new window).
 - **Default file manager**: Options → *Use as system file manager*, or `filebrowser --install` / `--uninstall`. Linux registers a `.desktop` entry and `inode/directory`; Windows adds *Open with File Browser* to the folder and folder-background context menus; macOS declares folder document types in the app bundle's `Info.plist`.
+- **Show in folder** (Linux): implements `org.freedesktop.FileManager1`, so browsers, chat apps, etc. open File Browser; `--install` registers the D-Bus activation file.
 - **Drag and drop**: selected items can be dragged out to other applications (Wayland, X11, Windows, macOS) and files dropped from other apps are copied into the current folder. Not available on mobile.
 - **Running files**: double-clicking a program runs it directly; *Open with* is a submenu listing installed applications.
 
