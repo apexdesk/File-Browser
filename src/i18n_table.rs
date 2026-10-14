@@ -36,6 +36,7 @@ pub const TABLE: &[[&str; 10]] = &[
     ["Marcador (Ctrl+D)", "Bookmark (Ctrl+D)", "Marque-page (Ctrl+D)", "Lesezeichen (Strg+D)", "Marcador (Ctrl+D)", "Segnalibro (Ctrl+D)", "Закладка (Ctrl+D)", "书签 (Ctrl+D)", "ブックマーク (Ctrl+D)", "북마크 (Ctrl+D)"],
     ["Favoritos", "Favorites", "Favoris", "Favoriten", "Favoritos", "Preferiti", "Избранное", "收藏夹", "お気に入り", "즐겨찾기"],
     ["Marcadores", "Bookmarks", "Marque-pages", "Lesezeichen", "Marcadores", "Segnalibri", "Закладки", "书签", "ブックマーク", "북마크"],
+    ["Añadir marcador", "Add bookmark", "Ajouter un marque-page", "Lesezeichen hinzufügen", "Adicionar marcador", "Aggiungi segnalibro", "Добавить закладку", "添加书签", "ブックマークを追加", "북마크 추가"],
     ["Quitar marcador", "Remove bookmark", "Supprimer le marque-page", "Lesezeichen entfernen", "Remover marcador", "Rimuovi segnalibro", "Удалить закладку", "移除书签", "ブックマークを削除", "북마크 제거"],
     ["Dispositivos", "Devices", "Périphériques", "Geräte", "Dispositivos", "Dispositivi", "Устройства", "设备", "デバイス", "장치"],
     ["{} elementos", "{} items", "{} éléments", "{} Elemente", "{} itens", "{} elementi", "Элементов: {}", "{} 个项目", "{} 個のアイテム", "항목 {}개"],

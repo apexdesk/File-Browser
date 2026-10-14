@@ -2904,18 +2904,20 @@ impl App {
         });
     }
 
-    /// Barra superior del móvil: lugares, ruta, selección múltiple y menú.
+    /// Barra superior del móvil, en dos líneas: arriba los iconos (favoritos y atrás a la izquierda,
+    /// selección múltiple y menú a la derecha) y debajo sólo la ruta, a todo el ancho.
     fn phone_bar(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal;
         let screen = self.ctx.content_rect();
+        ui.spacing_mut().item_spacing.y = 6.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            // lugares (la antigua barra lateral)
+            // favoritos y lugares (la antigua barra lateral)
             let (r, places) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
             if places.hovered() || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&places)) {
                 ui.painter().rect_filled(r, CornerRadius::same(12), pal.hover);
             }
-            theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Menu, pal.text);
+            theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Bookmark, pal.text);
             egui::Popup::menu(&places).show(|ui| {
                 let w = (screen.width() - 24.0).min(300.0);
                 ui.set_width(w);
@@ -2926,32 +2928,45 @@ impl App {
                     ui.close();
                 }
             });
-            let more_w = 48.0 + 6.0;
-            let w = (ui.available_width() - 2.0 * more_w - 6.0).max(80.0);
-            self.address_bar(ui, w);
-            // selección múltiple
-            let (r, sel) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
-            if sel.hovered() || self.sel_mode {
-                ui.painter().rect_filled(r, CornerRadius::same(12), if self.sel_mode { pal.sel } else { pal.hover });
-            }
-            theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Check, if self.sel_mode { pal.accent } else { pal.text });
-            if sel.clicked() {
-                self.sel_mode = !self.sel_mode;
-                if !self.sel_mode {
-                    self.clear_sel();
-                }
-            }
-            // menú
-            let (r, more) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
-            if more.hovered() || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&more)) {
+            // atrás
+            let can_back = !self.back.is_empty();
+            let (r, back) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+            if can_back && back.hovered() {
                 ui.painter().rect_filled(r, CornerRadius::same(12), pal.hover);
             }
-            theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::More, pal.text);
-            let max_h = (screen.height() - 90.0).max(200.0);
-            egui::Popup::menu(&more).show(|ui| {
-                egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| self.phone_menu(ui));
+            theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Back, if can_back { pal.text } else { pal.subtle.gamma_multiply(0.5) });
+            if can_back && back.clicked() {
+                self.go_back();
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // menú
+                let (r, more) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+                if more.hovered() || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&more)) {
+                    ui.painter().rect_filled(r, CornerRadius::same(12), pal.hover);
+                }
+                theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::More, pal.text);
+                let max_h = (screen.height() - 90.0).max(200.0);
+                egui::Popup::menu(&more).show(|ui| {
+                    egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| self.phone_menu(ui));
+                });
+                // selección múltiple
+                let (r, sel) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+                if sel.hovered() || self.sel_mode {
+                    ui.painter().rect_filled(r, CornerRadius::same(12), if self.sel_mode { pal.sel } else { pal.hover });
+                }
+                theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Check, if self.sel_mode { pal.accent } else { pal.text });
+                if sel.clicked() {
+                    self.sel_mode = !self.sel_mode;
+                    if !self.sel_mode {
+                        self.clear_sel();
+                    }
+                }
             });
         });
+        // segunda línea: sólo la ruta (tocar una carpeta navega; tocar el resto la edita)
+        let w = ui.available_width().max(80.0);
+        self.address_bar(ui, w);
     }
 
     /// Menú del móvil: sólo lo imprescindible.
@@ -2964,6 +2979,11 @@ impl App {
         if menu_row(ui, &pal, lbl, false, None) {
             self.cfg.grid = to_grid;
             self.cfg.save();
+            ui.close();
+        }
+        let bm = self.cfg.bookmarks.contains(&self.cwd);
+        if menu_row(ui, &pal, if bm { t("Quitar marcador") } else { t("Añadir marcador") }, bm, None) {
+            self.toggle_bookmark(self.cwd.clone());
             ui.close();
         }
         if menu_row(ui, &pal, t("Nueva carpeta"), false, None) {
@@ -3040,6 +3060,9 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(vec2(w, if self.phone { 48.0 } else { 34.0 }), Sense::click());
         let p = ui.painter().clone();
         p.rect_filled(rect, CornerRadius::same(10), pal.surface);
+        let rect = if self.phone {
+            rect
+        } else {
         // marcador dentro de la barra, a la derecha
         let bm = self.cfg.bookmarks.contains(&self.cwd);
         let br = Rect::from_center_size(pos2(rect.right() - 20.0, rect.center().y), vec2(30.0, 30.0));
@@ -3057,7 +3080,8 @@ impl App {
         if bresp.on_hover_text(if bm { t("Quitar marcador (Ctrl+D)") } else { t("Añadir marcador (Ctrl+D)") }).clicked() {
             self.toggle_bookmark(self.cwd.clone());
         }
-        let rect = Rect::from_min_max(rect.min, pos2(rect.right() - 38.0, rect.bottom()));
+            Rect::from_min_max(rect.min, pos2(rect.right() - 38.0, rect.bottom()))
+        };
         if self.addr_edit.is_some() {
             let mut buf = self.addr_edit.take().unwrap();
             let sep = std::path::MAIN_SEPARATOR;
@@ -3188,7 +3212,8 @@ impl App {
                 };
                 self.addr_hl = None;
                 self.navigate(PathBuf::from(t));
-            } else if esc || (r.lost_focus() && !in_sugg) {
+            } else if esc || (r.lost_focus() && !in_sugg && (!self.phone || ui.input(|i| i.pointer.any_pressed()))) {
+                // en el móvil el teclado puede quitar el foco al aparecer o recolocarse: sólo se cierra al tocar fuera
                 self.addr_hl = None;
             } else {
                 self.addr_edit = Some(buf);
