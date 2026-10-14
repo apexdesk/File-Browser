@@ -404,6 +404,8 @@ pub struct App {
     release_inject: bool,
     last_ptr: Option<Pos2>,
     ext_dropped: Vec<PathBuf>,
+    /// arrastre/redimensionado de la ventana en curso (Windows): respaldo si el del sistema no responde
+    win_drag: Option<WinDrag>,
     /// Rutas enviadas por otras invocaciones del programa.
     inbox: system::Inbox,
     /// Aplicaciones del submenú «Abrir con» para el último archivo consultado.
@@ -1045,6 +1047,7 @@ impl App {
             release_inject: false,
             last_ptr: None,
             ext_dropped: Vec::new(),
+            win_drag: None,
             inbox: system::listen({
                 let c = ctx_for_inbox;
                 move || c.request_repaint()
@@ -2181,7 +2184,10 @@ impl App {
                 return;
             }
             self.preview_keys(&c);
-            self.resize_edges(&c); // sin marco del sistema: bordes propios para redimensionar
+            if let Some(d) = self.resize_edges(&c) {
+                // sin marco del sistema: bordes propios para redimensionar
+                c.send_viewport_cmd(egui::ViewportCommand::BeginResize(d));
+            }
             let rounded = self.transparent;
             if let Some(pv) = &mut self.preview {
                 if matches!(pv.show(&c, &pal, Some(rounded)), preview::Action::Close) {
@@ -2809,7 +2815,105 @@ fn side_item(ui: &mut egui::Ui, pal: &Pal, g: Glyph, tex: Option<egui::TextureId
     resp
 }
 
+/// Estado de un arrastre de ventana iniciado por nosotros.
+struct WinDrag {
+    /// `None`: mover; `Some`: redimensionar por ese borde
+    dir: Option<egui::ResizeDirection>,
+    cursor0: Pos2,
+    outer0: Rect,
+    inner0: Rect,
+    /// el arrastre del sistema no ha movido la ventana: se mueve a mano
+    manual: bool,
+}
+
+/// Posición del cursor en la pantalla, en puntos (sólo Windows).
+#[cfg(windows)]
+fn screen_cursor(ppp: f32) -> Option<Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p).ok()? };
+    Some(pos2(p.x as f32 / ppp, p.y as f32 / ppp))
+}
+
+#[cfg(not(windows))]
+fn screen_cursor(_ppp: f32) -> Option<Pos2> {
+    None
+}
+
 impl App {
+    /// Pide al sistema mover (`dir == None`) o redimensionar la ventana. En Windows, si el sistema no
+    /// responde (le pasa a algunas instalaciones), `window_drag_tick` lo hace a mano.
+    fn begin_window_drag(&mut self, ctx: &egui::Context, dir: Option<egui::ResizeDirection>) {
+        use egui::ViewportCommand as V;
+        ctx.send_viewport_cmd(match dir {
+            Some(d) => V::BeginResize(d),
+            None => V::StartDrag,
+        });
+        if cfg!(windows) {
+            let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            if let (Some(c), Some(o), Some(inn)) = (screen_cursor(ctx.pixels_per_point()), outer, inner) {
+                self.win_drag = Some(WinDrag { dir, cursor0: c, outer0: o, inner0: inn, manual: false });
+            }
+        }
+    }
+
+    fn window_drag_tick(&mut self, ctx: &egui::Context) {
+        use egui::{ResizeDirection as D, ViewportCommand as V};
+        let Some(wd) = self.win_drag.as_mut() else { return };
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            self.win_drag = None;
+            return;
+        }
+        let Some(cur) = screen_cursor(ctx.pixels_per_point()) else {
+            self.win_drag = None;
+            return;
+        };
+        let d = cur - wd.cursor0;
+        if !wd.manual {
+            let moved = ctx
+                .input(|i| i.viewport().outer_rect)
+                .map(|o| (o.min - wd.outer0.min).length() > 0.5 || (o.size() - wd.outer0.size()).length() > 0.5)
+                .unwrap_or(true);
+            if moved {
+                // el sistema está moviendo/redimensionando la ventana: nada que hacer
+                self.win_drag = None;
+            } else if d.length() > 8.0 {
+                wd.manual = true;
+            }
+            return;
+        }
+        let mut r = wd.outer0;
+        match wd.dir {
+            None => r = r.translate(d),
+            Some(dir) => {
+                let (w, e, n, s) = (
+                    matches!(dir, D::West | D::NorthWest | D::SouthWest),
+                    matches!(dir, D::East | D::NorthEast | D::SouthEast),
+                    matches!(dir, D::North | D::NorthWest | D::NorthEast),
+                    matches!(dir, D::South | D::SouthWest | D::SouthEast),
+                );
+                let (min_w, min_h) = (640.0, 420.0);
+                if w {
+                    r.min.x = (r.min.x + d.x).min(r.max.x - min_w);
+                }
+                if e {
+                    r.max.x = (r.max.x + d.x).max(r.min.x + min_w);
+                }
+                if n {
+                    r.min.y = (r.min.y + d.y).min(r.max.y - min_h);
+                }
+                if s {
+                    r.max.y = (r.max.y + d.y).max(r.min.y + min_h);
+                }
+                let frame = wd.outer0.size() - wd.inner0.size();
+                ctx.send_viewport_cmd(V::InnerSize(r.size() - frame));
+            }
+        }
+        ctx.send_viewport_cmd(V::OuterPosition(r.min));
+        ctx.request_repaint();
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal;
         ui.horizontal(|ui| {
@@ -5755,7 +5859,7 @@ impl App {
             }
         });
         if resp.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            self.begin_window_drag(&ctx, None);
         }
         if resp.double_clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
@@ -5789,13 +5893,13 @@ impl App {
     }
 
     /// Bordes de 5 px para redimensionar la ventana sin decoración.
-    fn resize_edges(&self, ctx: &egui::Context) {
-        use egui::{CursorIcon as C, ResizeDirection as D, ViewportCommand as V};
+    fn resize_edges(&self, ctx: &egui::Context) -> Option<egui::ResizeDirection> {
+        use egui::{CursorIcon as C, ResizeDirection as D};
         if ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)) {
-            return;
+            return None;
         }
         let r = ctx.content_rect();
-        let Some(q) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+        let q = ctx.input(|i| i.pointer.hover_pos())?;
         let m = 5.0;
         let (l, rt, t, b) = (q.x < r.left() + m, q.x > r.right() - m, q.y < r.top() + m, q.y > r.bottom() - m);
         let hit = match (l, rt, t, b) {
@@ -5812,9 +5916,10 @@ impl App {
         if let Some((dir, cur)) = hit {
             ctx.set_cursor_icon(cur);
             if ctx.input(|i| i.pointer.primary_pressed()) {
-                ctx.send_viewport_cmd(V::BeginResize(dir));
+                return Some(dir);
             }
         }
+        None
     }
 
     /// Fila superior: botón de menú (☰), pestañas (si hay más de una), zona de arrastre y botones de ventana.
@@ -7418,6 +7523,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drag_out_tick(&ctx, frame);
+        self.window_drag_tick(&ctx);
         let pal = self.pal;
         self.thumbs.pump(&ctx);
         self.sys.begin_frame();
@@ -7714,7 +7820,9 @@ impl eframe::App for App {
         }
         self.preview_was = pv_open;
         if !self.cfg.native_deco {
-            self.resize_edges(&ctx);
+            if let Some(d) = self.resize_edges(&ctx) {
+                self.begin_window_drag(&ctx, Some(d));
+            }
         }
         self.palette_window(&ctx);
         self.confirm_dialog(&ctx);
