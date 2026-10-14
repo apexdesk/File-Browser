@@ -435,6 +435,8 @@ pub struct App {
     bm_drop: bool,
 
     addr_edit: Option<String>,
+    /// al abrir la edición de la ruta (Ctrl+L, clic en las migas) se selecciona todo el texto
+    addr_select: bool,
     addr_hl: Option<usize>,
     addr_cache: (String, Vec<String>),
     addr_sugg_rect: Option<Rect>,
@@ -1067,6 +1069,7 @@ impl App {
             side_drop: None,
             bm_drop: false,
             addr_edit: None,
+            addr_select: false,
             addr_hl: None,
             addr_cache: (String::new(), Vec::new()),
             addr_sugg_rect: None,
@@ -2238,7 +2241,10 @@ impl App {
                     self.navigate(h);
                 }
             }
-            C::EditPath => self.addr_edit = Some(self.cwd.display().to_string()),
+            C::EditPath => {
+                self.addr_edit = Some(self.cwd.display().to_string());
+                self.addr_select = true;
+            }
             C::Bookmark => self.toggle_bookmark(self.cwd.clone()),
             C::OpenTrash => {
                 if extras::trash_supported() {
@@ -3135,6 +3141,13 @@ impl App {
             if !r.has_focus() && !r.lost_focus() {
                 r.request_focus();
             }
+            if std::mem::take(&mut self.addr_select) {
+                let mut st = egui::TextEdit::load_state(ui.ctx(), r.id).unwrap_or_default();
+                let end = egui::text::CCursor::new(buf.chars().count());
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+                st.store(ui.ctx(), r.id);
+                ui.ctx().request_repaint();
+            }
             let mut sugg_rect = None;
             if !sugg.is_empty() {
                 let hl = self.addr_hl;
@@ -3254,6 +3267,7 @@ impl App {
             self.navigate(path);
         } else if resp.clicked() {
             self.addr_edit = Some(self.cwd.display().to_string());
+            self.addr_select = true;
         }
     }
 
@@ -5620,6 +5634,7 @@ impl App {
                     }
                 }
                 if mi(ui, t("Ir a la ruta…"), "Ctrl+L", true) {
+                    self.addr_select = true;
                     self.addr_edit = Some(self.cwd.display().to_string());
                 }
                 if extras::trash_supported() && mi(ui, t("Papelera"), "", true) {
@@ -7290,7 +7305,10 @@ impl App {
                 "deep" => self.set_deep(true),
                 "searchall" => self.open_search_tab("sub".into(), true),
                 "searchdir" => self.open_search_tab("txt".into(), false),
-                "addr" => self.addr_edit = Some(self.cwd.display().to_string()),
+                "addr" => {
+                    self.addr_edit = Some(self.cwd.display().to_string());
+                    self.addr_select = true;
+                }
                 "tabsplit" => {
                     self.toggle_split();
                     self.ensure_live(1);
