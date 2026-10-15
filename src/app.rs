@@ -464,6 +464,9 @@ pub struct App {
     op_card_hidden: bool,
     /// popup con la pila de tareas (escritorio)
     tasks_open: bool,
+    /// Diálogo «hay tareas en curso» al intentar cerrar; `quit_ok` = ya confirmado.
+    quit_ask: bool,
+    quit_ok: bool,
     /// descripción de la operación en curso
     op_desc: String,
     /// Cambio de tema en curso: paleta de origen y de destino, si es oscuro al final y cuándo empezó.
@@ -1109,6 +1112,8 @@ impl App {
             op_started: Instant::now(),
             op_card_hidden: false,
             tasks_open: false,
+            quit_ask: false,
+            quit_ok: false,
             op_desc: String::new(),
             theme_anim: None,
             undo_stack: Vec::new(),
@@ -3903,6 +3908,13 @@ impl App {
                 if ui.selectable_label(self.cfg.term_open, label).on_hover_text(t("Mostrar/ocultar terminal (F12)")).clicked() {
                     self.toggle_terminal();
                 }
+                if self.cfg.grid {
+                    ui.spacing_mut().slider_width = 130.0;
+                    let r = ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false));
+                    if r.drag_stopped() {
+                        self.cfg.save();
+                    }
+                }
                 if let Some(op) = self.op.clone() {
                     let tot = op.total.load(Ordering::Relaxed).max(1);
                     let d = op.done.load(Ordering::Relaxed).min(tot);
@@ -3921,13 +3933,6 @@ impl App {
                         self.tasks_open = !self.tasks_open;
                     }
                     ui.ctx().set_cursor_icon(if r.hovered() { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default });
-                }
-                if self.cfg.grid {
-                    ui.spacing_mut().slider_width = 130.0;
-                    let r = ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false));
-                    if r.drag_stopped() {
-                        self.cfg.save();
-                    }
                 }
             });
         });
@@ -7053,6 +7058,44 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
+        // cerrar con tareas en curso: se pide confirmación
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && (self.op.is_some() || !self.queue.is_empty()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_ask = true;
+        }
+        if self.quit_ask {
+            let n = self.queue.len() + self.op.is_some() as usize;
+            let mut decision: Option<bool> = None;
+            egui::Window::new(t("Hay tareas en curso"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(tf("Hay {} tarea(s) sin terminar. Si cierras ahora se interrumpirán.", &[&n.to_string()]));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(t("Cerrar de todos modos")).clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button(t("Seguir trabajando")).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                decision = Some(false);
+            }
+            match decision {
+                Some(true) => {
+                    self.quit_ask = false;
+                    self.quit_ok = true;
+                    self.cfg.save();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(false) => self.quit_ask = false,
+                None => {}
+            }
+        }
         let mut dlg = std::mem::replace(&mut self.dlg, Dlg::None);
         let mut keep = true;
         match &mut dlg {
@@ -7892,7 +7935,7 @@ impl App {
                         });
                     });
                 if let Some(f) = trash {
-                    if trash::delete(&f).is_ok() {
+                    if crate::extras::trash_delete(&f).is_ok() {
                         let mut g = d.job.groups.lock().unwrap();
                         for grp in g.iter_mut() {
                             grp.1.retain(|x| *x != f);

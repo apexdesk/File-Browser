@@ -729,7 +729,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                             let t = dst.join(&name);
                             if fs::symlink_metadata(&t).is_ok() {
                                 // El elemento reemplazado va a la papelera para poder recuperarlo.
-                                if let Err(e) = trash::delete(&t) {
+                                if let Err(e) = crate::extras::trash_delete(&t) {
                                     p.errors.lock().unwrap().push(format!("{name}: {e}"));
                                     continue;
                                 }
@@ -777,7 +777,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     if p.cancelled() {
                         break;
                     }
-                    match trash::delete(&it) {
+                    match crate::extras::trash_delete(&it) {
                         Ok(()) => p.pairs.lock().unwrap().push((it.clone(), it.clone())),
                         Err(e) => p.errors.lock().unwrap().push(format!("{}: {e}", it.display())),
                     }
@@ -836,25 +836,37 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
 }
 
 pub fn open_external(path: &Path) {
-    #[cfg(target_os = "linux")]
-    let r = std::process::Command::new("xdg-open").arg(path).spawn();
-    #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        let prog = "xdg-open";
+        #[cfg(target_os = "macos")]
+        let prog = "open";
+        if let Ok(mut c) = std::process::Command::new(prog).arg(path).spawn() {
+            // sin esperar al proceso quedaría zombi
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
+        }
+    }
     #[cfg(windows)]
-    let r = {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(path)
-            .creation_flags(0x0800_0000)
-            .spawn()
-    };
+    {
+        // ShellExecute: respeta la asociación del sistema y no pasa por cmd (&, ^, % en nombres)
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(hwnd: isize, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+        }
+        let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+        let (op, file) = (wide("open".as_ref()), wide(path.as_os_str()));
+        unsafe {
+            ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+        }
+    }
     #[cfg(target_os = "android")]
     let _ = crate::android_open(path);
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "android")))]
-    let r = path;
-    #[cfg(not(target_os = "android"))]
-    let _ = r;
+    let _ = path;
 }
 
 pub fn human_size(n: u64) -> String {
