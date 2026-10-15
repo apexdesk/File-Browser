@@ -118,6 +118,13 @@ fn fmt_secs(s: f64) -> String {
 }
 
 fn load(job: &Job) -> Raw {
+    // archivo de un servidor SFTP: se descarga sólo si es pequeño
+    if !matches!(job.kind, Kind::Folder) && crate::sftp::is_remote(&job.path) {
+        let small = std::fs::metadata(&job.path).map(|m| m.len() <= 32 << 20).unwrap_or(false);
+        if !small || crate::sftp::ensure_local(&job.path).is_err() {
+            return Raw::Binary;
+        }
+    }
     match job.kind {
         Kind::Folder => match std::fs::read_dir(&job.path) {
             Ok(rd) => {

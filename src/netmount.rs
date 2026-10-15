@@ -15,6 +15,7 @@ pub struct Login {
 #[derive(Debug, PartialEq)]
 pub enum Kind {
     Smb,
+    Sftp,
     Dav { tls: bool },
     Unsupported(String),
 }
@@ -52,6 +53,7 @@ pub fn parse(uri: &str) -> Option<Parsed> {
     let (scheme, rest) = uri.split_once("://")?;
     let kind = match scheme.to_lowercase().as_str() {
         "smb" | "cifs" => Kind::Smb,
+        "sftp" | "ssh" => Kind::Sftp,
         "dav" | "http" | "webdav" => Kind::Dav { tls: false },
         "davs" | "https" | "webdavs" => Kind::Dav { tls: true },
         other => Kind::Unsupported(other.to_string()),
@@ -71,6 +73,21 @@ pub fn parse(uri: &str) -> Option<Parsed> {
     }
     let path = parts.filter(|s| !s.is_empty()).map(pct_decode).collect();
     Some(Parsed { kind, host: host.to_string(), port, user, path })
+}
+
+/// SFTP con el `ssh` del sistema (ver `sftp.rs`): devuelve la carpeta espejo del servidor.
+#[cfg(any(windows, target_os = "macos"))]
+fn sftp_connect(l: &Login, p: &Parsed) -> Result<PathBuf, String> {
+    let user = if l.anon { String::new() } else if l.user.is_empty() { p.user.clone().unwrap_or_default() } else { l.user.clone() };
+    let user = if user.is_empty() { std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default() } else { user };
+    let conn = crate::sftp::Conn {
+        host: p.host.clone(),
+        port: p.port,
+        user,
+        pass: if l.pass.is_empty() || l.anon { None } else { Some(l.pass.clone()) },
+    };
+    let path = if p.path.is_empty() { String::new() } else { format!("/{}", p.path.join("/")) };
+    crate::sftp::connect(conn, &path)
 }
 
 #[cfg(windows)]
@@ -114,6 +131,9 @@ mod imp {
 
     pub fn connect(l: &Login) -> Result<PathBuf, String> {
         let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+        if p.kind == Kind::Sftp {
+            return sftp_connect(l, &p);
+        }
         let remote = match &p.kind {
             Kind::Smb => {
                 if p.path.is_empty() {
@@ -137,6 +157,7 @@ mod imp {
                 }
                 s
             }
+            Kind::Sftp => unreachable!(),
             Kind::Unsupported(sc) => return Err(format!("«{sc}» no está disponible en este sistema")),
         };
         // ya accesible (sesión previa): no hace falta reconectar
@@ -206,6 +227,9 @@ mod imp {
 
     pub fn connect(l: &Login) -> Result<PathBuf, String> {
         let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+        if p.kind == Kind::Sftp {
+            return sftp_connect(l, &p);
+        }
         let (url, want) = match &p.kind {
             Kind::Smb => {
                 if p.path.is_empty() {
@@ -224,6 +248,7 @@ mod imp {
                 }
                 (u, p.path.last().cloned().unwrap_or_else(|| p.host.clone()))
             }
+            Kind::Sftp => unreachable!(),
             Kind::Unsupported(sc) => return Err(format!("«{sc}» no está disponible en este sistema")),
         };
         let before = volumes();
@@ -285,7 +310,8 @@ mod tests {
         assert_eq!(p.port, Some(8443));
         assert_eq!(p.user.as_deref(), Some("user"));
         assert_eq!(p.path, vec!["remote.php", "webdav"]);
-        assert!(matches!(parse("sftp://h").unwrap().kind, Kind::Unsupported(_)));
+        assert_eq!(parse("sftp://h").unwrap().kind, Kind::Sftp);
+        assert!(matches!(parse("nfs://h").unwrap().kind, Kind::Unsupported(_)));
         assert!(parse("sin-esquema").is_none());
         assert_eq!(parse("smb://nas/My%20Share").unwrap().path, vec!["My Share"]);
     }

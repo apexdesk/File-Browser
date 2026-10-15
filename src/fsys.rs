@@ -125,6 +125,14 @@ pub fn spawn_load(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
+        // carpeta espejo de un servidor SFTP: se refleja antes de leerla
+        if let Err(e) = crate::sftp::sync_dir(&dir) {
+            if !dir.exists() {
+                let _ = tx.send(LoadMsg::Done(generation, Some(e)));
+                ctx.request_repaint();
+                return;
+            }
+        }
         let rd = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -504,6 +512,10 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// debe convertir una copia correcta en un error.
 fn copy_file(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std::io::Result<()> {
     use std::io::{Read, Write};
+    // archivo de un servidor SFTP: primero se descarga
+    if let Err(e) = crate::sftp::ensure_local_with(src, &prog.cancel, &mut |_| {}) {
+        return Err(std::io::Error::other(e));
+    }
     let mut r = fs::File::open(src)?;
     let md = r.metadata()?;
     let mut w = fs::File::create(dst)?;
@@ -696,6 +708,9 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
         match op {
             Op::Copy { srcs, dst, mv, policy } => {
                 *p.label.lock().unwrap() = t("Calculando…").into();
+                for s in &srcs {
+                    crate::sftp::sync_tree(s);
+                }
                 let costs: Vec<u64> = srcs.iter().map(|s| size_of_tree(s)).collect();
                 p.total.store(costs.iter().sum::<u64>().max(1), AO::Relaxed);
                 let mut buf: Vec<u8> = Vec::new();
@@ -836,6 +851,16 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
 }
 
 pub fn open_external(path: &Path) {
+    // archivo de un servidor SFTP: se descarga y luego se abre
+    if crate::sftp::is_remote(path) && !path.is_dir() {
+        let p = path.to_path_buf();
+        std::thread::spawn(move || {
+            if crate::sftp::ensure_local(&p).is_ok() {
+                open_external(&p);
+            }
+        });
+        return;
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         #[cfg(target_os = "linux")]

@@ -280,7 +280,8 @@ impl Thumbs {
                         st = sh.cv.wait(st).unwrap();
                     }
                 };
-                let out = decode_image(&req.path, THUMB);
+                // los archivos de un servidor SFTP no se descargan sólo para la miniatura
+                let out = if crate::sftp::is_remote(&req.path) { None } else { decode_image(&req.path, THUMB) };
                 if tx.send((req.key, out)).is_err() {
                     return;
                 }

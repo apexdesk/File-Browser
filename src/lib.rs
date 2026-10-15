@@ -17,6 +17,7 @@ pub mod i18n;
 pub mod netmount;
 pub mod i18n_table;
 pub mod preview;
+pub mod sftp;
 pub mod sysicons;
 pub mod system;
 pub mod terminal;
@@ -58,6 +59,8 @@ fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result 
 /// Punto de entrada de escritorio.
 #[cfg(not(target_os = "android"))]
 pub fn run() -> eframe::Result {
+    // `ssh` nos llama como programa de contraseñas (SSH_ASKPASS) para conectar por SFTP
+    sftp::askpass_main();
     if let system::Cli::Exit(code) = system::start() {
         std::process::exit(code);
     }

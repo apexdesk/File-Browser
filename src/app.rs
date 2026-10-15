@@ -1884,6 +1884,9 @@ impl App {
     }
 
     fn commit_rename(&mut self, idx: u32, new: String) {
+        if self.remote_ro(&self.cwd.clone()) {
+            return;
+        }
         let Some(e) = self.entries.get(idx as usize) else { return };
         let old_full = e.name.to_string();
         let old = base_name(&old_full).to_string();
@@ -1913,6 +1916,9 @@ impl App {
     }
 
     fn new_folder(&mut self) {
+        if self.remote_ro(&self.cwd.clone()) {
+            return;
+        }
         let (cwd, name) = (self.cwd.clone(), t("Nueva carpeta").to_string());
         self.say(t("Creando carpeta…").into(), false);
         self.spawn_io(
@@ -1944,7 +1950,28 @@ impl App {
         self.cfg.save();
     }
 
+    /// Los servidores SFTP se reflejan en una carpeta de caché de sólo lectura: nada se escribe ahí.
+    fn remote_ro(&mut self, p: &Path) -> bool {
+        if crate::sftp::is_remote(p) {
+            self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
+            true
+        } else {
+            false
+        }
+    }
+
     fn start_op(&mut self, op: Op, meta: OpMeta) {
+        let remote = |v: &Vec<PathBuf>| v.iter().any(|p| crate::sftp::is_remote(p));
+        let touches = match &op {
+            Op::Copy { srcs, dst, mv, .. } => crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
+            Op::Trash(v) | Op::Delete(v) => remote(v),
+            Op::Zip { srcs, out } => crate::sftp::is_remote(out) || remote(srcs),
+            Op::Unzip { src, dst } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
+        };
+        if touches {
+            self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
+            return;
+        }
         if self.busy() {
             self.queue.push_back((op, meta));
             return;
@@ -7407,6 +7434,7 @@ impl App {
                     let n = name.trim().to_string();
                     if n.is_empty() || n.contains(['/', '\\']) {
                         self.say(t("Nombre no válido").into(), true);
+                    } else if self.remote_ro(&self.cwd.clone()) {
                     } else {
                         let cwd = self.cwd.clone();
                         self.say(t("Creando archivo…").into(), false);
@@ -7497,6 +7525,9 @@ impl App {
                             }
                         });
                     });
+                if act == 1 && self.remote_ro(&self.cwd.clone()) {
+                    act = 2;
+                }
                 if act == 1 {
                     let pairs: Vec<(String, String)> =
                         d.names.iter().cloned().zip(new.iter().cloned()).filter(|(o, n)| o != n).collect();
