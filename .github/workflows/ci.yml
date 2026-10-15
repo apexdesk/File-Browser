@@ -154,10 +154,36 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  flatpak:
+    name: Build Flatpak bundle (x86_64)
+    runs-on: ubuntu-22.04
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: filebrowser-linux-x86_64
+          path: in
+      - name: Install Flatpak and runtime
+        run: |
+          sudo apt-get update && sudo apt-get install -y flatpak
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+      - name: Bundle
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p out
+          flatpak/build.sh in/filebrowser-linux-x86_64.tar.gz "$ver" out/filebrowser-x86_64.flatpak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filebrowser-flatpak-x86_64
+          path: out/*
+          if-no-files-found: error
+
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build, android]
+    needs: [test, build, android, flatpak]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

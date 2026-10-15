@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=File Browser
+GenericName=File Manager
+Comment=Fast, lightweight file manager
+Comment[es]=Gestor de archivos rápido y ligero
+Exec=filebrowser %U
+Icon=io.github.apexdesk.FileBrowser
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+StartupWMClass=io.github.apexdesk.FileBrowser
+Keywords=files;folders;explorer;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New window
+Exec=filebrowser --new-window

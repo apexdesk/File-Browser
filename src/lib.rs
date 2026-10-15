@@ -34,7 +34,8 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
         .with_title("File Browser")
         .with_decorations(cfg.native_deco)
         .with_transparent(!cfg.native_deco)
-        .with_app_id("filebrowser-rs")
+        // dentro de Flatpak el app_id debe coincidir con el ID de la aplicación
+        .with_app_id(std::env::var("FLATPAK_ID").unwrap_or_else(|_| "filebrowser-rs".into()))
         .with_icon(window_icon())
         .with_inner_size([cfg.win.0, cfg.win.1])
         .with_min_inner_size([640.0, 420.0]);
