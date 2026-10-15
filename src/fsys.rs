@@ -727,7 +727,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
             }
             Op::Unzip { src, dst } => {
                 *p.label.lock().unwrap() = t("Extrayendo…").into();
-                match crate::tools::unzip_to(&src, &dst, &p, &ctx) {
+                match crate::archive::extract_all(&src, &dst, &p, &ctx) {
                     Ok(top) => {
                         p.created.lock().unwrap().extend(top);
                         p.pairs.lock().unwrap().push((dst.clone(), dst.clone()));

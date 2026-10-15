@@ -117,6 +117,8 @@ enum OpMeta {
     Copy { mv: bool, replay: bool },
     Trash { replay: bool },
     Generated,
+    /// Extracción a la caché para navegar dentro de un comprimido.
+    OpenArchive { archive: PathBuf, root: PathBuf },
     /// Deshacer asíncrono: al terminar, el elemento pasa a la pila de rehacer.
     Replay(Undo),
     Other,
@@ -363,6 +365,8 @@ pub struct App {
     preview_was: bool,
     /// Datos extra de las columnas opcionales de la lista, por ruta; se vacía al recargar.
     extra_cache: HashMap<PathBuf, fsys::ExtraMeta>,
+    /// Comprimidos abiertos como carpeta: (carpeta de caché, archivo original).
+    arch: Vec<(PathBuf, PathBuf)>,
     /// Pestaña abierta en Opciones: 0 = general, 1 = columnas.
     opts_tab: u8,
     perm_t: f64,
@@ -1015,6 +1019,7 @@ impl App {
             tap_block: false,
             preview_was: false,
             extra_cache: HashMap::new(),
+            arch: Vec::new(),
             opts_tab: 0,
             perm_t: -10.0,
             insets: [0.0; 4],
@@ -1136,6 +1141,7 @@ impl App {
             palette: None,
             rebinding: None,
         };
+        std::thread::spawn(clean_archive_cache);
         if std::env::var("FB_LIST").is_ok() {
             app.cfg.grid = false;
         }
@@ -1451,6 +1457,18 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        if let Some((root, archive)) = self.arch_of(&self.cwd) {
+            if self.cwd == root {
+                // salir del comprimido: carpeta que lo contiene, con el archivo seleccionado
+                if let Some(dir) = archive.parent().map(|p| p.to_path_buf()) {
+                    self.navigate(dir);
+                    if let Some(n) = archive.file_name() {
+                        self.pending_select = vec![n.to_string_lossy().into_owned()];
+                    }
+                }
+                return;
+            }
+        }
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             let from = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned());
             self.navigate(parent);
@@ -1739,6 +1757,8 @@ impl App {
             fsys::open_external(&p);
         } else if e.is_dir() {
             self.navigate(p);
+        } else if crate::archive::detect(&p).is_some() {
+            self.open_archive(p);
         } else if is_program(&p) {
             self.run_program(&p);
         } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text) {
@@ -2013,7 +2033,19 @@ impl App {
             let pairs = op.pairs.lock().unwrap().clone();
             self.op = None;
             let meta = std::mem::replace(&mut self.op_meta, OpMeta::Other);
+            let mut enter: Option<PathBuf> = None;
             match meta {
+                OpMeta::OpenArchive { archive, root } => {
+                    if errs.is_empty() && !op.cancelled() {
+                        let _ = std::fs::write(archive_marker(&root), b"");
+                        if !self.arch.iter().any(|(r, _)| *r == root) {
+                            self.arch.push((root.clone(), archive));
+                        }
+                        enter = Some(root);
+                    } else {
+                        let _ = std::fs::remove_dir_all(&root);
+                    }
+                }
                 OpMeta::Copy { mv, replay } if !pairs.is_empty() => {
                     self.push_undo(if mv { Undo::Moved(pairs) } else { Undo::Copied(pairs) }, !replay);
                 }
@@ -2041,6 +2073,10 @@ impl App {
             self.pending_select = created;
             self.preview = None;
             self.refresh();
+            if let Some(root) = enter {
+                self.pending_select.clear();
+                self.navigate(root);
+            }
         }
     }
 
@@ -3343,21 +3379,34 @@ impl App {
         }
         // migas de pan
         let mut segs: Vec<(String, PathBuf)> = Vec::new();
-        let mut acc = PathBuf::new();
-        for c in self.cwd.components() {
-            acc.push(c.as_os_str());
-            match c {
-                Component::Prefix(pf) => segs.push((pf.as_os_str().to_string_lossy().into_owned(), acc.clone())),
-                Component::RootDir => {
-                    if let Some(l) = segs.last_mut() {
-                        l.1 = acc.clone();
-                    } else {
-                        segs.push(("/".into(), acc.clone()));
+        let push_segs = |segs: &mut Vec<(String, PathBuf)>, path: &Path, base: Option<&Path>| {
+            let mut acc = base.map(|b| b.to_path_buf()).unwrap_or_default();
+            for c in path.components() {
+                acc.push(c.as_os_str());
+                match c {
+                    Component::Prefix(pf) => segs.push((pf.as_os_str().to_string_lossy().into_owned(), acc.clone())),
+                    Component::RootDir => {
+                        if let Some(l) = segs.last_mut() {
+                            l.1 = acc.clone();
+                        } else {
+                            segs.push(("/".into(), acc.clone()));
+                        }
                     }
+                    Component::Normal(n) => segs.push((n.to_string_lossy().into_owned(), acc.clone())),
+                    _ => {}
                 }
-                Component::Normal(n) => segs.push((n.to_string_lossy().into_owned(), acc.clone())),
-                _ => {}
             }
+        };
+        if let Some((root, archive)) = self.arch_of(&self.cwd) {
+            // dentro de un comprimido: ruta virtual «carpeta/archivo.zip/subcarpeta»
+            push_segs(&mut segs, &archive, None);
+            if let Some(l) = segs.last_mut() {
+                l.1 = root.clone();
+            }
+            let rel = self.cwd.strip_prefix(&root).unwrap_or(Path::new(""));
+            push_segs(&mut segs, rel, Some(&root));
+        } else {
+            push_segs(&mut segs, &self.cwd, None);
         }
         let font = FontId::proportional(14.0);
         let widths: Vec<f32> = segs
@@ -4063,6 +4112,7 @@ impl App {
         if cfg!(target_os = "android") && !self.perm_ok {
             self.perm_banner(ui);
         }
+        self.arch_banner(ui);
         if !grid {
             self.list_header(ui);
         }
@@ -4977,7 +5027,13 @@ impl App {
                 ui.close();
             }
             let is_zip = self.sel_count == 1
-                && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| e.ext().eq_ignore_ascii_case("zip")).unwrap_or(false);
+                && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| crate::archive::detect(Path::new(&*e.name)).is_some()).unwrap_or(false);
+            if is_zip && ui.button(t("Abrir comprimido")).clicked() {
+                if let Some(p) = self.selected_paths().into_iter().next() {
+                    self.open_archive(p);
+                }
+                ui.close();
+            }
             if is_zip && ui.button(t("Extraer aquí")).clicked() {
                 self.do_unzip();
                 ui.close();
@@ -5433,7 +5489,7 @@ impl App {
     }
 
     fn tab_title(&self, i: usize) -> String {
-        let name = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
+        let name = |p: &PathBuf| self.dir_label(p);
         let mode = if i == self.cur_tab { &self.vmode } else { &self.tabs[i].vmode };
         match mode {
             VMode::Search { query, all } => {
@@ -5653,7 +5709,7 @@ impl App {
         let has_sel = self.sel_count > 0;
         let one_zip = has_sel
             && self.sel_count == 1
-            && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| e.ext().eq_ignore_ascii_case("zip")).unwrap_or(false);
+            && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| crate::archive::detect(Path::new(&*e.name)).is_some()).unwrap_or(false);
         {
             ui.menu_button(t("Archivo"), |ui| {
                 ui.set_min_width(250.0);
@@ -5881,7 +5937,7 @@ impl App {
         let (r, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click_and_drag());
         let title = format!(
             "{} — File Browser",
-            self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.cwd.display().to_string())
+            self.dir_label(&self.cwd)
         );
         if show_title {
             ui.painter().text(r.center(), Align2::CENTER_CENTER, title, FontId::proportional(12.5), pal.subtle);
@@ -6077,6 +6133,58 @@ impl App {
         };
         let out = fsys::unique_path(&self.cwd, &format!("{base}.zip"));
         self.start_op(Op::Zip { srcs, out }, OpMeta::Generated);
+    }
+
+    /// Abre un comprimido como carpeta de sólo lectura: lo extrae a la caché (una vez) y navega dentro.
+    fn open_archive(&mut self, p: PathBuf) {
+        let Some(root) = archive_cache_dir(&p) else {
+            fsys::open_external(&p);
+            return;
+        };
+        if archive_marker(&root).exists() && root.is_dir() {
+            if !self.arch.iter().any(|(r, _)| *r == root) {
+                self.arch.push((root.clone(), p));
+            }
+            self.navigate(root);
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        self.start_op(Op::Unzip { src: p.clone(), dst: root.clone() }, OpMeta::OpenArchive { archive: p, root });
+    }
+
+    /// Nombre corto de una carpeta; la raíz de un comprimido abierto se muestra con el nombre del archivo.
+    fn dir_label(&self, p: &Path) -> String {
+        let p = match self.arch.iter().find(|(r, _)| r == p) {
+            Some((_, a)) => a.as_path(),
+            None => p,
+        };
+        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+    }
+
+    /// Archivo original si `cwd` está dentro de un comprimido abierto.
+    fn arch_of(&self, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+        self.arch.iter().find(|(r, _)| cwd.starts_with(r)).cloned()
+    }
+
+    /// Franja sobre la lista cuando se está dentro de un comprimido.
+    fn arch_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((_, archive)) = self.arch_of(&self.cwd) else { return };
+        let pal = self.pal;
+        let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(tf("Contenido de «{}» (sólo lectura)", &[&name])).color(pal.subtle).size(12.5));
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(t("Extraer todo")).clicked() {
+                    if let Some(dir) = archive.parent() {
+                        let stem = archive.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "extraido".into());
+                        let dst = fsys::unique_path(dir, &stem);
+                        self.start_op(Op::Unzip { src: archive.clone(), dst }, OpMeta::Generated);
+                    }
+                }
+            });
+        });
+        ui.add_space(2.0);
     }
 
     fn do_unzip(&mut self) {
@@ -7616,7 +7724,7 @@ impl eframe::App for App {
         // título de ventana
         let title = format!(
             "{} — File Browser",
-            self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.cwd.display().to_string())
+            self.dir_label(&self.cwd)
         );
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -7915,5 +8023,41 @@ mod gvfs_tests {
         assert!(uri_to_gvfs("davs://cloud.x.org/remote.php").is_some());
         assert!(uri_to_gvfs("sftp://otro").is_none());
         let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Carpeta de caché donde se extrae un comprimido para navegar dentro (única por ruta, tamaño y fecha).
+fn archive_cache_dir(p: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let md = std::fs::metadata(p).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.hash(&mut h);
+    md.len().hash(&mut h);
+    mtime_secs(&md).hash(&mut h);
+    Some(dirs::cache_dir()?.join("filebrowser-rs").join("archives").join(format!("{:016x}", h.finish())))
+}
+
+/// Marca de extracción completa (junto a la carpeta de caché).
+fn archive_marker(root: &Path) -> PathBuf {
+    let mut n = root.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    n.push(".done");
+    root.with_file_name(n)
+}
+
+/// Borra de la caché los comprimidos extraídos hace más de un día.
+pub fn clean_archive_cache() {
+    let Some(dir) = dirs::cache_dir().map(|d| d.join("filebrowser-rs").join("archives")) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let limit = Duration::from_secs(24 * 3600);
+    for e in rd.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|a| a > limit).unwrap_or(false);
+        if old {
+            let p = e.path();
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
     }
 }

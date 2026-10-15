@@ -16,13 +16,17 @@ path = "src/main.rs"
 dirs = "7.0.0"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 egui = { version = "0.36.2", default-features = false }
+flate2 = "1.1.10"
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "webp", "bmp"] }
 jpeg-decoder = "0.3.2"
 md-5 = "0.11.0"
 portable-pty = "0.9.0"
 resvg = { version = "0.48.1", default-features = false }
+sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util", "compress"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
+tar = "0.4.46"
+unrar = "0.5.8"
 vt100 = "0.16.2"
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
