@@ -26,7 +26,6 @@ sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 tar = "0.4.46"
-unrar = "0.5.8"
 vt100 = "0.16.2"
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
@@ -42,6 +41,8 @@ opt-level = 2
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 trash = "5.2.9"
+# RAR sólo se extrae/lista (la biblioteca C++ de RARLAB no compila con el NDK de Android)
+unrar = "0.5.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

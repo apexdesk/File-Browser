@@ -116,6 +116,9 @@ pub fn list(path: &Path, max: usize, budget: Duration) -> Result<Listing, String
                 items.push(Item { name: e.name().to_string(), size: e.size(), dir: e.is_directory() });
             }
         }
+        #[cfg(target_os = "android")]
+        Format::Rar => return Err("RAR no está soportado en Android".into()),
+        #[cfg(not(target_os = "android"))]
         Format::Rar => {
             let ar = unrar::Archive::new(path).open_for_listing().map_err(|e| e.to_string())?;
             let end = Instant::now() + budget;
@@ -188,6 +191,9 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) ->
             })
             .map_err(|e| e.to_string())?;
         }
+        #[cfg(target_os = "android")]
+        Format::Rar => return Err("RAR no está soportado en Android".into()),
+        #[cfg(not(target_os = "android"))]
         Format::Rar => {
             let mut cur = unrar::Archive::new(src).open_for_processing().map_err(|e| e.to_string())?;
             let mut done = 0u64;
