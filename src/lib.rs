@@ -2,6 +2,7 @@
 pub mod app;
 pub mod archive;
 pub mod commands;
+pub mod diskusage;
 pub mod dragout;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod dragout_linux;

@@ -143,6 +143,8 @@ struct TrashDlg {
     rows: Vec<extras::TrashRow>,
     sel: Vec<bool>,
     err: Option<String>,
+    /// carga en segundo plano (la papelera puede recorrer montajes lentos)
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<extras::TrashRow>, String>>>,
 }
 
 struct HashDlg {
@@ -6681,12 +6683,13 @@ impl App {
     }
 
     fn open_trash(&mut self) {
-        let (rows, err) = match extras::trash_list() {
-            Ok(r) => (r, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
-        let sel = vec![false; rows.len()];
-        self.dlg = Dlg::Trash(TrashDlg { rows, sel, err });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(extras::trash_list());
+            ctx.request_repaint();
+        });
+        self.dlg = Dlg::Trash(TrashDlg { rows: Vec::new(), sel: Vec::new(), err: None, rx: Some(rx) });
     }
 
     fn conflict_dialog(&mut self, ctx: &egui::Context) {
@@ -7522,11 +7525,24 @@ impl App {
                     }
                     None => {}
                 }
-                keep = open && matches!(self.dlg, Dlg::Recent);
+                keep = open && matches!(self.dlg, Dlg::None);
             }
             Dlg::Trash(d) => {
                 let mut open = true;
                 let mut act = 0; // 1 restaurar, 2 eliminar, 3 todo
+                if let Some(rx) = &d.rx {
+                    if let Ok(r) = rx.try_recv() {
+                        match r {
+                            Ok(v) => {
+                                d.sel = vec![false; v.len()];
+                                d.rows = v;
+                            }
+                            Err(e) => d.err = Some(e),
+                        }
+                        d.rx = None;
+                    }
+                }
+                let loading = d.rx.is_some();
                 egui::Window::new(t("Papelera"))
                     .open(&mut open)
                     .collapsible(false)
@@ -7536,7 +7552,9 @@ impl App {
                         if let Some(e) = &d.err {
                             ui.label(egui::RichText::new(e).color(Color32::from_rgb(235, 100, 100)));
                         }
-                        if d.rows.is_empty() && d.err.is_none() {
+                        if loading {
+                            ui.label(egui::RichText::new(t("Calculando…")).color(pal.subtle));
+                        } else if d.rows.is_empty() && d.err.is_none() {
                             ui.label(egui::RichText::new(t("La papelera está vacía")).color(pal.subtle));
                         }
                         egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
