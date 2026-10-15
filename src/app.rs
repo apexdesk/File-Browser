@@ -3632,6 +3632,11 @@ impl App {
             push_segs(&mut segs, rel, Some(&root));
         } else if virt_mode(&self.cwd).is_some() {
             segs.push((self.dir_label(&self.cwd), self.cwd.clone()));
+        } else if let Some((mount, label)) = self.gvfs_mount_of(&self.cwd) {
+            // carpeta de red montada: un solo tramo legible en vez de /run/user/1000/gvfs/smb-share:…
+            segs.push((label, mount.clone()));
+            let rel = self.cwd.strip_prefix(&mount).unwrap_or(Path::new(""));
+            push_segs(&mut segs, rel, Some(&mount));
         } else {
             push_segs(&mut segs, &self.cwd, None);
         }
@@ -6705,7 +6710,28 @@ impl App {
     }
 
     /// Nombre corto de una carpeta; la raíz de un comprimido abierto se muestra con el nombre del archivo.
+    /// Raíz del montaje gvfs que contiene `p` y su nombre legible.
+    fn gvfs_mount_of(&self, p: &Path) -> Option<(PathBuf, String)> {
+        #[cfg(target_os = "linux")]
+        {
+            let g = gvfs_dir()?;
+            let first = p.strip_prefix(&g).ok()?.components().next()?;
+            let name = first.as_os_str().to_string_lossy().into_owned();
+            return Some((g.join(&name), gvfs_label(&name)));
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = p;
+            None
+        }
+    }
+
     fn dir_label(&self, p: &Path) -> String {
+        if let Some((m, l)) = self.gvfs_mount_of(p) {
+            if m == p {
+                return l;
+            }
+        }
         match virt_mode(p) {
             Some(VMode::Trash) => return t("Papelera").to_string(),
             Some(VMode::Recent) => return t("Recientes").to_string(),
