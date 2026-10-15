@@ -378,7 +378,7 @@ mod clip_impl {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn OpenClipboard(hwnd: isize) -> i32;
         fn CloseClipboard() -> i32;
         fn EmptyClipboard() -> i32;
@@ -390,14 +390,14 @@ mod clip_impl {
         fn GetForegroundWindow() -> isize;
     }
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
         fn GlobalLock(h: *mut c_void) -> *mut c_void;
         fn GlobalUnlock(h: *mut c_void) -> i32;
         fn GlobalFree(h: *mut c_void) -> *mut c_void;
     }
     #[link(name = "shell32")]
-    extern "system" {
+    unsafe extern "system" {
         fn DragQueryFileW(hdrop: *mut c_void, i: u32, buf: *mut u16, cch: u32) -> u32;
     }
 

@@ -90,7 +90,7 @@ mod imp {
     }
 
     #[link(name = "mpr")]
-    extern "system" {
+    unsafe extern "system" {
         fn WNetAddConnection2W(res: *const NetResource, pass: *const u16, user: *const u16, flags: u32) -> u32;
     }
 
@@ -182,7 +182,7 @@ mod imp {
 
     pub fn disconnect(path: &std::path::Path) {
         #[link(name = "mpr")]
-        extern "system" {
+        unsafe extern "system" {
             fn WNetCancelConnection2W(name: *const u16, flags: u32, force: i32) -> u32;
         }
         let w = wide(&path.display().to_string());
