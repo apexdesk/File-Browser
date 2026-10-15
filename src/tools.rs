@@ -224,7 +224,7 @@ pub fn spawn_search(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui
 }
 
 // ---------------------------------------------------------------------------
-// Portapapeles de archivos del sistema (Linux: wl-copy/xclip; resto: no disponible)
+// Portapapeles de archivos del sistema (Linux: wl-copy/xclip; Windows: CF_HDROP; macOS: NSPasteboard)
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -370,7 +370,219 @@ mod clip_impl {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: CF_HDROP + «Preferred DropEffect» (1 copiar, 2 mover), como el Explorador.
+#[cfg(windows)]
+mod clip_impl {
+    use super::*;
+    use std::ffi::c_void;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(fmt: u32, h: *mut c_void) -> *mut c_void;
+        fn GetClipboardData(fmt: u32) -> *mut c_void;
+        fn IsClipboardFormatAvailable(fmt: u32) -> i32;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+        fn GetActiveWindow() -> isize;
+        fn GetForegroundWindow() -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+        fn GlobalLock(h: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(h: *mut c_void) -> i32;
+        fn GlobalFree(h: *mut c_void) -> *mut c_void;
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragQueryFileW(hdrop: *mut c_void, i: u32, buf: *mut u16, cch: u32) -> u32;
+    }
+
+    const CF_HDROP: u32 = 15;
+    const GHND: u32 = 0x0042; // GMEM_MOVEABLE | GMEM_ZEROINIT
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn effect_format() -> u32 {
+        unsafe { RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr()) }
+    }
+
+    /// Abre el portapapeles (con reintentos: otra aplicación puede tenerlo un instante).
+    fn open() -> bool {
+        unsafe {
+            let mut hwnd = GetActiveWindow();
+            if hwnd == 0 {
+                hwnd = GetForegroundWindow();
+            }
+            for _ in 0..10 {
+                if OpenClipboard(hwnd) != 0 {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        }
+    }
+
+    unsafe fn global_from(bytes: &[u8]) -> *mut c_void {
+        let h = GlobalAlloc(GHND, bytes.len().max(1));
+        if h.is_null() {
+            return h;
+        }
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            GlobalFree(h);
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        GlobalUnlock(h);
+        h
+    }
+
+    pub fn set_files(paths: &[PathBuf], cut: bool) -> bool {
+        if paths.is_empty() || !open() {
+            return false;
+        }
+        unsafe {
+            // DROPFILES: pFiles (20), pt (0,0), fNC (0), fWide (1); después, rutas UTF-16 y doble NUL
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(&20u32.to_le_bytes());
+            buf.extend_from_slice(&[0u8; 12]);
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            for p in paths {
+                for u in p.as_os_str().encode_wide() {
+                    buf.extend_from_slice(&u.to_le_bytes());
+                }
+                buf.extend_from_slice(&[0, 0]);
+            }
+            buf.extend_from_slice(&[0, 0]);
+            let h = global_from(&buf);
+            let h2 = global_from(&(if cut { 2u32 } else { 1u32 }).to_le_bytes());
+            let mut ok = false;
+            if !h.is_null() {
+                EmptyClipboard();
+                ok = !SetClipboardData(CF_HDROP, h).is_null();
+                if !ok {
+                    GlobalFree(h);
+                }
+                if !h2.is_null() && ok {
+                    if SetClipboardData(effect_format(), h2).is_null() {
+                        GlobalFree(h2);
+                    }
+                }
+            }
+            CloseClipboard();
+            ok
+        }
+    }
+
+    pub fn get_files() -> Option<(Vec<PathBuf>, bool)> {
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP) == 0 || !open() {
+                return None;
+            }
+            let mut out: Vec<PathBuf> = Vec::new();
+            let mut cut = false;
+            let h = GetClipboardData(CF_HDROP);
+            if !h.is_null() {
+                let n = DragQueryFileW(h, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+                for i in 0..n {
+                    let len = DragQueryFileW(h, i, std::ptr::null_mut(), 0) as usize;
+                    let mut b = vec![0u16; len + 1];
+                    let got = DragQueryFileW(h, i, b.as_mut_ptr(), (len + 1) as u32) as usize;
+                    out.push(PathBuf::from(std::ffi::OsString::from_wide(&b[..got.min(len)])));
+                }
+            }
+            let fmt = effect_format();
+            if fmt != 0 && IsClipboardFormatAvailable(fmt) != 0 {
+                let h2 = GetClipboardData(fmt);
+                if !h2.is_null() {
+                    let p = GlobalLock(h2) as *const u32;
+                    if !p.is_null() {
+                        cut = *p & 2 != 0;
+                        GlobalUnlock(h2);
+                    }
+                }
+            }
+            CloseClipboard();
+            if out.is_empty() {
+                None
+            } else {
+                Some((out, cut))
+            }
+        }
+    }
+}
+
+/// macOS: NSPasteboard a través de JavaScript for Automation (`osascript -l JavaScript`); el
+/// Finder no tiene «cortar» en el portapapeles, así que sólo se comparte la lista de archivos.
+#[cfg(target_os = "macos")]
+mod clip_impl {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    const SET: &str = r#"function run(argv) {
+  ObjC.import('AppKit');
+  var pb = $.NSPasteboard.generalPasteboard;
+  pb.clearContents;
+  var arr = $.NSMutableArray.alloc.init;
+  for (var i = 0; i < argv.length; i++) { arr.addObject($.NSURL.fileURLWithPath(argv[i])); }
+  return pb.writeObjects(arr) ? "ok" : "fail";
+}"#;
+
+    const GET: &str = r#"function run(argv) {
+  ObjC.import('AppKit');
+  var pb = $.NSPasteboard.generalPasteboard;
+  var opts = $({ NSPasteboardURLReadingFileURLsOnlyKey: true });
+  var urls = pb.readObjectsForClassesOptions($([$.NSURL]), opts);
+  var out = [];
+  if (urls) { for (var i = 0; i < urls.count; i++) { out.push(ObjC.unwrap(urls.objectAtIndex(i).path)); } }
+  return out.join("
+");
+}"#;
+
+    pub fn set_files(paths: &[PathBuf], _cut: bool) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", SET])
+            .args(paths)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok")
+            .unwrap_or(false)
+    }
+
+    pub fn get_files() -> Option<(Vec<PathBuf>, bool)> {
+        let o = Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", GET])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let v: Vec<PathBuf> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if v.is_empty() {
+            None
+        } else {
+            Some((v, false))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod clip_impl {
     use super::*;
     pub fn set_files(_p: &[PathBuf], _cut: bool) -> bool {

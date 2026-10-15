@@ -462,6 +462,10 @@ pub struct App {
     op_started: Instant,
     /// el usuario ocultó el panel flotante de progreso (queda la barra de estado)
     op_card_hidden: bool,
+    /// popup con la pila de tareas (escritorio)
+    tasks_open: bool,
+    /// descripción de la operación en curso
+    op_desc: String,
     /// Cambio de tema en curso: paleta de origen y de destino, si es oscuro al final y cuándo empezó.
     theme_anim: Option<(theme::Pal, theme::Pal, bool, Instant)>,
     undo_stack: Vec<Undo>,
@@ -1104,6 +1108,8 @@ impl App {
             op_meta: OpMeta::Other,
             op_started: Instant::now(),
             op_card_hidden: false,
+            tasks_open: false,
+            op_desc: String::new(),
             theme_anim: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1829,7 +1835,15 @@ impl App {
     }
 
     fn do_paste(&mut self) {
-        let Some((srcs, cut)) = tools::clip_get_files().or_else(|| self.clipboard.clone()) else { return };
+        // Si lo del portapapeles del sistema es lo que cortamos nosotros, se conserva el «cortar»
+        // (macOS no lo transporta en el portapapeles).
+        let own = self.clipboard.clone();
+        let picked = match (tools::clip_get_files(), own) {
+            (Some((sp, _)), Some((op, true))) if sp == op => Some((op, true)),
+            (Some(sys), _) => Some(sys),
+            (None, own) => own,
+        };
+        let Some((srcs, cut)) = picked else { return };
         let dst = self.cwd.clone();
         self.start_copy(srcs, dst, cut);
         if cut {
@@ -1932,6 +1946,7 @@ impl App {
         }
         self.op_meta = meta;
         self.op_started = Instant::now();
+        self.op_desc = op_desc(&op);
         self.op = Some(fsys::run_op(op, self.ctx.clone()));
     }
 
@@ -2863,6 +2878,23 @@ fn base_name(s: &str) -> &str {
     }
 }
 
+/// Texto corto de una operación: «Moviendo 3 elementos», «Comprimiendo informe.pdf»…
+fn op_desc(op: &Op) -> String {
+    let what = |v: &[PathBuf]| -> String {
+        match v {
+            [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            _ => tf("{count} elementos", &[&v.len()]),
+        }
+    };
+    match op {
+        Op::Copy { srcs, mv, .. } => format!("{} {}", if *mv { t("Moviendo") } else { t("Copiando") }, what(srcs)),
+        Op::Trash(v) => format!("{} {}", t("Moviendo a la papelera"), what(v)),
+        Op::Delete(v) => format!("{} {}", t("Eliminando"), what(v)),
+        Op::Zip { srcs, .. } => format!("{} {}", t("Comprimiendo"), what(srcs)),
+        Op::Unzip { src, .. } => format!("{} {}", t("Extrayendo"), what(std::slice::from_ref(src))),
+    }
+}
+
 fn side_item(ui: &mut egui::Ui, pal: &Pal, g: Glyph, tex: Option<egui::TextureId>, label: &str, active: bool, drop_hot: bool) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
@@ -3675,7 +3707,23 @@ impl App {
                 ctx.request_repaint();
             });
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let uri = l.uri.trim().to_string();
+            self.net_busy.store(true, Ordering::Relaxed);
+            self.say(tf("Conectando con {}…", &[&uri]), false);
+            let (slot, err_slot, busy, ctx) = (self.net_nav.clone(), self.net_err.clone(), self.net_busy.clone(), self.ctx.clone());
+            let login = crate::netmount::Login { uri, user: l.user.clone(), domain: l.domain.clone(), pass: l.pass.clone(), anon: l.anon };
+            std::thread::spawn(move || {
+                match crate::netmount::connect(&login) {
+                    Ok(p) => *slot.lock().unwrap() = Some(p),
+                    Err(m) => *err_slot.lock().unwrap() = Some(m),
+                }
+                busy.store(false, Ordering::Relaxed);
+                ctx.request_repaint();
+            });
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         {
             let _ = l;
             self.say(t("Conectar a servidores no está disponible en este sistema").into(), true);
@@ -3841,20 +3889,6 @@ impl App {
             if let Some(n) = &self.hover_name {
                 ui.label(egui::RichText::new(format!("  ·  {n}")).size(12.5).color(pal.text));
             }
-            if let Some(op) = &self.op {
-                let tot = op.total.load(Ordering::Relaxed).max(1);
-                let d = op.done.load(Ordering::Relaxed);
-                ui.add(egui::ProgressBar::new((d as f32 / tot as f32).clamp(0.0, 1.0)).desired_width(160.0).corner_radius(6));
-                let l = op.label.lock().unwrap().clone();
-                ui.label(egui::RichText::new(l).size(12.0).color(pal.subtle));
-                if !self.queue.is_empty() {
-                    ui.label(egui::RichText::new(tf("(+{} en cola)", &[&self.queue.len()])).size(12.0).color(pal.subtle));
-                }
-                if ui.small_button(t("Cancelar")).clicked() {
-                    op.cancel.store(true, Ordering::Relaxed);
-                    self.queue.clear();
-                }
-            }
             if let Some((m, t, err)) = &self.msg {
                 if t.elapsed() < Duration::from_secs(6) {
                     let c = if *err { Color32::from_rgb(235, 100, 100) } else { pal.accent };
@@ -3868,6 +3902,25 @@ impl App {
                 let label = egui::RichText::new(t("Terminal")).size(12.0);
                 if ui.selectable_label(self.cfg.term_open, label).on_hover_text(t("Mostrar/ocultar terminal (F12)")).clicked() {
                     self.toggle_terminal();
+                }
+                if let Some(op) = self.op.clone() {
+                    let tot = op.total.load(Ordering::Relaxed).max(1);
+                    let d = op.done.load(Ordering::Relaxed).min(tot);
+                    let scanning = op.label.lock().unwrap().as_str() == t("Calculando…");
+                    let frac = if scanning { 0.0 } else { d as f32 / tot as f32 };
+                    let mut txt = self.op_desc.clone();
+                    if !scanning {
+                        txt.push_str(&format!("  {:.0}%", frac * 100.0));
+                    }
+                    if !self.queue.is_empty() {
+                        txt.push_str(&format!("  +{}", self.queue.len()));
+                    }
+                    let r = ui.add(egui::ProgressBar::new(frac).desired_width(220.0).text(egui::RichText::new(txt).size(12.0)).corner_radius(6));
+                    let r = ui.interact(r.rect, egui::Id::new("tasks_btn"), Sense::click()).on_hover_text(t("Tareas en curso"));
+                    if r.clicked() {
+                        self.tasks_open = !self.tasks_open;
+                    }
+                    ui.ctx().set_cursor_icon(if r.hovered() { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default });
                 }
                 if self.cfg.grid {
                     ui.spacing_mut().slider_width = 130.0;
@@ -6789,8 +6842,124 @@ impl App {
 
     // ---- diálogos ----
 
+    /// Pila de tareas (escritorio): la operación en curso y las que esperan en la cola.
+    fn tasks_popup(&mut self, ctx: &egui::Context) {
+        let Some(op) = self.op.clone() else {
+            self.tasks_open = false;
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(120));
+        if !self.tasks_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.tasks_open = false;
+            return;
+        }
+        let pal = self.pal;
+        let elapsed = self.op_started.elapsed().as_secs_f64();
+        let total = op.total.load(Ordering::Relaxed).max(1);
+        let done = op.done.load(Ordering::Relaxed).min(total);
+        let label = op.label.lock().unwrap().clone();
+        let scanning = label == t("Calculando…");
+        let bytes = matches!(self.op_meta, OpMeta::Copy { .. } | OpMeta::Generated);
+        let detail = if scanning {
+            String::new()
+        } else if bytes {
+            let speed = done as f64 / elapsed.max(0.001);
+            let mut d = format!("{} / {}  ·  {}/s", fsys::human_size(done), fsys::human_size(total), fsys::human_size(speed as u64));
+            if speed > 1.0 && done > 0 {
+                let eta = ((total - done) as f64 / speed) as u64;
+                let hms = if eta >= 3600 { format!("{}:{:02}:{:02}", eta / 3600, eta / 60 % 60, eta % 60) } else { format!("{}:{:02}", eta / 60, eta % 60) };
+                d.push_str(&format!("  ·  {}", tf("quedan {}", &[&hms])));
+            }
+            d
+        } else {
+            tf("{} de {}", &[&done, &total])
+        };
+        let ppp = ctx.pixels_per_point();
+        let inset_b = self.insets[3] / ppp;
+        let width = (ctx.content_rect().width() - 28.0).clamp(240.0, 400.0);
+        let mut cancel_cur = false;
+        let mut drop_q: Option<usize> = None;
+        let mut close = false;
+        let desc = self.op_desc.clone();
+        let queued: Vec<String> = self.queue.iter().map(|(o, _)| op_desc(o)).collect();
+        let area = egui::Area::new(egui::Id::new("tasks_popup"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-14.0, -(36.0 + inset_b)))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(12))
+                    .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(90) })
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(t("Tareas en curso")).strong());
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button(t("Ocultar")).clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&desc).strong()).truncate());
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button(t("Cancelar")).clicked() {
+                                    cancel_cur = true;
+                                }
+                            });
+                        });
+                        if scanning {
+                            ui.add(egui::ProgressBar::new(0.0).desired_width(width).text(t("Calculando…")).animate(true).corner_radius(6));
+                        } else {
+                            ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(width).show_percentage().corner_radius(6));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(detail).size(12.0).color(pal.subtle));
+                            if !label.is_empty() {
+                                ui.add(egui::Label::new(egui::RichText::new(label).size(12.0).color(pal.text)).truncate());
+                            }
+                        }
+                        if !queued.is_empty() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(egui::RichText::new(t("En cola")).size(12.0).color(pal.subtle));
+                            for (i, q) in queued.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(format!("{}.  {q}", i + 1)).size(12.5)).truncate());
+                                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button(t("Cancelar")).clicked() {
+                                            drop_q = Some(i);
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    });
+            });
+        // clic fuera de la pila: se cierra (el botón de la barra la alterna por su cuenta)
+        let outside = ctx.input(|i| i.pointer.primary_clicked())
+            && ctx.input(|i| i.pointer.interact_pos()).map(|p| !area.response.rect.contains(p) && p.y < ctx.content_rect().bottom() - 34.0).unwrap_or(false);
+        if close || outside {
+            self.tasks_open = false;
+        }
+        if let Some(i) = drop_q {
+            self.queue.remove(i);
+        }
+        if cancel_cur {
+            op.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Panel flotante con el progreso de la operación en curso (copiar, mover, borrar…).
     fn op_overlay(&mut self, ctx: &egui::Context) {
+        if !self.phone {
+            return self.tasks_popup(ctx);
+        }
         let Some(op) = self.op.clone() else {
             self.op_card_hidden = false;
             return;
@@ -7837,6 +8006,17 @@ impl App {
                 self.select_only(i);
                 self.open_preview_at(i);
             }
+        }
+        if el > 800 && self.op.is_none() && self.queue.is_empty() && !self.shot_prev && std::env::var_os("FB_TASKS").is_some() {
+            // prueba del centro de tareas: tres copias seguidas de la carpeta actual
+            self.shot_prev = true;
+            let dst = PathBuf::from(std::env::var("FB_TASKS").unwrap_or_default());
+            let _ = std::fs::create_dir_all(&dst);
+            let srcs: Vec<PathBuf> = self.entries.iter().map(|e| self.cwd.join(&*e.name)).collect();
+            for _ in 0..3 {
+                self.start_op(Op::Copy { srcs: srcs.clone(), dst: dst.clone(), mv: false, policy: Policy::Rename }, OpMeta::Other);
+            }
+            self.tasks_open = true;
         }
         if el > 900 && self.shot_dbl == 0 && std::env::var_os("FB_DBL").is_some() {
             self.shot_dbl = 1; // simula doble clic sobre el primer elemento
