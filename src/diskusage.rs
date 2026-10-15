@@ -62,14 +62,19 @@ pub fn start(path: PathBuf, ctx: &egui::Context, limited: bool) -> Scan {
         partial: scan.partial.clone(),
         budget: limited.then(|| (200_000, std::time::Instant::now() + std::time::Duration::from_secs(10))),
         egui: ctx.clone(),
+        // se rellena en el hilo: `metadata` sobre un montaje de red caído bloquearía la interfaz
         #[cfg(unix)]
-        dev: {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&path).map(|m| m.dev()).unwrap_or(0)
-        },
+        dev: 0,
     };
     let (done, result) = (scan.done.clone(), scan.result.clone());
     std::thread::spawn(move || {
+        #[cfg(unix)]
+        let c = {
+            use std::os::unix::fs::MetadataExt;
+            let mut c = c;
+            c.dev = std::fs::metadata(&path).map(|m| m.dev()).unwrap_or(0);
+            c
+        };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         let node = scan_bfs(&path, name, &c);
         if !c.cancel.load(AO::Relaxed) {
@@ -114,12 +119,15 @@ struct Ent {
     dir: bool,
     own: u64,
     kids: Vec<usize>,
+    /// Archivos de la carpeta que se conservan (los mayores); el resto sólo suma a `own`.
+    files: Vec<(u64, String)>,
+    dropped: u64,
 }
 
 /// Recorrido por niveles: se termina de mirar un nivel de carpetas antes de pasar al siguiente, de
 /// modo que, si se agota el presupuesto, todas las ramas están igual de exploradas.
 fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
-    let mut arena: Vec<Ent> = vec![Ent { name, dir: true, own: 0, kids: Vec::new() }];
+    let mut arena: Vec<Ent> = vec![Ent { name, dir: true, own: 0, kids: Vec::new(), files: Vec::new(), dropped: 0 }];
     let mut level: Vec<(usize, PathBuf)> = vec![(0, root.to_path_buf())];
     let mut depth = 0usize;
     let mut cut = false;
@@ -144,7 +152,7 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
                         }
                     }
                     let k = arena.len();
-                    arena.push(Ent { name: n, dir: true, own: 0, kids: Vec::new() });
+                    arena.push(Ent { name: n, dir: true, own: 0, kids: Vec::new(), files: Vec::new(), dropped: 0 });
                     arena[idx].kids.push(k);
                     next.push((k, e.path()));
                 } else {
@@ -160,10 +168,16 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
                     }
                     arena[idx].own += sz;
                     // sólo se conservan individualmente los archivos de los anillos visibles
+                    // y de cada carpeta sólo los mayores: una carpeta con millones de archivos no
+                    // debe llenar la memoria
                     if depth < DEPTH {
-                        let k = arena.len();
-                        arena.push(Ent { name: n, dir: false, own: sz, kids: Vec::new() });
-                        arena[idx].kids.push(k);
+                        let d = &mut arena[idx];
+                        d.files.push((sz, n));
+                        if d.files.len() >= KIDS * 4 {
+                            d.files.sort_by(|a, b| b.0.cmp(&a.0));
+                            d.dropped += (d.files.len() - KIDS) as u64;
+                            d.files.truncate(KIDS);
+                        }
                     }
                 }
             }
@@ -173,6 +187,23 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
     }
     if cut {
         c.partial.store(true, AO::Relaxed);
+    }
+    // los archivos conservados pasan a ser entradas del árbol
+    for i in 0..arena.len() {
+        if arena[i].files.is_empty() {
+            continue;
+        }
+        let mut files = std::mem::take(&mut arena[i].files);
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        if files.len() > KIDS {
+            arena[i].dropped += (files.len() - KIDS) as u64;
+            files.truncate(KIDS);
+        }
+        for (sz, n) in files {
+            let k = arena.len();
+            arena.push(Ent { name: n, dir: false, own: sz, kids: Vec::new(), files: Vec::new(), dropped: 0 });
+            arena[i].kids.push(k);
+        }
     }
     // totales: de las hojas hacia la raíz (los hijos tienen índice mayor)
     let mut total: Vec<u64> = arena.iter().map(|e| e.own).collect();
@@ -199,11 +230,15 @@ fn build(arena: &[Ent], total: &[u64], i: usize, depth: usize) -> Node {
     }
     let mut kids: Vec<Node> = e.kids.iter().map(|&k| build(arena, total, k, depth + 1)).collect();
     kids.sort_by(|a, b| b.size.cmp(&a.size));
+    let mut extra = e.dropped;
     if kids.len() > KIDS {
-        let rest: u64 = kids[KIDS..].iter().map(|k| k.size).sum();
-        let n = kids.len() - KIDS;
+        extra += (kids.len() - KIDS) as u64;
         kids.truncate(KIDS);
-        kids.push(Node { name: format!("… ({n})"), size: rest, dir: false, other: true, kids: Vec::new() });
+    }
+    let kept: u64 = kids.iter().map(|k| k.size).sum();
+    let rest = node.size.saturating_sub(kept);
+    if extra > 0 && rest > 0 {
+        kids.push(Node { name: format!("… ({extra})"), size: rest, dir: false, other: true, kids: Vec::new() });
     }
     node.kids = kids;
     node
@@ -219,5 +254,40 @@ impl Node {
             }
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_files_keep_only_largest_and_totals_match() {
+        let d = std::env::temp_dir().join(format!("fb_du_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        for i in 0..400 {
+            std::fs::write(d.join(format!("f{i}")), vec![0u8; 5000 + i]).unwrap();
+        }
+        std::fs::write(d.join("sub/x"), vec![0u8; 9000]).unwrap();
+        let c = Ctx {
+            bytes: Arc::new(AtomicU64::new(0)),
+            files: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            partial: Arc::new(AtomicBool::new(false)),
+            budget: None,
+            egui: egui::Context::default(),
+            #[cfg(unix)]
+            dev: {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&d).unwrap().dev()
+            },
+        };
+        let n = scan_bfs(&d, "r".into(), &c);
+        let sum: u64 = n.kids.iter().map(|k| k.size).sum();
+        assert_eq!(sum, n.size);
+        assert!(n.kids.len() <= KIDS + 2);
+        assert!(n.kids.iter().any(|k| k.other));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
