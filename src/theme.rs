@@ -69,6 +69,41 @@ pub fn palette(dark: bool) -> Pal {
     }
 }
 
+impl Pal {
+    pub fn colors(&self) -> [[u8; 3]; 9] {
+        let a = |c: Color32| [c.r(), c.g(), c.b()];
+        [a(self.bg), a(self.panel), a(self.surface), a(self.hover), a(self.border), a(self.text), a(self.subtle), a(self.accent), a(self.page)]
+    }
+}
+
+/// Paleta de un tema propio; la selección se deriva del acento.
+pub fn palette_of(th: &crate::config::CustomTheme) -> Pal {
+    let c = |i: usize| Color32::from_rgb(th.colors[i][0], th.colors[i][1], th.colors[i][2]);
+    let ac = th.colors[7];
+    Pal {
+        bg: c(0),
+        panel: c(1),
+        surface: c(2),
+        hover: c(3),
+        border: c(4),
+        text: c(5),
+        subtle: c(6),
+        accent: c(7),
+        sel: Color32::from_rgba_unmultiplied(ac[0], ac[1], ac[2], if th.dark { 64 } else { 50 }),
+        page: c(8),
+    }
+}
+
+/// Paleta vigente: la del tema propio activo si coincide con el modo, o la de serie.
+pub fn resolve(cfg: &crate::config::Config, dark: bool) -> Pal {
+    if let Some(th) = cfg.custom_themes.iter().find(|t| t.name == cfg.theme_custom) {
+        if th.dark == dark {
+            return palette_of(th);
+        }
+    }
+    palette(dark)
+}
+
 pub fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = p.bg;
