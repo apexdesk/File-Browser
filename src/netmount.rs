@@ -1,6 +1,7 @@
 //! Conexión a servidores de red en Windows y macOS usando lo que trae el sistema (sin dependencias):
 //! SMB y WebDAV. Windows: `WNetAddConnection2`; macOS: `mount volume` de AppleScript.
 //! En Linux se usa GVFS (`gio`), ver `app.rs`.
+#[cfg(any(windows, target_os = "macos"))]
 use std::path::PathBuf;
 
 pub struct Login {
