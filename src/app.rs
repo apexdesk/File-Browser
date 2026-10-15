@@ -460,6 +460,8 @@ pub struct App {
     queue: VecDeque<(Op, OpMeta)>,
     op_meta: OpMeta,
     op_started: Instant,
+    /// el usuario ocultó el panel flotante de progreso (queda la barra de estado)
+    op_card_hidden: bool,
     /// Cambio de tema en curso: paleta de origen y de destino, si es oscuro al final y cuándo empezó.
     theme_anim: Option<(theme::Pal, theme::Pal, bool, Instant)>,
     undo_stack: Vec<Undo>,
@@ -729,6 +731,8 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new("gio");
     cmd.args(args);
+    // preguntas en inglés: se reconocen por texto y, en otro idioma, gio se quedaba esperando
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
     if c.anon {
         cmd.arg("-a");
     }
@@ -764,7 +768,7 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
                 if last.ends_with(':') || last.ends_with("]:") {
                     let ans = if last.contains("anonymous") || last.contains("anónim") {
                         Some("n")
-                    } else if last.contains("password") || last.contains("contraseña") {
+                    } else if last.contains("password") || last.contains("passphrase") || last.contains("contraseña") {
                         Some(c.pass.as_str())
                     } else if last.contains("domain") || last.contains("dominio") {
                         Some(c.domain.as_str())
@@ -1099,6 +1103,7 @@ impl App {
             queue: VecDeque::new(),
             op_meta: OpMeta::Other,
             op_started: Instant::now(),
+            op_card_hidden: false,
             theme_anim: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -6786,8 +6791,14 @@ impl App {
 
     /// Panel flotante con el progreso de la operación en curso (copiar, mover, borrar…).
     fn op_overlay(&mut self, ctx: &egui::Context) {
-        let Some(op) = self.op.clone() else { return };
+        let Some(op) = self.op.clone() else {
+            self.op_card_hidden = false;
+            return;
+        };
         ctx.request_repaint_after(Duration::from_millis(120));
+        if self.op_card_hidden {
+            return;
+        }
         let elapsed = self.op_started.elapsed().as_secs_f64();
         if elapsed < 0.4 {
             return; // las operaciones rápidas no necesitan panel
@@ -6823,6 +6834,7 @@ impl App {
         let inset_b = self.insets[3] / ppp;
         let width = (ctx.content_rect().width() - 28.0).clamp(220.0, 380.0);
         let mut cancel = false;
+        let mut hide = false;
         egui::Area::new(egui::Id::new("op_overlay"))
             .order(egui::Order::Foreground)
             .anchor(Align2::RIGHT_BOTTOM, vec2(-14.0, -(42.0 + inset_b)))
@@ -6844,6 +6856,9 @@ impl App {
                                 if ui.small_button(t("Cancelar")).clicked() {
                                     cancel = true;
                                 }
+                                if ui.small_button(t("Ocultar")).clicked() {
+                                    hide = true;
+                                }
                             });
                         });
                         ui.add_space(6.0);
@@ -6859,6 +6874,9 @@ impl App {
                         }
                     });
             });
+        if hide {
+            self.op_card_hidden = true;
+        }
         if cancel {
             op.cancel.store(true, Ordering::Relaxed);
         }

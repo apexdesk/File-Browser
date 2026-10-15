@@ -71,3 +71,7 @@ eframe = { version = "0.36.2", default-features = false, features = ["glow", "an
 android-activity = { version = "0.6.1", features = ["native-activity"] }
 log = "0.4"
 jni = "0.21"
+
+# egui-winit parcheado: Ctrl+V debe llegar a la app aunque el portapapeles no tenga texto
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }

@@ -503,25 +503,56 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// Permisos y fecha se copian "si se puede": muchos sistemas de red/FAT no los admiten y eso no
 /// debe convertir una copia correcta en un error.
 fn copy_file(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std::io::Result<()> {
-    use std::io::Read;
+    use std::io::{Read, Write};
     let mut r = fs::File::open(src)?;
     let md = r.metadata()?;
     let mut w = fs::File::create(dst)?;
-    // `io::copy` entre archivos usa copy_file_range en Linux (copia en el kernel, reflink o copia
-    // en el servidor en NFS/SMB); en el resto cae a lectura/escritura. Se hace por trozos para poder
-    // informar del progreso y cancelar.
+    // En Linux se prueba primero copy_file_range (copia en el kernel o en el servidor en NFS/SMB);
+    // si el sistema de archivos no lo admite (FUSE/GVFS…) se cae a un bucle con búfer grande.
     let _ = &buf;
     let mut copied = 0u64;
+    #[cfg(target_os = "linux")]
+    let mut kernel = true;
+    let mut chunk: Vec<u8> = Vec::new();
     loop {
         if prog.cancelled() {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelado"));
         }
-        let n = std::io::copy(&mut r.by_ref().take(64 << 20), &mut w)?;
-        if n == 0 {
-            break;
+        #[cfg(target_os = "linux")]
+        if kernel {
+            use std::os::fd::AsRawFd;
+            let n = unsafe {
+                libc::copy_file_range(r.as_raw_fd(), std::ptr::null_mut(), w.as_raw_fd(), std::ptr::null_mut(), 64 << 20, 0)
+            };
+            if n > 0 {
+                copied += n as u64;
+                prog.done.fetch_add(n as u64, AO::Relaxed);
+                continue;
+            } else if n == 0 && copied > 0 {
+                break;
+            }
+            // 0 sin haber copiado nada o error: se usa la copia normal desde la posición actual
+            kernel = false;
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    kernel = true;
+                    continue;
+                }
+            }
         }
-        copied += n;
-        prog.done.fetch_add(n, AO::Relaxed);
+        if chunk.is_empty() {
+            chunk.resize(4 << 20, 0);
+        }
+        let n = match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w.write_all(&chunk[..n])?;
+        copied += n as u64;
+        prog.done.fetch_add(n as u64, AO::Relaxed);
     }
     if copied == 0 {
         prog.done.fetch_add(1, AO::Relaxed);

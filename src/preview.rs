@@ -53,6 +53,16 @@ pub struct Preview {
     scroll: f32,
     /// Última posición conocida del puntero (al soltar un dedo ya no hay posición).
     last_pos: Option<Pos2>,
+    /// pestaña «Uso de disco» de las carpetas
+    show_usage: bool,
+    usage: Option<UsageView>,
+}
+
+/// Gráfico de uso de disco de una carpeta: análisis en curso, árbol resultante y nivel mostrado.
+pub struct UsageView {
+    scan: crate::diskusage::Scan,
+    root: Option<Arc<crate::diskusage::Node>>,
+    path: Vec<usize>,
 }
 
 pub enum Action {
@@ -189,6 +199,8 @@ impl Preview {
             zoom: 1.0,
             pan: vec2(0.0, 0.0),
             scroll: 0.0,
+            show_usage: std::env::var_os("FB_USAGE").is_some(),
+            usage: None,
         }
     }
 
@@ -446,19 +458,44 @@ impl Preview {
                 }
             }
             Body::Folder { count, names } => {
-                let c = pos2(content.center().x, content.top() + 70.0);
-                theme::draw_folder(&cp, Rect::from_center_size(c, vec2(96.0, 96.0)));
-                cp.text(
-                    pos2(content.center().x, c.y + 70.0),
-                    Align2::CENTER_CENTER,
-                    tf("{count} elementos", &[count]),
-                    FontId::proportional(15.0),
-                    pal.text,
-                );
-                let mut y = c.y + 104.0;
-                for n in names.iter().take(((content.bottom() - y) / 20.0).max(0.0) as usize) {
-                    cp.text(pos2(content.center().x, y), Align2::CENTER_CENTER, n, FontId::proportional(13.0), pal.subtle);
-                    y += 20.0;
+                // pestañas: contenido / uso de disco
+                for (i, label) in [t("Contenido"), t("Uso de disco")].into_iter().enumerate() {
+                    let r = Rect::from_min_size(pos2(content.left() + 18.0 + i as f32 * 118.0, content.top() + 8.0), vec2(110.0, 28.0));
+                    let on = self.show_usage == (i == 1);
+                    let hot = pointer.map(|q| r.contains(q)).unwrap_or(false);
+                    cp.rect_filled(r, CornerRadius::same(8), if on { pal.sel } else if hot { pal.hover } else { pal.surface });
+                    cp.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), if on { pal.accent } else { pal.text });
+                    if hot && clicked {
+                        self.show_usage = i == 1;
+                    }
+                }
+                let area = Rect::from_min_max(pos2(content.left(), content.top() + 44.0), content.max);
+                if self.show_usage {
+                    if self.usage.is_none() {
+                        self.usage = Some(UsageView {
+                            scan: crate::diskusage::start(self.path.clone(), ctx, true),
+                            root: None,
+                            path: Vec::new(),
+                        });
+                    }
+                    if let Some(uv) = &mut self.usage {
+                        usage_ui(&cp, pal, ctx, area, self.path.clone(), uv, pointer, clicked);
+                    }
+                } else {
+                    let c = pos2(content.center().x, area.top() + 70.0);
+                    theme::draw_folder(&cp, Rect::from_center_size(c, vec2(96.0, 96.0)));
+                    cp.text(
+                        pos2(content.center().x, c.y + 70.0),
+                        Align2::CENTER_CENTER,
+                        tf("{count} elementos", &[count]),
+                        FontId::proportional(15.0),
+                        pal.text,
+                    );
+                    let mut y = c.y + 104.0;
+                    for n in names.iter().take(((content.bottom() - y) / 20.0).max(0.0) as usize) {
+                        cp.text(pos2(content.center().x, y), Align2::CENTER_CENTER, n, FontId::proportional(13.0), pal.subtle);
+                        y += 20.0;
+                    }
                 }
             }
             Body::Archive { rows, truncated } => {
@@ -648,5 +685,166 @@ impl Preview {
             .with_texture(tex, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
         p.add(shape);
         let _: Option<Pos2> = None;
+    }
+}
+
+/// Visita cada sector del gráfico: (nodo, ruta relativa, ángulo inicial/final, anillo 1.., índice de color).
+fn sectors(node: &crate::diskusage::Node, a0: f32, a1: f32, ring: usize, rings: usize, path: &mut Vec<usize>, hue: usize, f: &mut dyn FnMut(&crate::diskusage::Node, &[usize], f32, f32, usize, usize)) {
+    if ring > rings || node.size == 0 {
+        return;
+    }
+    let mut a = a0;
+    for (i, k) in node.kids.iter().enumerate() {
+        let span = (a1 - a0) * k.size as f32 / node.size as f32;
+        if span > 0.01 {
+            path.push(i);
+            let h = if ring == 1 { i } else { hue };
+            f(k, path, a, a + span, ring, h);
+            sectors(k, a, a + span, ring + 1, rings, path, h, f);
+            path.pop();
+        }
+        a += span;
+    }
+}
+
+fn usage_ui(cp: &egui::Painter, pal: &Pal, ctx: &egui::Context, area: Rect, root_path: PathBuf, uv: &mut UsageView, pointer: Option<Pos2>, clicked: bool) {
+    use std::f32::consts::{PI, TAU};
+    use std::sync::atomic::Ordering as AO;
+    if uv.root.is_none() && uv.scan.done.load(AO::Acquire) {
+        uv.root = uv.scan.result.lock().unwrap().take().map(Arc::new);
+    }
+    let Some(root) = uv.root.clone() else {
+        let msg = if uv.scan.done.load(AO::Relaxed) {
+            t("Sin datos").to_string()
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            format!("{}  {}", t("Calculando…"), tf("{} archivos", &[&uv.scan.files.load(AO::Relaxed)]))
+        };
+        cp.text(area.center(), Align2::CENTER_CENTER, msg, FontId::proportional(14.0), pal.subtle);
+        if !uv.scan.done.load(AO::Relaxed) {
+            cp.text(
+                area.center() + vec2(0.0, 24.0),
+                Align2::CENTER_CENTER,
+                human_size(uv.scan.bytes.load(AO::Relaxed)),
+                FontId::proportional(13.0),
+                pal.subtle,
+            );
+        }
+        return;
+    };
+    let cur = root.at(&uv.path);
+    let list_w = if area.width() > 560.0 { 230.0 } else { 0.0 };
+    let chart = Rect::from_min_max(area.min, pos2(area.right() - list_w, area.bottom()));
+    let c = chart.center();
+    let big = (chart.width().min(chart.height()) / 2.0 - 10.0).max(40.0);
+    let r0 = big * 0.24;
+    let partial = uv.scan.partial.load(AO::Relaxed);
+    // resultado parcial: menos anillos y aviso
+    let rings = if partial { 3 } else { crate::diskusage::DEPTH };
+    let th = (big - r0) / rings as f32;
+
+    // sector bajo el puntero
+    let mut hover: Option<(Vec<usize>, String, u64, bool)> = None;
+    let mut centre_hot = false;
+    if let Some(q) = pointer {
+        let d = q - c;
+        let r = d.length();
+        if r <= r0 {
+            centre_hot = chart.contains(q);
+        } else if r <= big {
+            let mut ang = d.y.atan2(d.x) + PI / 2.0;
+            if ang < 0.0 {
+                ang += TAU;
+            }
+            let ring = ((r - r0) / th) as usize + 1;
+            sectors(cur, 0.0, TAU, 1, rings, &mut Vec::new(), 0, &mut |n, path, a0, a1, rg, _| {
+                if rg == ring && ang >= a0 && ang < a1 {
+                    hover = Some((path.to_vec(), n.name.clone(), n.size, n.dir && !n.kids.is_empty() && !n.other));
+                }
+            });
+        }
+    }
+    let hp = hover.as_ref().map(|h| h.0.clone());
+
+    let mut mesh = egui::epaint::Mesh::default();
+    sectors(cur, 0.0, TAU, 1, rings, &mut Vec::new(), 0, &mut |n, path, a0, a1, rg, h| {
+        let hot = hp.as_deref() == Some(path);
+        let col: Color32 = if n.other {
+            pal.border
+        } else {
+            let v = (0.86 - 0.06 * (rg - 1) as f32 + if hot { 0.12 } else { 0.0 }).clamp(0.0, 1.0);
+            egui::ecolor::Hsva::new((h as f32 * 0.137) % 1.0, 0.55, v, 1.0).into()
+        };
+        let (ri, ro) = (r0 + (rg - 1) as f32 * th + 1.0, r0 + rg as f32 * th - 1.0);
+        let n_seg = ((a1 - a0) / 0.06).ceil().max(1.0) as usize;
+        let base = mesh.vertices.len() as u32;
+        for k in 0..=n_seg {
+            let a = a0 + (a1 - a0) * k as f32 / n_seg as f32 - PI / 2.0;
+            let dir = vec2(a.cos(), a.sin());
+            mesh.colored_vertex(c + dir * ri, col);
+            mesh.colored_vertex(c + dir * ro, col);
+        }
+        for k in 0..n_seg as u32 {
+            let i = base + 2 * k;
+            mesh.add_triangle(i, i + 1, i + 2);
+            mesh.add_triangle(i + 1, i + 3, i + 2);
+        }
+    });
+    cp.add(egui::Shape::mesh(mesh));
+
+    // centro: carpeta actual o sector señalado
+    cp.circle_filled(c, r0 - 2.0, if centre_hot && !uv.path.is_empty() { pal.hover } else { pal.surface });
+    let (name, size) = match &hover {
+        Some((_, n, s, _)) => (n.clone(), *s),
+        None => (cur.name.clone(), cur.size),
+    };
+    let mut nm = name;
+    if nm.chars().count() > 16 {
+        nm = nm.chars().take(15).collect::<String>() + "…";
+    }
+    cp.text(c + vec2(0.0, -9.0), Align2::CENTER_CENTER, nm, FontId::proportional(13.0), pal.text);
+    let pct = if cur.size > 0 { format!("  ·  {:.0}%", size as f32 * 100.0 / cur.size as f32) } else { String::new() };
+    let sub = if hover.is_some() { format!("{}{}", human_size(size), pct) } else { human_size(size) };
+    cp.text(c + vec2(0.0, 9.0), Align2::CENTER_CENTER, sub, FontId::proportional(12.0), pal.subtle);
+
+    let mut more = false;
+    if partial {
+        let r = Rect::from_min_size(pos2(chart.left() + 18.0, chart.bottom() - 30.0), vec2(150.0, 24.0));
+        let hot = pointer.map(|q| r.contains(q)).unwrap_or(false);
+        cp.text(pos2(r.left(), r.top() - 8.0), Align2::LEFT_CENTER, t("Tamaños aproximados (análisis parcial)"), FontId::proportional(11.5), pal.subtle);
+        cp.rect_filled(r, CornerRadius::same(8), if hot { pal.hover } else { pal.surface });
+        cp.text(r.center(), Align2::CENTER_CENTER, t("Seguir analizando"), FontId::proportional(12.5), pal.text);
+        more = hot && clicked;
+    }
+    if more {
+        uv.scan = crate::diskusage::start(root_path, ctx, false);
+        uv.root = None;
+        uv.path.clear();
+        return;
+    }
+    if clicked {
+        if let Some((p, _, _, true)) = &hover {
+            uv.path.extend(p.iter().copied());
+        } else if centre_hot && !uv.path.is_empty() {
+            uv.path.pop();
+        }
+    }
+
+    // lista de los mayores elementos
+    if list_w > 0.0 {
+        let x = area.right() - list_w + 8.0;
+        let mut y = area.top() + 22.0;
+        for (i, k) in cur.kids.iter().take(((area.height() - 20.0) / 24.0) as usize).enumerate() {
+            let col: Color32 = if k.other { pal.border } else { egui::ecolor::Hsva::new((i as f32 * 0.137) % 1.0, 0.55, 0.86, 1.0).into() };
+            cp.rect_filled(Rect::from_center_size(pos2(x + 5.0, y), vec2(10.0, 10.0)), CornerRadius::same(3), col);
+            let mut nm = k.name.clone();
+            if nm.chars().count() > 18 {
+                nm = nm.chars().take(17).collect::<String>() + "…";
+            }
+            cp.text(pos2(x + 18.0, y), Align2::LEFT_CENTER, nm, FontId::proportional(12.5), pal.text);
+            let pct = if cur.size > 0 { k.size as f32 * 100.0 / cur.size as f32 } else { 0.0 };
+            cp.text(pos2(area.right() - 12.0, y), Align2::RIGHT_CENTER, format!("{}  {:.0}%", human_size(k.size), pct), FontId::proportional(12.0), pal.subtle);
+            y += 24.0;
+        }
     }
 }
