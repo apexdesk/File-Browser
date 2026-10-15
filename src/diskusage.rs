@@ -22,6 +22,8 @@ pub struct Scan {
     pub files: Arc<AtomicU64>,
     pub done: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
+    /// el análisis se cortó por el presupuesto: los tamaños son aproximados
+    pub partial: Arc<AtomicBool>,
     pub result: Arc<Mutex<Option<Node>>>,
 }
 
@@ -35,23 +37,30 @@ struct Ctx {
     bytes: Arc<AtomicU64>,
     files: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
+    partial: Arc<AtomicBool>,
+    /// (archivos, instante límite); `None` = sin límite
+    budget: Option<(u64, std::time::Instant)>,
     egui: egui::Context,
     #[cfg(unix)]
     dev: u64,
 }
 
-pub fn start(path: PathBuf, ctx: &egui::Context) -> Scan {
+/// `limited`: corta a los ~200 000 archivos o 10 s y marca el resultado como parcial.
+pub fn start(path: PathBuf, ctx: &egui::Context, limited: bool) -> Scan {
     let scan = Scan {
         bytes: Arc::new(AtomicU64::new(0)),
         files: Arc::new(AtomicU64::new(0)),
         done: Arc::new(AtomicBool::new(false)),
         cancel: Arc::new(AtomicBool::new(false)),
+        partial: Arc::new(AtomicBool::new(false)),
         result: Arc::new(Mutex::new(None)),
     };
     let c = Ctx {
         bytes: scan.bytes.clone(),
         files: scan.files.clone(),
         cancel: scan.cancel.clone(),
+        partial: scan.partial.clone(),
+        budget: limited.then(|| (200_000, std::time::Instant::now() + std::time::Duration::from_secs(10))),
         egui: ctx.clone(),
         #[cfg(unix)]
         dev: {
@@ -62,7 +71,7 @@ pub fn start(path: PathBuf, ctx: &egui::Context) -> Scan {
     let (done, result) = (scan.done.clone(), scan.result.clone());
     std::thread::spawn(move || {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        let node = walk(&path, name, 0, &c);
+        let node = scan_bfs(&path, name, &c);
         if !c.cancel.load(AO::Relaxed) {
             *result.lock().unwrap() = Some(node);
         }
@@ -70,6 +79,21 @@ pub fn start(path: PathBuf, ctx: &egui::Context) -> Scan {
         c.egui.request_repaint();
     });
     scan
+}
+
+impl Ctx {
+    fn stop(&self) -> bool {
+        if self.cancel.load(AO::Relaxed) {
+            return true;
+        }
+        if let Some((max, end)) = self.budget {
+            if self.files.load(AO::Relaxed) >= max || std::time::Instant::now() >= end {
+                self.partial.store(true, AO::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn file_size(md: &std::fs::Metadata) -> u64 {
@@ -84,41 +108,96 @@ fn file_size(md: &std::fs::Metadata) -> u64 {
     }
 }
 
-fn walk(path: &Path, name: String, depth: usize, c: &Ctx) -> Node {
-    let mut node = Node { name, size: 0, dir: true, other: false, kids: Vec::new() };
-    let Ok(rd) = std::fs::read_dir(path) else { return node };
-    let mut kids: Vec<Node> = Vec::new();
-    for e in rd.flatten() {
-        if c.cancel.load(AO::Relaxed) {
-            break;
-        }
-        let Ok(ft) = e.file_type() else { continue };
-        let n = e.file_name().to_string_lossy().into_owned();
-        if ft.is_dir() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                // no cruza a otros sistemas de archivos (/proc, montajes…)
-                if e.metadata().map(|m| m.dev() != c.dev).unwrap_or(true) {
-                    continue;
+/// Entrada del árbol en construcción (los hijos siempre tienen índice mayor que el padre).
+struct Ent {
+    name: String,
+    dir: bool,
+    own: u64,
+    kids: Vec<usize>,
+}
+
+/// Recorrido por niveles: se termina de mirar un nivel de carpetas antes de pasar al siguiente, de
+/// modo que, si se agota el presupuesto, todas las ramas están igual de exploradas.
+fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
+    let mut arena: Vec<Ent> = vec![Ent { name, dir: true, own: 0, kids: Vec::new() }];
+    let mut level: Vec<(usize, PathBuf)> = vec![(0, root.to_path_buf())];
+    let mut depth = 0usize;
+    let mut cut = false;
+    'outer: while !level.is_empty() {
+        let mut next: Vec<(usize, PathBuf)> = Vec::new();
+        for (idx, dir) in level {
+            if c.stop() {
+                cut = true;
+                break 'outer;
+            }
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                let n = e.file_name().to_string_lossy().into_owned();
+                if ft.is_dir() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        // no cruza a otros sistemas de archivos (/proc, montajes…)
+                        if e.metadata().map(|m| m.dev() != c.dev).unwrap_or(true) {
+                            continue;
+                        }
+                    }
+                    let k = arena.len();
+                    arena.push(Ent { name: n, dir: true, own: 0, kids: Vec::new() });
+                    arena[idx].kids.push(k);
+                    next.push((k, e.path()));
+                } else {
+                    let sz = e.metadata().map(|m| file_size(&m)).unwrap_or(0);
+                    c.bytes.fetch_add(sz, AO::Relaxed);
+                    let cnt = c.files.fetch_add(1, AO::Relaxed);
+                    if cnt % 2000 == 0 {
+                        c.egui.request_repaint();
+                    }
+                    if cnt % 512 == 511 {
+                        // baja prioridad: deja respirar al disco y a la CPU
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    arena[idx].own += sz;
+                    // sólo se conservan individualmente los archivos de los anillos visibles
+                    if depth < DEPTH {
+                        let k = arena.len();
+                        arena.push(Ent { name: n, dir: false, own: sz, kids: Vec::new() });
+                        arena[idx].kids.push(k);
+                    }
                 }
             }
-            let sub = walk(&e.path(), n, depth + 1, c);
-            node.size += sub.size;
-            kids.push(sub);
-        } else {
-            let sz = e.metadata().map(|m| file_size(&m)).unwrap_or(0);
-            node.size += sz;
-            c.bytes.fetch_add(sz, AO::Relaxed);
-            if c.files.fetch_add(1, AO::Relaxed) % 2000 == 0 {
-                c.egui.request_repaint();
-            }
-            kids.push(Node { name: n, size: sz, dir: false, other: false, kids: Vec::new() });
+        }
+        level = next;
+        depth += 1;
+    }
+    if cut {
+        c.partial.store(true, AO::Relaxed);
+    }
+    // totales: de las hojas hacia la raíz (los hijos tienen índice mayor)
+    let mut total: Vec<u64> = arena.iter().map(|e| e.own).collect();
+    let mut parent = vec![usize::MAX; arena.len()];
+    for (i, e) in arena.iter().enumerate() {
+        for &k in &e.kids {
+            parent[k] = i;
         }
     }
-    if depth >= DEPTH {
-        return node; // sin detalle por debajo del último anillo
+    for i in (1..arena.len()).rev() {
+        if parent[i] != usize::MAX && arena[i].dir {
+            let t = total[i];
+            total[parent[i]] += t;
+        }
     }
+    build(&arena, &total, 0, 0)
+}
+
+fn build(arena: &[Ent], total: &[u64], i: usize, depth: usize) -> Node {
+    let e = &arena[i];
+    let mut node = Node { name: e.name.clone(), size: if e.dir { total[i] } else { e.own }, dir: e.dir, other: false, kids: Vec::new() };
+    if depth >= DEPTH || e.kids.is_empty() {
+        return node;
+    }
+    let mut kids: Vec<Node> = e.kids.iter().map(|&k| build(arena, total, k, depth + 1)).collect();
     kids.sort_by(|a, b| b.size.cmp(&a.size));
     if kids.len() > KIDS {
         let rest: u64 = kids[KIDS..].iter().map(|k| k.size).sum();
