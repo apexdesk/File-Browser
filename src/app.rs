@@ -172,6 +172,7 @@ enum Dlg {
     None,
     OpenWith(OpenWithDlg),
     Trash(TrashDlg),
+    Recent,
     Hash(HashDlg),
     Dups(DupsDlg),
     Props(PropsDlg),
@@ -367,6 +368,12 @@ pub struct App {
     extra_cache: HashMap<PathBuf, fsys::ExtraMeta>,
     /// Comprimidos abiertos como carpeta: (carpeta de caché, archivo original).
     arch: Vec<(PathBuf, PathBuf)>,
+    /// El usuario cerró el panel del portapapeles (reaparece al copiar de nuevo).
+    clip_hidden: bool,
+    /// Listados de las columnas estáticas de la vista de columnas: ruta -> (instante, filas).
+    col_cache: HashMap<PathBuf, (Instant, Arc<Vec<(String, bool)>>)>,
+    /// Se está pintando la columna activa de la vista de columnas (sin cabecera ni columnas extra).
+    col_active: bool,
     /// Pestaña abierta en Opciones: 0 = general, 1 = columnas.
     opts_tab: u8,
     perm_t: f64,
@@ -1020,6 +1027,9 @@ impl App {
             preview_was: false,
             extra_cache: HashMap::new(),
             arch: Vec::new(),
+            clip_hidden: false,
+            col_cache: HashMap::new(),
+            col_active: false,
             opts_tab: 0,
             perm_t: -10.0,
             insets: [0.0; 4],
@@ -1142,6 +1152,9 @@ impl App {
             rebinding: None,
         };
         std::thread::spawn(clean_archive_cache);
+        if std::env::var_os("FB_COLS").is_some() {
+            app.cfg.col_view = true;
+        }
         if std::env::var("FB_LIST").is_ok() {
             app.cfg.grid = false;
         }
@@ -1150,7 +1163,7 @@ impl App {
         app.load(start, false);
         let split_dir = if std::env::var_os("FB_SPLIT").is_some() {
             Some(std::env::var_os("FB_SPLIT").map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| app.cwd.clone()))
-        } else if app.cfg.split {
+        } else if app.cfg.split && !app.cfg.col_view {
             Some(app.cfg.split_dir.clone().filter(|p| p.is_dir()).unwrap_or_else(|| app.cwd.clone()))
         } else {
             None
@@ -1201,7 +1214,21 @@ impl App {
         self.live_side = 0;
     }
 
+    /// 0 = lista, 1 = cuadrícula, 2 = columnas (cierra la vista dividida).
+    fn set_view(&mut self, m: u8) {
+        self.cfg.grid = m == 1;
+        self.cfg.col_view = m == 2;
+        if m == 2 && self.other.is_some() {
+            self.toggle_split();
+        }
+        self.cfg.save();
+    }
+
     fn toggle_split(&mut self) {
+        if self.cfg.col_view && self.other.is_none() {
+            self.say(t("La vista de columnas no admite vista dividida").into(), true);
+            return;
+        }
         if self.other.is_some() {
             // el panel con foco pasa a ser el único
             self.ensure_live(self.active_side);
@@ -1750,6 +1777,14 @@ impl App {
         }
     }
 
+    /// Anota un archivo abierto en la lista de recientes.
+    fn note_recent(&mut self, p: &Path) {
+        self.cfg.recent.retain(|r| r != p);
+        self.cfg.recent.insert(0, p.to_path_buf());
+        self.cfg.recent.truncate(40);
+        self.cfg.save();
+    }
+
     fn open_index(&mut self, i: u32) {
         let Some(e) = self.entries.get(i as usize) else { return };
         let p = self.cwd.join(&*e.name);
@@ -1758,12 +1793,15 @@ impl App {
         } else if e.is_dir() {
             self.navigate(p);
         } else if crate::archive::detect(&p).is_some() {
+            self.note_recent(&p);
             self.open_archive(p);
         } else if is_program(&p) {
             self.run_program(&p);
         } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text) {
+            self.note_recent(&p);
             self.open_preview_at(i);
         } else {
+            self.note_recent(&p);
             fsys::open_external(&p);
         }
     }
@@ -1780,6 +1818,7 @@ impl App {
         }
         self.say(tf("{} {} elemento(s)", &[&(if cut { t("Cortado:") } else { t("Copiado:") }), &v.len()]), false);
         self.clipboard = Some((v, cut));
+        self.clip_hidden = false;
     }
 
     fn do_paste(&mut self) {
@@ -2359,14 +2398,8 @@ impl App {
             C::SwitchPane => self.focus_side(1 - self.active_side),
             C::CopyOther => self.to_other_pane(false),
             C::MoveOther => self.to_other_pane(true),
-            C::GridView => {
-                self.cfg.grid = true;
-                self.cfg.save();
-            }
-            C::ListView => {
-                self.cfg.grid = false;
-                self.cfg.save();
-            }
+            C::GridView => self.set_view(1),
+            C::ListView => self.set_view(0),
             C::Theme => self.set_dark(!self.cfg.dark),
             C::Search => self.open_search(),
             C::Filter => self.filter_focus = true,
@@ -3007,13 +3040,14 @@ impl App {
                         self.spawn_sort();
                     }
                 });
-                if icon_button(ui, &pal, Glyph::List, true, !self.cfg.grid, t("Vista de lista")).clicked() {
-                    self.cfg.grid = false;
-                    self.cfg.save();
+                if icon_button(ui, &pal, Glyph::List, true, !self.cfg.grid && !self.cfg.col_view, t("Vista de lista")).clicked() {
+                    self.set_view(0);
                 }
                 if icon_button(ui, &pal, Glyph::Grid, true, self.cfg.grid, t("Vista de cuadrícula")).clicked() {
-                    self.cfg.grid = true;
-                    self.cfg.save();
+                    self.set_view(1);
+                }
+                if !self.phone && icon_button(ui, &pal, Glyph::Columns, true, self.cfg.col_view, t("Vista de columnas")).clicked() {
+                    self.set_view(2);
                 }
                 ui.add_space(4.0);
                 // filtro
@@ -3651,6 +3685,8 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut connect: Option<String> = None;
         let mut unmount: Option<PathBuf> = None;
+        let mut show_recent = false;
+        let mut show_trash = false;
         let cwd = self.cwd.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let head = |ui: &mut egui::Ui, t: &str| {
@@ -3669,6 +3705,12 @@ impl App {
                 if r.clicked() {
                     go = Some(pl.path.clone());
                 }
+            }
+            if side_item(ui, &pal, Glyph::Clock, None, t("Recientes"), false, false).clicked() {
+                show_recent = true;
+            }
+            if extras::trash_supported() && side_item(ui, &pal, Glyph::Trash, None, t("Papelera"), false, false).clicked() {
+                show_trash = true;
             }
             if !self.cfg.bookmarks.is_empty() || dragging {
                 head(ui, t("Marcadores"));
@@ -3748,6 +3790,12 @@ impl App {
                 connect = Some(String::new());
             }
         });
+        if show_recent {
+            self.dlg = Dlg::Recent;
+        }
+        if show_trash {
+            self.open_trash();
+        }
         if let Some(u) = connect {
             self.connect_uri(u);
         }
@@ -3823,6 +3871,203 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Panel del portapapeles: lo copiado/cortado, pegar aquí, vaciar y ocultar.
+    fn clip_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        let Some((paths, cut)) = self.clipboard.clone() else { return };
+        let mut paste = false;
+        let mut clear = false;
+        let mut hide = false;
+        ui.horizontal_centered(|ui| {
+            ui.label(egui::RichText::new(if cut { t("Cortado:") } else { t("Copiado:") }).size(12.5).color(pal.accent));
+            let mut shown = 0;
+            let mut used = 0.0;
+            let room = (ui.available_width() - 260.0).max(80.0);
+            for p in &paths {
+                let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
+                let g = ui.painter().layout_no_wrap(n.clone(), FontId::proportional(12.5), pal.text);
+                if used + g.size().x + 14.0 > room && shown > 0 {
+                    break;
+                }
+                used += g.size().x + 14.0;
+                shown += 1;
+                egui::Frame::new().fill(pal.hover).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(6, 1)).show(ui, |ui| {
+                    ui.label(egui::RichText::new(n).size(12.5).color(pal.text));
+                });
+            }
+            if paths.len() > shown {
+                ui.label(egui::RichText::new(format!("+{}", paths.len() - shown)).size(12.5).color(pal.subtle));
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(t("Cerrar")).clicked() {
+                    hide = true;
+                }
+                if ui.small_button(t("Vaciar")).clicked() {
+                    clear = true;
+                }
+                if ui.small_button(t("Pegar aquí")).clicked() {
+                    paste = true;
+                }
+            });
+        });
+        if paste {
+            self.do_paste();
+        }
+        if clear {
+            self.clipboard = None;
+        }
+        if hide {
+            self.clip_hidden = true;
+        }
+    }
+
+    /// Listado ligero de una carpeta para las columnas estáticas (con caché de unos segundos).
+    fn col_rows(&mut self, dir: &Path) -> Arc<Vec<(String, bool)>> {
+        if let Some((t0, v)) = self.col_cache.get(dir) {
+            if t0.elapsed() < Duration::from_secs(3) {
+                return v.clone();
+            }
+        }
+        let hidden = self.cfg.show_hidden;
+        let mut rows: Vec<(String, bool)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten().take(20_000) {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if !hidden && n.starts_with('.') {
+                    continue;
+                }
+                let d = e.file_type().map(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir())).unwrap_or(false);
+                rows.push((n, d));
+            }
+        }
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| fsys::natural_cmp(&a.0, &b.0)));
+        let v = Arc::new(rows);
+        if self.col_cache.len() > 64 {
+            self.col_cache.clear();
+        }
+        self.col_cache.insert(dir.to_path_buf(), (Instant::now(), v.clone()));
+        v
+    }
+
+    /// Columna estática (carpeta ascendente o contenido de la carpeta seleccionada).
+    /// Devuelve el elemento pulsado: (nombre, es carpeta).
+    fn col_static(&mut self, ui: &mut egui::Ui, rect: Rect, dir: &Path, hl: Option<&str>, salt: usize) -> Option<(String, bool)> {
+        let pal = self.pal;
+        let rows = self.col_rows(dir);
+        let folder_tex = if self.cfg.sys_icons { self.sys.folder(&self.ctx, None) } else { None };
+        let mut out = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(0.0, 0.0))), |ui| {
+            egui::ScrollArea::vertical().id_salt(("col_static", salt)).auto_shrink([false, false]).show_rows(ui, 28.0, rows.len(), |ui, range| {
+                for i in range {
+                    let (name, is_dir) = &rows[i];
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+                    let p = ui.painter();
+                    if hl == Some(name.as_str()) {
+                        p.rect_filled(r.shrink2(vec2(3.0, 1.0)), CornerRadius::same(8), pal.sel);
+                    } else if resp.hovered() {
+                        p.rect_filled(r.shrink2(vec2(3.0, 1.0)), CornerRadius::same(8), pal.hover.gamma_multiply(0.7));
+                    }
+                    let ir = Rect::from_center_size(pos2(r.left() + 18.0, r.center().y), vec2(18.0, 18.0));
+                    if let (true, Some(tex)) = (*is_dir, folder_tex) {
+                        p.image(tex, ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    } else if *is_dir {
+                        theme::draw_folder(p, ir);
+                    } else {
+                        let ext = name.rsplit_once('.').map(|x| x.1).unwrap_or("");
+                        theme::draw_file(p, ir, fsys::kind_of_ext(&ext.to_lowercase()), ext, &pal);
+                    }
+                    let mut job = egui::text::LayoutJob::simple_singleline(name.clone(), FontId::proportional(13.0), pal.text);
+                    job.wrap.max_width = (r.width() - 62.0).max(20.0);
+                    job.wrap.max_rows = 1;
+                    job.wrap.break_anywhere = true;
+                    let g = p.layout_job(job);
+                    p.galley(pos2(r.left() + 34.0, r.center().y - g.size().y / 2.0), g, pal.text);
+                    if *is_dir {
+                        let c = pos2(r.right() - 14.0, r.center().y);
+                        p.add(egui::Shape::line(
+                            vec![c + vec2(-2.0, -4.0), c + vec2(2.0, 0.0), c + vec2(-2.0, 4.0)],
+                            Stroke::new(1.3, pal.subtle),
+                        ));
+                    }
+                    if resp.clicked() {
+                        out = Some((name.clone(), *is_dir));
+                    }
+                }
+            });
+        });
+        out
+    }
+
+    /// Vista de columnas: ascendentes | carpeta actual (columna activa, completa) | contenido/ficha de la selección.
+    fn show_columns(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        let full = ui.available_rect_before_wrap();
+        let n_fit = ((full.width() / 230.0).floor() as usize).max(2);
+        let mut anc: Vec<PathBuf> = self.cwd.ancestors().skip(1).map(|p| p.to_path_buf()).collect();
+        let n = n_fit.min(anc.len() + 2);
+        anc.truncate(n.saturating_sub(2));
+        anc.reverse();
+        let w = full.width() / n as f32;
+        let mut nav: Option<(PathBuf, String, bool)> = None; // (carpeta de la columna, nombre, es carpeta)
+        let mut x = full.left();
+        for (i, dir) in anc.iter().enumerate() {
+            let rect = Rect::from_min_size(pos2(x, full.top()), vec2(w, full.height()));
+            let next: &Path = anc.get(i + 1).map(|p| p.as_path()).unwrap_or(self.cwd.as_path());
+            let hl = next.file_name().map(|n| n.to_string_lossy().into_owned());
+            if let Some((name, is_dir)) = self.col_static(ui, rect.shrink2(vec2(2.0, 0.0)), dir, hl.as_deref(), i) {
+                nav = Some((dir.clone(), name, is_dir));
+            }
+            ui.painter().line_segment([rect.right_top() + vec2(-0.5, 6.0), rect.right_bottom() + vec2(-0.5, -6.0)], Stroke::new(1.0, pal.border));
+            x += w;
+        }
+        // columna activa: la lista completa de siempre, sin cabecera ni columnas extra
+        let arect = Rect::from_min_size(pos2(x, full.top()), vec2(w, full.height()));
+        self.col_active = true;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(arect.shrink2(vec2(2.0, 0.0))), |ui| {
+            ui.push_id("col_active", |ui| self.show_files(ui));
+        });
+        self.col_active = false;
+        ui.painter().line_segment([arect.right_top() + vec2(-0.5, 6.0), arect.right_bottom() + vec2(-0.5, -6.0)], Stroke::new(1.0, pal.border));
+        x += w;
+        // columna de vista: contenido de la carpeta seleccionada o ficha del archivo
+        let prect = Rect::from_min_size(pos2(x, full.top()), vec2(full.right() - x, full.height()));
+        let sel: Option<(String, bool, u64, i64)> = if self.sel_count == 1 {
+            self.cursor
+                .and_then(|c| self.entries.get(c as usize))
+                .map(|e| (e.name.to_string(), e.is_dir(), e.size, e.mtime))
+        } else {
+            None
+        };
+        match sel {
+            Some((name, true, _, _)) => {
+                let dir = self.cwd.join(&name);
+                if let Some((n2, is_dir)) = self.col_static(ui, prect.shrink2(vec2(2.0, 0.0)), &dir, None, 99) {
+                    nav = Some((dir, n2, is_dir));
+                }
+            }
+            Some((name, false, size, mtime)) => {
+                let ext = name.rsplit_once('.').map(|x| x.1).unwrap_or("").to_string();
+                let c = pos2(prect.center().x, prect.top() + 90.0);
+                theme::draw_file(ui.painter(), Rect::from_center_size(c, vec2(96.0, 96.0)), fsys::kind_of_ext(&ext.to_lowercase()), &ext, &pal);
+                let p = ui.painter();
+                p.text(pos2(prect.center().x, c.y + 72.0), Align2::CENTER_CENTER, &name, FontId::proportional(14.0), pal.text);
+                p.text(pos2(prect.center().x, c.y + 94.0), Align2::CENTER_CENTER, fsys::human_size(size), FontId::proportional(12.5), pal.subtle);
+                p.text(pos2(prect.center().x, c.y + 114.0), Align2::CENTER_CENTER, fsys::fmt_time(mtime), FontId::proportional(12.5), pal.subtle);
+            }
+            None => {}
+        }
+        if let Some((dir, name, is_dir)) = nav {
+            // carpeta de una columna ascendente → entrar; archivo (o elemento de la columna de vista) → ir a su carpeta y seleccionarlo
+            let from_preview = dir.starts_with(&self.cwd) && dir != self.cwd;
+            if is_dir && !from_preview {
+                self.navigate(dir.join(&name));
+            } else {
+                self.navigate(dir);
+                self.pending_select = vec![name];
+            }
+        }
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
@@ -4113,7 +4358,7 @@ impl App {
             self.perm_banner(ui);
         }
         self.arch_banner(ui);
-        if !grid {
+        if !grid && !self.col_active {
             self.list_header(ui);
         }
         let entries = self.entries.clone();
@@ -4550,7 +4795,7 @@ impl App {
                     }
                     let cy = r.center().y;
                     let name_x = r.left() + 46.0;
-                    let lc = list_cols(r.width(), &self.cfg.columns, &self.cfg.col_w);
+                    let lc = list_cols(r.width(), if self.col_active { &[] } else { &self.cfg.columns }, &self.cfg.col_w);
                     let name_w = (r.right() - lc.reserve - name_x).max(40.0);
                     if renaming {
                         let lr = Rect::from_min_size(pos2(name_x - 4.0, r.top() + 2.0), vec2(name_w, r.height() - 4.0));
@@ -5805,12 +6050,13 @@ impl App {
             ui.menu_button(t("Ver"), |ui| {
                 ui.set_min_width(250.0);
                 if mi_check(ui, t("Cuadrícula"), "", self.cfg.grid) {
-                    self.cfg.grid = true;
-                    self.cfg.save();
+                    self.set_view(1);
                 }
-                if mi_check(ui, t("Lista"), "", !self.cfg.grid) {
-                    self.cfg.grid = false;
-                    self.cfg.save();
+                if mi_check(ui, t("Lista"), "", !self.cfg.grid && !self.cfg.col_view) {
+                    self.set_view(0);
+                }
+                if mi_check(ui, t("Vista de columnas"), "", self.cfg.col_view) {
+                    self.set_view(2);
                 }
                 ui.separator();
                 if mi_check(ui, t("Vista dividida (dos paneles)"), "F9", self.other.is_some()) {
@@ -7084,6 +7330,7 @@ impl App {
                         changed |= hid;
                         res_sort |= hid;
                         changed |= ui.checkbox(&mut self.cfg.show_sidebar, t("Mostrar barra lateral")).changed();
+                        changed |= ui.checkbox(&mut self.cfg.clip_panel, t("Mostrar panel del portapapeles")).changed();
                         ui.add_space(4.0);
                         let mut single = self.cfg.single_click.unwrap_or(cfg!(target_os = "android"));
                         if ui.checkbox(&mut single, t("Abrir con un solo clic o toque")).changed() {
@@ -7216,6 +7463,66 @@ impl App {
                     done = true;
                 }
                 keep = open && !done;
+            }
+            Dlg::Recent => {
+                let mut open = true;
+                let mut act: Option<(u8, PathBuf)> = None; // 1 abrir, 2 mostrar en carpeta
+                let mut clear = false;
+                egui::Window::new(t("Recientes"))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .default_size([560.0, 380.0])
+                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        if self.cfg.recent.is_empty() {
+                            ui.label(egui::RichText::new(t("Sin elementos recientes")).color(pal.subtle));
+                        }
+                        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+                            for r in &self.cfg.recent {
+                                let name = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| r.display().to_string());
+                                ui.horizontal(|ui| {
+                                    if ui.link(name).clicked() {
+                                        act = Some((1, r.clone()));
+                                    }
+                                    ui.label(egui::RichText::new(r.parent().map(|p| p.display().to_string()).unwrap_or_default()).size(12.0).color(pal.subtle));
+                                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button(t("Mostrar en carpeta")).clicked() {
+                                            act = Some((2, r.clone()));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                        ui.separator();
+                        if ui.add_enabled(!self.cfg.recent.is_empty(), egui::Button::new(t("Vaciar"))).clicked() {
+                            clear = true;
+                        }
+                    });
+                if clear {
+                    self.cfg.recent.clear();
+                    self.cfg.save();
+                }
+                match act {
+                    Some((1, p)) => {
+                        if p.exists() {
+                            fsys::open_external(&p);
+                            self.note_recent(&p);
+                        } else {
+                            self.say(tf("No existe: {}", &[&p.display()]), true);
+                        }
+                    }
+                    Some((_, p)) => {
+                        if let Some(dir) = p.parent().map(|d| d.to_path_buf()) {
+                            self.dlg = Dlg::None;
+                            self.navigate(dir);
+                            if let Some(n) = p.file_name() {
+                                self.pending_select = vec![n.to_string_lossy().into_owned()];
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                keep = open && matches!(self.dlg, Dlg::Recent);
             }
             Dlg::Trash(d) => {
                 let mut open = true;
@@ -7881,6 +8188,14 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show(ui, |ui| self.status_bar(ui));
 
+        if self.cfg.clip_panel && !phone && !self.clip_hidden && self.clipboard.is_some() {
+            egui::Panel::bottom("clip")
+                .frame(egui::Frame::new().fill(bgfill).inner_margin(egui::Margin::symmetric(14, 4)))
+                .exact_size(34.0)
+                .show_separator_line(false)
+                .show(ui, |ui| self.clip_bar(ui));
+        }
+
         if self.cfg.term_open && !phone {
             let r = egui::Panel::bottom("terminal")
                 .frame(egui::Frame::new().fill(bgfill).inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 6 }))
@@ -7929,7 +8244,11 @@ impl eframe::App for App {
                                 // La vista rápida captura la entrada: el fondo no recibe interacción.
                                 ui.disable();
                             }
-                            self.show_files(ui);
+                            if self.cfg.col_view && !phone {
+                                self.show_columns(ui);
+                            } else {
+                                self.show_files(ui);
+                            }
                         });
                 } else {
                     self.show_split(ui, card);
