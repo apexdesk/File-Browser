@@ -149,6 +149,9 @@ pub enum Glyph {
     Plus,
     Check,
     More,
+    Trash,
+    Clock,
+    Columns,
 }
 
 /// Trazo con terminaciones redondeadas (egui no las ofrece): se añaden discos en los extremos.
@@ -433,6 +436,22 @@ pub fn draw_glyph(p: &Painter, c: Pos2, s: f32, g: Glyph, col: Color32) {
             for y in [-6.0, 0.0, 6.0] {
                 p.circle_filled(q(0.0, y), 1.9, st.color);
             }
+        }
+        Glyph::Columns => {
+            path(p, &[q(-8.0, -7.0), q(8.0, -7.0), q(8.0, 7.0), q(-8.0, 7.0)], true, st);
+            path(p, &[q(-2.7, -7.0), q(-2.7, 7.0)], false, st);
+            path(p, &[q(2.7, -7.0), q(2.7, 7.0)], false, st);
+        }
+        Glyph::Trash => {
+            path(p, &[q(-8.0, -5.0), q(8.0, -5.0)], false, st);
+            path(p, &[q(-2.5, -5.0), q(-2.5, -8.0), q(2.5, -8.0), q(2.5, -5.0)], false, st);
+            path(p, &[q(-6.0, -5.0), q(-5.0, 8.0), q(5.0, 8.0), q(6.0, -5.0)], false, st);
+            path(p, &[q(-2.0, -1.5), q(-2.0, 4.5)], false, st);
+            path(p, &[q(2.0, -1.5), q(2.0, 4.5)], false, st);
+        }
+        Glyph::Clock => {
+            p.circle_stroke(q(0.0, 0.0), 8.0, st);
+            path(p, &[q(0.0, -4.5), q(0.0, 0.0), q(4.0, 2.5)], false, st);
         }
         Glyph::Check => {
             path(p, &[q(-8.0, -8.0), q(8.0, -8.0), q(8.0, 8.0), q(-8.0, 8.0)], true, st);

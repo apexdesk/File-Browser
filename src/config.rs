@@ -29,6 +29,12 @@ pub struct Config {
     pub columns: Vec<String>,
     /// Anchuras personalizadas de columnas de la lista: (id, ancho).
     pub col_w: Vec<(String, f32)>,
+    /// Mostrar el panel del portapapeles cuando hay algo copiado.
+    pub clip_panel: bool,
+    /// Vista de columnas (jerarquía horizontal); excluye la vista dividida.
+    pub col_view: bool,
+    /// Archivos abiertos recientemente (el más reciente primero).
+    pub recent: Vec<PathBuf>,
     /// Abrir con un solo clic/toque; `None` = según la plataforma (sí en Android, no en PC).
     pub single_click: Option<bool>,
     pub split: bool,
@@ -67,6 +73,9 @@ impl Default for Config {
             preview_window: true,
             columns: vec!["date".into(), "size".into(), "kind".into()],
             col_w: Vec::new(),
+            clip_panel: true,
+            col_view: false,
+            recent: Vec::new(),
             single_click: None,
             split: false,
             keys: Vec::new(),
@@ -95,6 +104,18 @@ impl Config {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
                 "bookmark" => c.bookmarks.push(PathBuf::from(v)),
+                "recent" => {
+                    if c.recent.len() < 40 {
+                        c.recent.push(PathBuf::from(v));
+                    }
+                }
+                "clip_panel" => c.clip_panel = v != "0",
+                "col_view" => c.col_view = v == "1",
+                k if k.starts_with("colw.") => {
+                    if let Ok(w) = v.parse::<f32>() {
+                        c.col_w.push((k["colw.".len()..].to_string(), w.clamp(40.0, 400.0)));
+                    }
+                }
                 "grid" => c.grid = v == "1",
                 "zoom" => c.zoom = v.parse().unwrap_or(120.0f32).clamp(64.0, 200.0),
                 "hidden" => c.show_hidden = v == "1",
@@ -192,6 +213,14 @@ impl Config {
             s.push_str(&format!("single_click={}\n", v as u8));
         }
         s.push_str(&format!("columns={}\n", self.columns.join(",")));
+        s.push_str(&format!("clip_panel={}\n", self.clip_panel as u8));
+        s.push_str(&format!("col_view={}\n", self.col_view as u8));
+        for r in &self.recent {
+            s.push_str(&format!("recent={}\n", r.display()));
+        }
+        for (id, w) in &self.col_w {
+            s.push_str(&format!("colw.{id}={w}\n"));
+        }
         s.push_str(&format!("split={}\n", self.split as u8));
         for (id, spec) in &self.keys {
             s.push_str(&format!("key.{id}={spec}\n"));
