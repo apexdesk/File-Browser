@@ -22,6 +22,7 @@ enum Raw {
     Image(Decoded),
     Text(Vec<String>, bool),
     Folder(usize, Vec<String>),
+    Archive(crate::archive::Listing),
     Binary,
     Err(String),
 }
@@ -31,6 +32,7 @@ pub enum Body {
     Image(egui::TextureHandle),
     Text { lines: Vec<String>, truncated: bool },
     Folder { count: usize, names: Vec<String> },
+    Archive { rows: Vec<(String, u64, bool)>, truncated: bool },
     Info,
     Error(String),
 }
@@ -124,6 +126,11 @@ fn load(job: &Job) -> Raw {
                 Raw::Folder(n, names)
             }
             Err(e) => Raw::Err(e.to_string()),
+        },
+        Kind::Archive => match crate::archive::list(&job.path, 3000, std::time::Duration::from_millis(700)) {
+            Ok(l) if !l.items.is_empty() => Raw::Archive(l),
+            Ok(_) => Raw::Binary,
+            Err(_) => Raw::Binary,
         },
         Kind::Image | Kind::Video => match decode_image(&job.path, MAX_IMG) {
             Some(d) => Raw::Image(d),
@@ -223,6 +230,11 @@ impl Preview {
                 }
                 Raw::Text(lines, truncated) => Body::Text { lines, truncated },
                 Raw::Folder(count, names) => Body::Folder { count, names },
+                Raw::Archive(l) => {
+                    let mut rows: Vec<(String, u64, bool)> = l.items.into_iter().map(|i| (i.name, i.size, i.dir)).collect();
+                    rows.sort_by(|a, b| crate::fsys::natural_cmp(&a.0, &b.0));
+                    Body::Archive { rows, truncated: l.truncated }
+                }
                 Raw::Binary => Body::Info,
                 Raw::Err(e) => Body::Error(e),
             };
@@ -380,7 +392,7 @@ impl Preview {
                     let t = t.clone();
                     self.draw_zoomable(ctx, &cp, content, t.id(), sz, in_content);
                 }
-                if matches!(self.kind, Kind::Image | Kind::Video | Kind::Folder | Kind::Text) {
+                if matches!(self.kind, Kind::Image | Kind::Video | Kind::Folder | Kind::Text | Kind::Archive) {
                     p.text(
                         pos2(content.center().x, content.bottom() - 14.0),
                         Align2::CENTER_CENTER,
@@ -447,6 +459,37 @@ impl Preview {
                 for n in names.iter().take(((content.bottom() - y) / 20.0).max(0.0) as usize) {
                     cp.text(pos2(content.center().x, y), Align2::CENTER_CENTER, n, FontId::proportional(13.0), pal.subtle);
                     y += 20.0;
+                }
+            }
+            Body::Archive { rows, truncated } => {
+                let head = if *truncated { format!("{} {}", tf("{count} elementos", &[&rows.len()]), t("(índice parcial)")) } else { tf("{count} elementos", &[&rows.len()]) };
+                cp.text(pos2(content.left() + 18.0, content.top() + 16.0), Align2::LEFT_CENTER, head, FontId::proportional(13.0), pal.text);
+                let top = content.top() + 38.0;
+                let fit = ((content.bottom() - top - 8.0) / 20.0).max(0.0) as usize;
+                for (i, (n, sz, dir)) in rows.iter().take(fit).enumerate() {
+                    let y = top + i as f32 * 20.0 + 10.0;
+                    let maxw = content.width() - 36.0 - 90.0;
+                    let mut name = n.clone();
+                    let mut g = cp.layout_no_wrap(name.clone(), FontId::proportional(13.0), pal.text);
+                    while g.size().x > maxw && name.chars().count() > 4 {
+                        let keep = name.chars().count() - ((name.chars().count() / 8).max(1));
+                        name = name.chars().take(keep).collect();
+                        g = cp.layout_no_wrap(format!("{name}…"), FontId::proportional(13.0), pal.text);
+                    }
+                    let col = if *dir { pal.accent } else { pal.text };
+                    cp.galley(pos2(content.left() + 18.0, y - g.size().y / 2.0), g, col);
+                    if !*dir {
+                        cp.text(pos2(content.right() - 18.0, y), Align2::RIGHT_CENTER, human_size(*sz), FontId::proportional(12.0), pal.subtle);
+                    }
+                }
+                if rows.len() > fit {
+                    cp.text(
+                        pos2(content.center().x, content.bottom() - 12.0),
+                        Align2::CENTER_CENTER,
+                        format!("… +{}", rows.len() - fit),
+                        FontId::proportional(12.0),
+                        pal.subtle,
+                    );
                 }
             }
             Body::Info | Body::Error(_) => {
