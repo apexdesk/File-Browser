@@ -503,27 +503,25 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// Permisos y fecha se copian "si se puede": muchos sistemas de red/FAT no los admiten y eso no
 /// debe convertir una copia correcta en un error.
 fn copy_file(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std::io::Result<()> {
-    use std::io::{Read, Write};
+    use std::io::Read;
     let mut r = fs::File::open(src)?;
     let md = r.metadata()?;
     let mut w = fs::File::create(dst)?;
-    if buf.len() < (2 << 20) {
-        buf.resize(2 << 20, 0);
-    }
+    // `io::copy` entre archivos usa copy_file_range en Linux (copia en el kernel, reflink o copia
+    // en el servidor en NFS/SMB); en el resto cae a lectura/escritura. Se hace por trozos para poder
+    // informar del progreso y cancelar.
+    let _ = &buf;
     let mut copied = 0u64;
     loop {
         if prog.cancelled() {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelado"));
         }
-        let n = match r.read(buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        w.write_all(&buf[..n])?;
-        copied += n as u64;
-        prog.done.fetch_add(n as u64, AO::Relaxed);
+        let n = std::io::copy(&mut r.by_ref().take(64 << 20), &mut w)?;
+        if n == 0 {
+            break;
+        }
+        copied += n;
+        prog.done.fetch_add(n, AO::Relaxed);
     }
     if copied == 0 {
         prog.done.fetch_add(1, AO::Relaxed);
@@ -566,14 +564,60 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
         }
         match fs::read_dir(src) {
             Ok(rd) => {
+                // Los archivos pequeños se copian en paralelo: en red lo que cuesta es la latencia
+                // de cada archivo, no el ancho de banda.
+                let mut small: Vec<(PathBuf, PathBuf)> = Vec::new();
                 for e in rd {
                     match e {
-                        Ok(e) => failed += copy_tree(&e.path(), &dst.join(e.file_name()), prog, buf)?,
+                        Ok(e) => {
+                            let sp = e.path();
+                            let dp = dst.join(e.file_name());
+                            let is_small = e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                                && e.metadata().map(|m| m.len() < (8 << 20)).unwrap_or(false);
+                            if is_small {
+                                small.push((sp, dp));
+                            } else {
+                                failed += copy_tree(&sp, &dp, prog, buf)?;
+                            }
+                        }
                         Err(e) => {
                             note_error(prog, src, &e);
                             failed += 1;
                         }
                     }
+                }
+                if small.len() < 4 {
+                    for (sp, dp) in &small {
+                        failed += copy_tree(sp, dp, prog, buf)?;
+                    }
+                } else {
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let fails = std::sync::atomic::AtomicUsize::new(0);
+                    let cancelled = std::sync::atomic::AtomicBool::new(false);
+                    std::thread::scope(|sc| {
+                        for _ in 0..small.len().min(6) {
+                            sc.spawn(|| {
+                                let mut b: Vec<u8> = Vec::new();
+                                loop {
+                                    let i = next.fetch_add(1, AO::Relaxed);
+                                    let Some((sp, dp)) = small.get(i) else { break };
+                                    match copy_tree(sp, dp, prog, &mut b) {
+                                        Ok(f) => {
+                                            fails.fetch_add(f, AO::Relaxed);
+                                        }
+                                        Err(_) => {
+                                            cancelled.store(true, AO::Relaxed);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    if cancelled.load(AO::Relaxed) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelado"));
+                    }
+                    failed += fails.load(AO::Relaxed);
                 }
             }
             Err(e) => {
