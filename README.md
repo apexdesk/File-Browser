@@ -104,6 +104,17 @@ To sign the Android APK with your own key instead of a throw-away debug key, add
 Drag items onto a folder or onto the sidebar to move them; drag on empty space for a rubber-band
 selection. Dropping files from another application onto the window copies them to the current folder.
 
+### Flatpak
+
+Each release includes `filebrowser-x86_64.flatpak` (x86_64). Install it with:
+
+```
+flatpak install --user filebrowser-x86_64.flatpak
+flatpak run io.github.apexdesk.FileBrowser
+```
+
+It runs sandboxed with access to your files (`--filesystem=host`); launching external programs from inside the sandbox is limited compared with the native binary.
+
 ## System integration
 
 - **Command line**: `filebrowser [-n|--new-window] [PATH...]`. Folders open as tabs; a file opens its folder with the file selected. A second launch forwards its paths to the running instance (use `-n` to force a new window).

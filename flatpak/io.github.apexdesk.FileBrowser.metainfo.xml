@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.apexdesk.FileBrowser</id>
+  <name>File Browser</name>
+  <summary>Fast, lightweight file manager</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/apexdesk/File-Browser</url>
+  <url type="bugtracker">https://github.com/apexdesk/File-Browser/issues</url>
+  <description>
+    <p>A fast, ultra-light file manager with tabs, split view, thumbnails, previews and drag and drop between applications.</p>
+  </description>
+  <launchable type="desktop-id">io.github.apexdesk.FileBrowser.desktop</launchable>
+  <provides><binary>filebrowser</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="@VERSION@" date="@DATE@"/></releases>
+</component>
