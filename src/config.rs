@@ -2,7 +2,19 @@
 use crate::fsys::SortKey;
 use std::path::PathBuf;
 
+/// Tema de color creado por el usuario. `colors`: fondo, panel, superficie, resaltado, borde,
+/// texto, texto secundario, acento y fondo del visor.
+#[derive(Clone, PartialEq)]
+pub struct CustomTheme {
+    pub name: String,
+    pub dark: bool,
+    pub colors: [[u8; 3]; 9],
+}
+
 pub struct Config {
+    pub custom_themes: Vec<CustomTheme>,
+    /// Nombre del tema propio activo ('' = uno de los de serie).
+    pub theme_custom: String,
     pub bookmarks: Vec<PathBuf>,
     pub grid: bool,
     pub zoom: f32,
@@ -50,6 +62,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            custom_themes: Vec::new(),
+            theme_custom: String::new(),
             bookmarks: Vec::new(),
             grid: true,
             zoom: 120.0,
@@ -129,6 +143,27 @@ impl Config {
                     has_theme = true;
                     c.theme_mode = v.parse().unwrap_or(0u8).min(2);
                 }
+                "theme_custom" => c.theme_custom = v.to_string(),
+                "ctheme" => {
+                    // nombre|0/1|rrggbb,… (9 colores)
+                    let mut it = v.splitn(3, '|');
+                    if let (Some(n), Some(d), Some(cs)) = (it.next(), it.next(), it.next()) {
+                        let mut colors = [[0u8; 3]; 9];
+                        let hex: Vec<&str> = cs.split(',').collect();
+                        if hex.len() == 9 && !n.is_empty() {
+                            let mut ok = true;
+                            for (i, h) in hex.iter().enumerate() {
+                                match u32::from_str_radix(h, 16) {
+                                    Ok(x) if h.len() == 6 => colors[i] = [(x >> 16) as u8, (x >> 8) as u8, x as u8],
+                                    _ => ok = false,
+                                }
+                            }
+                            if ok && c.custom_themes.len() < 32 {
+                                c.custom_themes.push(CustomTheme { name: n.to_string(), dark: d == "1", colors });
+                            }
+                        }
+                    }
+                }
                 "sort" => c.sort = SortKey::from_str(v),
                 "asc" => c.asc = v != "0",
                 "sys_icons" => c.sys_icons = v != "0",
@@ -195,6 +230,11 @@ impl Config {
         s.push_str(&format!("hidden={}\n", self.show_hidden as u8));
         s.push_str(&format!("dark={}\n", self.dark as u8));
         s.push_str(&format!("theme={}\n", self.theme_mode));
+        s.push_str(&format!("theme_custom={}\n", self.theme_custom));
+        for th in &self.custom_themes {
+            let hex: Vec<String> = th.colors.iter().map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
+            s.push_str(&format!("ctheme={}|{}|{}\n", th.name, th.dark as u8, hex.join(",")));
+        }
         s.push_str(&format!("sort={}\n", self.sort.as_str()));
         s.push_str(&format!("asc={}\n", self.asc as u8));
         if let Some(d) = &self.last_dir {

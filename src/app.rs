@@ -973,7 +973,11 @@ impl App {
                 cfg.dark = d;
             }
         }
-        let pal = theme::palette(cfg.dark);
+        if let Some(th) = cfg.custom_themes.iter().find(|t| t.name == cfg.theme_custom) {
+            cfg.dark = th.dark;
+            cfg.theme_mode = if th.dark { 2 } else { 1 };
+        }
+        let pal = theme::resolve(&cfg, cfg.dark);
         theme::apply_style(&ctx, &pal, cfg.dark);
         let (load_tx, load_rx) = channel();
         let (sort_tx, sort_rx) = channel();
@@ -6616,7 +6620,7 @@ impl App {
     fn apply_dark(&mut self, dark: bool) {
         self.cfg.dark = dark;
         // el cambio es gradual: `tick_theme` va mezclando la paleta actual con la nueva
-        self.theme_anim = Some((self.pal, theme::palette(dark), dark, Instant::now()));
+        self.theme_anim = Some((self.pal, theme::resolve(&self.cfg, dark), dark, Instant::now()));
         self.ctx.request_repaint();
     }
 
@@ -6635,8 +6639,37 @@ impl App {
         }
     }
 
+    /// Activa un tema propio (o los de serie con `None`) y repinta con él.
+    fn set_custom_theme(&mut self, name: Option<String>) {
+        match name {
+            Some(n) => {
+                let Some(th) = self.cfg.custom_themes.iter().find(|t| t.name == n) else { return };
+                let dark = th.dark;
+                self.cfg.theme_custom = n;
+                self.cfg.theme_mode = if dark { 2 } else { 1 };
+                self.apply_dark(dark);
+            }
+            None => {
+                let dark = self.cfg.dark;
+                self.set_dark(dark);
+                return;
+            }
+        }
+        self.cfg.save();
+    }
+
+    /// Edición en vivo de los colores del tema propio activo.
+    fn refresh_custom_theme(&mut self) {
+        self.theme_anim = None;
+        let dark = self.cfg.dark;
+        self.pal = theme::resolve(&self.cfg, dark);
+        theme::apply_style(&self.ctx, &self.pal, dark);
+        self.ctx.request_repaint();
+    }
+
     /// Tema explícito (claro u oscuro).
     fn set_dark(&mut self, dark: bool) {
+        self.cfg.theme_custom.clear();
         self.cfg.theme_mode = if dark { 2 } else { 1 };
         self.apply_dark(dark);
         self.cfg.save();
@@ -6644,6 +6677,7 @@ impl App {
 
     /// 0 = según el sistema, 1 = claro, 2 = oscuro.
     fn set_theme_mode(&mut self, mode: u8) {
+        self.cfg.theme_custom.clear();
         self.cfg.theme_mode = mode;
         let dark = match mode {
             1 => false,
@@ -7899,6 +7933,8 @@ impl App {
                 let mut open = true;
                 let mut changed = false;
                 let mut theme_change = None;
+                let mut pick_theme: Option<String> = None;
+                let mut new_theme = false;
                 let mut res_sort = false;
                 let mut install_sys = false;
                 egui::Window::new(t("Opciones"))
@@ -7938,9 +7974,101 @@ impl App {
                         changed |= ui.checkbox(&mut self.cfg.restore_tabs, t("Restaurar las pestañas al iniciar")).changed();
                         changed |= ui.checkbox(&mut self.cfg.preview_window, t("Abrir el visor en una ventana aparte")).changed();
                         changed |= ui.checkbox(&mut self.cfg.native_deco, t("Usar la barra de título del sistema (requiere reiniciar)")).changed();
-                        let mut dark = self.cfg.dark;
-                        if ui.checkbox(&mut dark, t("Tema oscuro")).changed() {
-                            theme_change = Some(dark);
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(t("Tema de color"));
+                            let cur_name = if self.cfg.custom_themes.iter().any(|t| t.name == self.cfg.theme_custom) {
+                                self.cfg.theme_custom.clone()
+                            } else if self.cfg.dark {
+                                t("Oscuro").to_string()
+                            } else {
+                                t("Claro").to_string()
+                            };
+                            egui::ComboBox::from_id_salt("theme_combo").selected_text(cur_name).show_ui(ui, |ui| {
+                                let builtin = !self.cfg.custom_themes.iter().any(|t| t.name == self.cfg.theme_custom);
+                                if ui.selectable_label(builtin && !self.cfg.dark, t("Claro")).clicked() {
+                                    theme_change = Some(false);
+                                }
+                                if ui.selectable_label(builtin && self.cfg.dark, t("Oscuro")).clicked() {
+                                    theme_change = Some(true);
+                                }
+                                for th in &self.cfg.custom_themes {
+                                    if ui.selectable_label(!builtin && th.name == self.cfg.theme_custom, &th.name).clicked() {
+                                        pick_theme = Some(th.name.clone());
+                                    }
+                                }
+                            });
+                            if ui.button(t("Nuevo tema")).clicked() {
+                                new_theme = true;
+                            }
+                        });
+                        if let Some(i) = self.cfg.custom_themes.iter().position(|t| t.name == self.cfg.theme_custom) {
+                            let mut edited = false;
+                            let mut del = false;
+                            let mut rename: Option<String> = None;
+                            {
+                                let th = &mut self.cfg.custom_themes[i];
+                                ui.horizontal(|ui| {
+                                    ui.label(t("Nombre"));
+                                    let mut n = th.name.clone();
+                                    if ui.add(egui::TextEdit::singleline(&mut n).desired_width(160.0)).changed() {
+                                        rename = Some(n);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(t("Base del tema"));
+                                    let mut d = th.dark;
+                                    ui.radio_value(&mut d, false, t("Claro"));
+                                    ui.radio_value(&mut d, true, t("Oscuro"));
+                                    if d != th.dark {
+                                        th.dark = d;
+                                        edited = true;
+                                    }
+                                });
+                                let labels = [
+                                    t("Fondo"),
+                                    t("Panel lateral"),
+                                    t("Superficie"),
+                                    t("Resaltado"),
+                                    t("Borde"),
+                                    t("Texto"),
+                                    t("Texto secundario"),
+                                    t("Acento"),
+                                    t("Fondo del visor"),
+                                ];
+                                egui::Grid::new("theme_colors").num_columns(4).show(ui, |ui| {
+                                    for (k, l) in labels.iter().enumerate() {
+                                        ui.label(*l);
+                                        edited |= ui.color_edit_button_srgb(&mut th.colors[k]).changed();
+                                        if k % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                            }
+                            if let Some(n) = rename {
+                                let n: String = n.chars().filter(|c| !matches!(c, '|' | '\n' | '\r')).take(40).collect();
+                                if !n.is_empty() && !self.cfg.custom_themes.iter().any(|t| t.name == n) {
+                                    self.cfg.custom_themes[i].name = n.clone();
+                                    self.cfg.theme_custom = n;
+                                    changed = true;
+                                }
+                            }
+                            if ui.button(t("Eliminar tema")).clicked() {
+                                del = true;
+                            }
+                            if edited {
+                                let (d, ) = (self.cfg.custom_themes[i].dark,);
+                                self.cfg.dark = d;
+                                self.cfg.theme_mode = if d { 2 } else { 1 };
+                                self.refresh_custom_theme();
+                                changed = true;
+                            }
+                            if del {
+                                self.cfg.custom_themes.remove(i);
+                                let d = self.cfg.dark;
+                                theme_change = Some(d);
+                            }
                         }
                         if system::can_install() {
                             ui.add_space(6.0);
@@ -7987,6 +8115,24 @@ impl App {
                     });
                 if let Some(d) = theme_change {
                     self.set_dark(d);
+                }
+                if let Some(n) = pick_theme {
+                    self.set_custom_theme(Some(n));
+                }
+                if new_theme {
+                    let mut k = self.cfg.custom_themes.len() + 1;
+                    let name = loop {
+                        let n = format!("{} {}", t("Tema"), k);
+                        if !self.cfg.custom_themes.iter().any(|t| t.name == n) {
+                            break n;
+                        }
+                        k += 1;
+                    };
+                    if self.cfg.custom_themes.len() < 32 {
+                        let colors = self.pal.colors();
+                        self.cfg.custom_themes.push(crate::config::CustomTheme { name: name.clone(), dark: self.cfg.dark, colors });
+                        self.set_custom_theme(Some(name));
+                    }
                 }
                 if res_sort {
                     self.spawn_sort();
