@@ -339,6 +339,8 @@ pub struct TrashRow {
     pub name: String,
     pub parent: PathBuf,
     pub time: i64,
+    pub size: u64,
+    pub dir: bool,
     #[cfg(any(target_os = "linux", windows))]
     pub item: trash::TrashItem,
     /// macOS: ubicación actual dentro de ~/.Trash.
@@ -446,10 +448,13 @@ mod mac_trash {
                 }
                 None => home.join("Desktop"),
             };
+            let md = e.metadata().ok();
             out.push(TrashRow {
                 name: if hit.is_some() { base } else { name },
                 parent,
-                time: e.metadata().map(|m| m.ctime()).unwrap_or(0),
+                time: md.as_ref().map(|m| m.ctime()).unwrap_or(0),
+                size: md.as_ref().filter(|m| m.is_file()).map(|m| m.len()).unwrap_or(0),
+                dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
                 path: e.path(),
             });
         }
@@ -503,11 +508,22 @@ pub fn trash_list() -> Result<Vec<TrashRow>, String> {
     let mut v: Vec<TrashRow> = trash::os_limited::list()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|it| TrashRow {
-            name: it.name.to_string_lossy().into_owned(),
-            parent: it.original_parent.clone(),
-            time: it.time_deleted,
-            item: it,
+        .map(|it| {
+            let (size, dir) = match trash::os_limited::metadata(&it) {
+                Ok(m) => match m.size {
+                    trash::TrashItemSize::Bytes(b) => (b, false),
+                    trash::TrashItemSize::Entries(_) => (0, true),
+                },
+                Err(_) => (0, false),
+            };
+            TrashRow {
+                name: it.name.to_string_lossy().into_owned(),
+                parent: it.original_parent.clone(),
+                time: it.time_deleted,
+                size,
+                dir,
+                item: it,
+            }
         })
         .collect();
     v.sort_by(|a, b| b.time.cmp(&a.time));

@@ -37,6 +37,30 @@ enum VMode {
     Deep,
     /// Resultados de una búsqueda por nombre (en la carpeta o en todo el equipo).
     Search { query: String, all: bool },
+    /// Archivos abiertos hace poco (ubicación «Recientes»).
+    Recent,
+    /// Contenido de la papelera del sistema (ubicación «Papelera»).
+    Trash,
+}
+
+/// Rutas centinela de las ubicaciones virtuales: no son carpetas reales.
+const LOC_TRASH: &str = "trash:";
+const LOC_RECENT: &str = "recent:";
+
+fn virt_mode(p: &Path) -> Option<VMode> {
+    if p == Path::new(LOC_TRASH) {
+        Some(VMode::Trash)
+    } else if p == Path::new(LOC_RECENT) {
+        Some(VMode::Recent)
+    } else {
+        None
+    }
+}
+
+/// Qué se va a eliminar definitivamente de la papelera.
+enum PurgeReq {
+    All,
+    Rows(Vec<extras::TrashRow>),
 }
 
 #[derive(Clone)]
@@ -139,14 +163,6 @@ struct OpenWithDlg {
     custom_only: bool,
 }
 
-struct TrashDlg {
-    rows: Vec<extras::TrashRow>,
-    sel: Vec<bool>,
-    err: Option<String>,
-    /// carga en segundo plano (la papelera puede recorrer montajes lentos)
-    rx: Option<std::sync::mpsc::Receiver<Result<Vec<extras::TrashRow>, String>>>,
-}
-
 struct HashDlg {
     path: PathBuf,
     job: Arc<extras::HashJob>,
@@ -173,8 +189,6 @@ impl Drop for DupsDlg {
 enum Dlg {
     None,
     OpenWith(OpenWithDlg),
-    Trash(TrashDlg),
-    Recent,
     Hash(HashDlg),
     Dups(DupsDlg),
     Props(PropsDlg),
@@ -466,6 +480,10 @@ pub struct App {
     tasks_open: bool,
     /// Diálogo «hay tareas en curso» al intentar cerrar; `quit_ok` = ya confirmado.
     quit_ask: bool,
+    /// Filas de la papelera mostradas (en el mismo orden que `entries` en la vista Papelera).
+    trash_rows: Arc<std::sync::Mutex<Vec<extras::TrashRow>>>,
+    trash_job: Option<std::sync::mpsc::Receiver<Result<(bool, usize), String>>>,
+    confirm_purge: Option<PurgeReq>,
     quit_ok: bool,
     /// descripción de la operación en curso
     op_desc: String,
@@ -1113,6 +1131,9 @@ impl App {
             op_card_hidden: false,
             tasks_open: false,
             quit_ask: false,
+            trash_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+            trash_job: None,
+            confirm_purge: None,
             quit_ok: false,
             op_desc: String::new(),
             theme_anim: None,
@@ -1364,7 +1385,11 @@ impl App {
 
     fn load(&mut self, path: PathBuf, keep_filter: bool) {
         // recargar la misma carpeta conserva el modo (recursivo / búsqueda); navegar vuelve a carpeta normal
-        let mode = if path == self.cwd { self.vmode.clone() } else { VMode::Dir };
+        let mode = match virt_mode(&path) {
+            Some(m) => m,
+            None if path == self.cwd => self.vmode.clone(),
+            None => VMode::Dir,
+        };
         self.load_mode(path, keep_filter, mode);
     }
 
@@ -1398,7 +1423,7 @@ impl App {
         self.load_err = None;
         self.dir_hash = hash_str(0, &path.to_string_lossy());
         self.dir_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if self.live_side == self.active_side {
+        if self.live_side == self.active_side && virt_mode(&path).is_none() {
             self.cfg.last_dir = Some(path.clone());
         }
         match self.vmode.clone() {
@@ -1408,6 +1433,58 @@ impl App {
             VMode::Deep => {
                 let hidden = self.cfg.show_hidden;
                 fsys::spawn_load_deep(path, hidden, self.generation, self.gen_shared.clone(), self.load_tx.clone(), self.ctx.clone());
+            }
+            VMode::Recent => {
+                let list = self.cfg.recent.clone();
+                let (tx, generation, ctx) = (self.load_tx.clone(), self.generation, self.ctx.clone());
+                std::thread::spawn(move || {
+                    let ents: Vec<fsys::Entry> =
+                        list.iter().filter_map(|p| fsys::entry_from_path(p, p.to_string_lossy().into_owned())).collect();
+                    let _ = tx.send(fsys::LoadMsg::Chunk(generation, ents));
+                    let _ = tx.send(fsys::LoadMsg::Done(generation, None));
+                    ctx.request_repaint();
+                });
+            }
+            VMode::Trash => {
+                let (tx, generation, cur, ctx) = (self.load_tx.clone(), self.generation, self.gen_shared.clone(), self.ctx.clone());
+                let slot = self.trash_rows.clone();
+                std::thread::spawn(move || {
+                    match extras::trash_list() {
+                        Ok(rows) => {
+                            let ents: Vec<fsys::Entry> = rows
+                                .iter()
+                                .map(|r| {
+                                    let full = r.parent.join(&r.name).to_string_lossy().into_owned();
+                                    let kind = if r.dir {
+                                        Kind::Folder
+                                    } else {
+                                        match r.name.rsplit_once('.') {
+                                            Some((st, e)) if !st.is_empty() => fsys::kind_of_ext(e),
+                                            _ => Kind::Other,
+                                        }
+                                    };
+                                    fsys::Entry {
+                                        name: full.into_boxed_str(),
+                                        size: r.size,
+                                        mtime: r.time,
+                                        kind,
+                                        flags: if r.dir { fsys::F_DIR } else { 0 },
+                                    }
+                                })
+                                .collect();
+                            // sólo la carga vigente fija las filas (una anterior llegaría tarde)
+                            if cur.load(Ordering::Relaxed) == generation {
+                                *slot.lock().unwrap() = rows;
+                            }
+                            let _ = tx.send(fsys::LoadMsg::Chunk(generation, ents));
+                            let _ = tx.send(fsys::LoadMsg::Done(generation, None));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(fsys::LoadMsg::Done(generation, Some(e)));
+                        }
+                    }
+                    ctx.request_repaint();
+                });
             }
             VMode::Search { query, all } => {
                 let q = query.trim().to_string();
@@ -1467,6 +1544,17 @@ impl App {
         // en Android «/storage/emulated» no se puede listar: el almacenamiento real es el usuario 0
         #[cfg(target_os = "android")]
         let path = if path == Path::new("/storage/emulated") { PathBuf::from("/storage/emulated/0") } else { path };
+        if let Some(m) = virt_mode(&path) {
+            if path == self.cwd && self.vmode == m {
+                return;
+            }
+            self.back.push(self.cwd.clone());
+            self.fwd.clear();
+            self.preview = None;
+            self.load_mode(path, false, m);
+            self.scroll_to_top();
+            return;
+        }
         if !path.is_dir() {
             if path.exists() {
                 fsys::open_external(&path);
@@ -1513,6 +1601,13 @@ impl App {
                 }
                 return;
             }
+        }
+        if virt_mode(&self.cwd).is_some() {
+            // las ubicaciones virtuales no tienen carpeta superior: se vuelve al inicio
+            if let Some(h) = self.home.clone() {
+                self.navigate(h);
+            }
+            return;
         }
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             let from = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -1739,6 +1834,9 @@ impl App {
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
+        if self.vmode == VMode::Trash {
+            return Vec::new(); // lo de la papelera no está en esas rutas: tiene sus propias acciones
+        }
         self.selected_names().into_iter().map(|n| self.cwd.join(n)).collect()
     }
 
@@ -1779,6 +1877,14 @@ impl App {
             self.addr_edit = None;
         } else if self.rename.is_some() {
             self.rename = None;
+        } else if virt_mode(&self.cwd).is_some() {
+            if !self.back.is_empty() {
+                self.run_cmd(Cmd::Back);
+            } else if self.tabs.len() > 1 {
+                self.close_tab(self.cur_tab);
+            } else {
+                self.run_cmd(Cmd::Home);
+            }
         } else if self.vmode != VMode::Dir && self.tabs.len() > 1 {
             self.close_tab(self.cur_tab);
         } else if self.vmode != VMode::Dir {
@@ -1804,6 +1910,9 @@ impl App {
     }
 
     fn open_index(&mut self, i: u32) {
+        if self.vmode == VMode::Trash {
+            return;
+        }
         let Some(e) = self.entries.get(i as usize) else { return };
         let p = self.cwd.join(&*e.name);
         if e.is_dir() && cfg!(target_os = "macos") && p.extension().map(|x| x == "app").unwrap_or(false) {
@@ -1952,7 +2061,10 @@ impl App {
 
     /// Los servidores SFTP se reflejan en una carpeta de caché de sólo lectura: nada se escribe ahí.
     fn remote_ro(&mut self, p: &Path) -> bool {
-        if crate::sftp::is_remote(p) {
+        if virt_mode(p).is_some() {
+            self.say(t("Esta ubicación es de sólo lectura").into(), true);
+            true
+        } else if crate::sftp::is_remote(p) {
             self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
             true
         } else {
@@ -1963,7 +2075,7 @@ impl App {
     fn start_op(&mut self, op: Op, meta: OpMeta) {
         let remote = |v: &Vec<PathBuf>| v.iter().any(|p| crate::sftp::is_remote(p));
         let touches = match &op {
-            Op::Copy { srcs, dst, mv, .. } => crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
+            Op::Copy { srcs, dst, mv, .. } => virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
             Op::Trash(v) | Op::Delete(v) => remote(v),
             Op::Zip { srcs, out } => crate::sftp::is_remote(out) || remote(srcs),
             Op::Unzip { src, dst } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
@@ -2208,6 +2320,9 @@ impl App {
     }
 
     fn toggle_preview(&mut self) {
+        if self.vmode == VMode::Trash {
+            return;
+        }
         if self.preview.is_some() {
             self.preview = None;
             return;
@@ -2368,6 +2483,11 @@ impl App {
 
     fn run_cmd(&mut self, cmd: Cmd) {
         use Cmd as C;
+        // en la papelera, «eliminar» es eliminar definitivamente de ella
+        if self.vmode == VMode::Trash && matches!(cmd, C::Trash | C::DeletePerm) {
+            self.trash_ask_purge();
+            return;
+        }
         match cmd {
             C::Palette => self.palette = Some(PaletteState::default()),
             C::Back => self.go_back(),
@@ -2386,7 +2506,7 @@ impl App {
             C::Bookmark => self.toggle_bookmark(self.cwd.clone()),
             C::OpenTrash => {
                 if extras::trash_supported() {
-                    self.open_trash();
+                    self.navigate(PathBuf::from(LOC_TRASH));
                 }
             }
             C::NewTab => self.new_tab(self.cwd.clone()),
@@ -3510,6 +3630,8 @@ impl App {
             }
             let rel = self.cwd.strip_prefix(&root).unwrap_or(Path::new(""));
             push_segs(&mut segs, rel, Some(&root));
+        } else if virt_mode(&self.cwd).is_some() {
+            segs.push((self.dir_label(&self.cwd), self.cwd.clone()));
         } else {
             push_segs(&mut segs, &self.cwd, None);
         }
@@ -3774,6 +3896,8 @@ impl App {
         let mut unmount: Option<PathBuf> = None;
         let mut show_recent = false;
         let mut show_trash = false;
+        let mut clear_recent = false;
+        let mut empty_trash = false;
         let cwd = self.cwd.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let head = |ui: &mut egui::Ui, t: &str| {
@@ -3793,11 +3917,27 @@ impl App {
                     go = Some(pl.path.clone());
                 }
             }
-            if side_item(ui, &pal, Glyph::Clock, None, t("Recientes"), false, false).clicked() {
+            let r = side_item(ui, &pal, Glyph::Clock, None, t("Recientes"), cwd == Path::new(LOC_RECENT), false);
+            if r.clicked() {
                 show_recent = true;
             }
-            if extras::trash_supported() && side_item(ui, &pal, Glyph::Trash, None, t("Papelera"), false, false).clicked() {
-                show_trash = true;
+            r.context_menu(|ui| {
+                if ui.add_enabled(!self.cfg.recent.is_empty(), egui::Button::new(t("Vaciar recientes"))).clicked() {
+                    clear_recent = true;
+                    ui.close();
+                }
+            });
+            if extras::trash_supported() {
+                let r = side_item(ui, &pal, Glyph::Trash, None, t("Papelera"), cwd == Path::new(LOC_TRASH), false);
+                if r.clicked() {
+                    show_trash = true;
+                }
+                r.context_menu(|ui| {
+                    if ui.button(t("Vaciar papelera")).clicked() {
+                        empty_trash = true;
+                        ui.close();
+                    }
+                });
             }
             if !self.cfg.bookmarks.is_empty() || dragging {
                 head(ui, t("Marcadores"));
@@ -3878,10 +4018,20 @@ impl App {
             }
         });
         if show_recent {
-            self.dlg = Dlg::Recent;
+            self.navigate(PathBuf::from(LOC_RECENT));
         }
         if show_trash {
-            self.open_trash();
+            self.navigate(PathBuf::from(LOC_TRASH));
+        }
+        if clear_recent {
+            self.cfg.recent.clear();
+            self.cfg.save();
+            if self.vmode == VMode::Recent {
+                self.refresh();
+            }
+        }
+        if empty_trash {
+            self.confirm_purge = Some(PurgeReq::All);
         }
         if let Some(u) = connect {
             self.connect_uri(u);
@@ -4388,6 +4538,48 @@ impl App {
                     let p = self.cwd.clone();
                     self.preview = None;
                     self.load_mode(p, false, VMode::Search { query: self.sbuf.clone(), all: new_all });
+                }
+            }
+            VMode::Recent => {
+                let mut clear = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(tf("Archivos abiertos recientemente · {} elementos", &[&self.entries.len()])).size(12.0).color(pal.subtle));
+                    if ui.add_enabled(!self.cfg.recent.is_empty(), egui::Button::new(t("Vaciar recientes")).small()).clicked() {
+                        clear = true;
+                    }
+                });
+                ui.add_space(2.0);
+                if clear {
+                    self.cfg.recent.clear();
+                    self.cfg.save();
+                    self.refresh();
+                }
+            }
+            VMode::Trash => {
+                let (mut restore, mut purge, mut empty) = (false, false, false);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(tf("Papelera · {} elementos", &[&self.entries.len()])).size(12.0).color(pal.subtle));
+                    let any = self.sel_count > 0;
+                    if ui.add_enabled(any, egui::Button::new(t("Restaurar")).small()).clicked() {
+                        restore = true;
+                    }
+                    if ui.add_enabled(any, egui::Button::new(t("Eliminar definitivamente")).small()).clicked() {
+                        purge = true;
+                    }
+                    if ui.add_enabled(!self.entries.is_empty(), egui::Button::new(t("Vaciar papelera")).small()).clicked() {
+                        empty = true;
+                    }
+                });
+                ui.add_space(2.0);
+                if restore {
+                    let rows = self.trash_selected();
+                    if !rows.is_empty() {
+                        self.trash_run(true, Some(rows));
+                    }
+                } else if purge {
+                    self.trash_ask_purge();
+                } else if empty {
+                    self.confirm_purge = Some(PurgeReq::All);
                 }
             }
             VMode::Deep => {
@@ -5268,6 +5460,26 @@ impl App {
 
     fn context_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(190.0);
+        if self.vmode == VMode::Trash {
+            let any = self.sel_count > 0;
+            if ui.add_enabled(any, egui::Button::new(t("Restaurar"))).clicked() {
+                let rows = self.trash_selected();
+                if !rows.is_empty() {
+                    self.trash_run(true, Some(rows));
+                }
+                ui.close();
+            }
+            if ui.add_enabled(any, egui::Button::new(t("Eliminar definitivamente"))).clicked() {
+                self.trash_ask_purge();
+                ui.close();
+            }
+            ui.separator();
+            if ui.add_enabled(!self.entries.is_empty(), egui::Button::new(t("Vaciar papelera"))).clicked() {
+                self.confirm_purge = Some(PurgeReq::All);
+                ui.close();
+            }
+            return;
+        }
         if self.sel_count > 0 {
             if let Some(c) = self.cursor.filter(|&c| self.is_sel(c)) {
                 if ui.button(t("Abrir")).clicked() {
@@ -5837,6 +6049,8 @@ impl App {
                 let base = if i == self.cur_tab { name(&self.cwd) } else { name(&self.tabs[i].cwd) };
                 return format!("{base} {}", t("(todo)"));
             }
+            VMode::Recent => return t("Recientes").to_string(),
+            VMode::Trash => return t("Papelera").to_string(),
             VMode::Dir => {}
         }
         if i == self.cur_tab {
@@ -6212,7 +6426,7 @@ impl App {
                     self.addr_edit = Some(self.cwd.display().to_string());
                 }
                 if extras::trash_supported() && mi(ui, t("Papelera"), "", true) {
-                    self.open_trash();
+                    self.navigate(PathBuf::from(LOC_TRASH));
                 }
                 ui.separator();
                 let bm = self.cfg.bookmarks.contains(&self.cwd);
@@ -6492,6 +6706,11 @@ impl App {
 
     /// Nombre corto de una carpeta; la raíz de un comprimido abierto se muestra con el nombre del archivo.
     fn dir_label(&self, p: &Path) -> String {
+        match virt_mode(p) {
+            Some(VMode::Trash) => return t("Papelera").to_string(),
+            Some(VMode::Recent) => return t("Recientes").to_string(),
+            _ => {}
+        }
         let p = match self.arch.iter().find(|(r, _)| r == p) {
             Some((_, a)) => a.as_path(),
             None => p,
@@ -6772,14 +6991,100 @@ impl App {
         self.dlg = Dlg::Dups(DupsDlg { root, job });
     }
 
-    fn open_trash(&mut self) {
+    /// Filas de la papelera que corresponden a la selección actual.
+    fn trash_selected(&self) -> Vec<extras::TrashRow> {
+        let rows = self.trash_rows.lock().unwrap();
+        let mut v = Vec::new();
+        self.for_each_selected(|i| {
+            if let Some(r) = rows.get(i as usize) {
+                v.push(r.clone());
+            }
+        });
+        v
+    }
+
+    fn trash_ask_purge(&mut self) {
+        let rows = self.trash_selected();
+        if !rows.is_empty() {
+            self.confirm_purge = Some(PurgeReq::Rows(rows));
+        }
+    }
+
+    /// Restaura (`restore`) o elimina definitivamente `rows` (todas si `None`) en segundo plano.
+    fn trash_run(&mut self, restore: bool, rows: Option<Vec<extras::TrashRow>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(extras::trash_list());
+            let res = (|| -> Result<(bool, usize), String> {
+                let rows = match rows {
+                    Some(r) => r,
+                    None => extras::trash_list()?,
+                };
+                let n = rows.len();
+                if restore {
+                    extras::trash_restore(&rows)?;
+                } else {
+                    extras::trash_purge(&rows)?;
+                }
+                Ok((restore, n))
+            })();
+            let _ = tx.send(res);
             ctx.request_repaint();
         });
-        self.dlg = Dlg::Trash(TrashDlg { rows: Vec::new(), sel: Vec::new(), err: None, rx: Some(rx) });
+        self.trash_job = Some(rx);
+        self.say(t("Trabajando…").into(), false);
+    }
+
+    fn trash_poll(&mut self) {
+        let Some(rx) = &self.trash_job else { return };
+        let Ok(r) = rx.try_recv() else { return };
+        self.trash_job = None;
+        match r {
+            Ok((restore, n)) => {
+                let m = if restore { tf("{} elemento(s) restaurados", &[&n]) } else { tf("{} elemento(s) eliminados", &[&n]) };
+                self.say(m, false);
+            }
+            Err(e) => self.say(e, true),
+        }
+        if self.vmode == VMode::Trash {
+            self.refresh();
+        } else if self.vmode == VMode::Dir {
+            self.refresh(); // lo restaurado puede estar en esta carpeta
+        }
+    }
+
+    fn purge_dialog(&mut self, ctx: &egui::Context) {
+        let Some(req) = &self.confirm_purge else { return };
+        let text = match req {
+            PurgeReq::All => t("Se vaciará la papelera: todo se eliminará de forma permanente. No se puede deshacer.").to_string(),
+            PurgeReq::Rows(v) => tf("Se eliminarán {} elemento(s) de forma permanente. No se puede deshacer.", &[&v.len()]),
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new(t("Eliminar definitivamente"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(text);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("Eliminar")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button(t("Cancelar")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => match self.confirm_purge.take() {
+                Some(PurgeReq::All) => self.trash_run(false, None),
+                Some(PurgeReq::Rows(v)) => self.trash_run(false, Some(v)),
+                None => {}
+            },
+            Some(false) => self.confirm_purge = None,
+            None => {}
+        }
     }
 
     fn conflict_dialog(&mut self, ctx: &egui::Context) {
@@ -6850,6 +7155,9 @@ impl App {
     }
 
     fn set_deep(&mut self, on: bool) {
+        if virt_mode(&self.cwd).is_some() {
+            return;
+        }
         let p = self.cwd.clone();
         self.preview = None;
         self.load_mode(p, true, if on { VMode::Deep } else { VMode::Dir });
@@ -7728,145 +8036,6 @@ impl App {
                 }
                 keep = open && !done;
             }
-            Dlg::Recent => {
-                let mut open = true;
-                let mut act: Option<(u8, PathBuf)> = None; // 1 abrir, 2 mostrar en carpeta
-                let mut clear = false;
-                egui::Window::new(t("Recientes"))
-                    .open(&mut open)
-                    .collapsible(false)
-                    .default_size([560.0, 380.0])
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        if self.cfg.recent.is_empty() {
-                            ui.label(egui::RichText::new(t("Sin elementos recientes")).color(pal.subtle));
-                        }
-                        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                            for r in &self.cfg.recent {
-                                let name = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| r.display().to_string());
-                                ui.horizontal(|ui| {
-                                    if ui.link(name).clicked() {
-                                        act = Some((1, r.clone()));
-                                    }
-                                    ui.label(egui::RichText::new(r.parent().map(|p| p.display().to_string()).unwrap_or_default()).size(12.0).color(pal.subtle));
-                                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.small_button(t("Mostrar en carpeta")).clicked() {
-                                            act = Some((2, r.clone()));
-                                        }
-                                    });
-                                });
-                            }
-                        });
-                        ui.separator();
-                        if ui.add_enabled(!self.cfg.recent.is_empty(), egui::Button::new(t("Vaciar"))).clicked() {
-                            clear = true;
-                        }
-                    });
-                if clear {
-                    self.cfg.recent.clear();
-                    self.cfg.save();
-                }
-                match act {
-                    Some((1, p)) => {
-                        if p.exists() {
-                            fsys::open_external(&p);
-                            self.note_recent(&p);
-                        } else {
-                            self.say(tf("No existe: {}", &[&p.display()]), true);
-                        }
-                    }
-                    Some((_, p)) => {
-                        if let Some(dir) = p.parent().map(|d| d.to_path_buf()) {
-                            self.dlg = Dlg::None;
-                            self.navigate(dir);
-                            if let Some(n) = p.file_name() {
-                                self.pending_select = vec![n.to_string_lossy().into_owned()];
-                            }
-                        }
-                    }
-                    None => {}
-                }
-                keep = open && matches!(self.dlg, Dlg::None);
-            }
-            Dlg::Trash(d) => {
-                let mut open = true;
-                let mut act = 0; // 1 restaurar, 2 eliminar, 3 todo
-                if let Some(rx) = &d.rx {
-                    if let Ok(r) = rx.try_recv() {
-                        match r {
-                            Ok(v) => {
-                                d.sel = vec![false; v.len()];
-                                d.rows = v;
-                            }
-                            Err(e) => d.err = Some(e),
-                        }
-                        d.rx = None;
-                    }
-                }
-                let loading = d.rx.is_some();
-                egui::Window::new(t("Papelera"))
-                    .open(&mut open)
-                    .collapsible(false)
-                    .default_size([640.0, 420.0])
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        if let Some(e) = &d.err {
-                            ui.label(egui::RichText::new(e).color(Color32::from_rgb(235, 100, 100)));
-                        }
-                        if loading {
-                            ui.label(egui::RichText::new(t("Calculando…")).color(pal.subtle));
-                        } else if d.rows.is_empty() && d.err.is_none() {
-                            ui.label(egui::RichText::new(t("La papelera está vacía")).color(pal.subtle));
-                        }
-                        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                            for i in 0..d.rows.len() {
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut d.sel[i], "");
-                                    ui.label(&d.rows[i].name);
-                                    ui.label(
-                                        egui::RichText::new(format!("{}  ·  {}", d.rows[i].parent.display(), fsys::fmt_time(d.rows[i].time)))
-                                            .size(12.0)
-                                            .color(pal.subtle),
-                                    );
-                                });
-                            }
-                        });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let any = d.sel.iter().any(|&b| b);
-                            if ui.add_enabled(any, egui::Button::new(t("Restaurar"))).clicked() {
-                                act = 1;
-                            }
-                            if ui.add_enabled(any, egui::Button::new(t("Eliminar definitivamente"))).clicked() {
-                                act = 2;
-                            }
-                            if ui.button(t("Seleccionar todo")).clicked() {
-                                act = 3;
-                            }
-                        });
-                    });
-                if act == 3 {
-                    for b in d.sel.iter_mut() {
-                        *b = true;
-                    }
-                } else if act == 1 || act == 2 {
-                    let rows: Vec<extras::TrashRow> =
-                        d.rows.iter().zip(&d.sel).filter(|(_, s)| **s).map(|(r, _)| r.clone()).collect();
-                    let r = if act == 1 { extras::trash_restore(&rows) } else { extras::trash_purge(&rows) };
-                    match extras::trash_list() {
-                        Ok(v) => {
-                            d.sel = vec![false; v.len()];
-                            d.rows = v;
-                            d.err = r.err();
-                        }
-                        Err(e) => d.err = Some(e),
-                    }
-                    if act == 1 {
-                        self.refresh();
-                    }
-                }
-                keep = open;
-            }
             Dlg::Hash(d) => {
                 let mut open = true;
                 egui::Window::new(t("Hash del archivo"))
@@ -8152,7 +8321,7 @@ impl App {
                         "hash" => self.open_hash(),
                         "openwith" => self.open_with(),
                         "dups" => self.open_dups(),
-                        _ => self.open_trash(),
+                        _ => self.navigate(PathBuf::from(LOC_TRASH)),
                     }
                 }
                 "themeanim" => self.set_dark(!self.cfg.dark),
@@ -8581,6 +8750,8 @@ impl eframe::App for App {
         }
         self.palette_window(&ctx);
         self.confirm_dialog(&ctx);
+        self.purge_dialog(&ctx);
+        self.trash_poll();
         self.conflict_dialog(&ctx);
         self.dialogs(&ctx);
         self.op_overlay(&ctx);
@@ -8593,7 +8764,7 @@ impl eframe::App for App {
             self.cfg.split_dir = self.other.as_deref().map(|o| o.cwd.clone());
         }
         self.save_tab();
-        self.cfg.tabs = self.tabs.iter().map(|t| t.cwd.clone()).collect();
+        self.cfg.tabs = self.tabs.iter().map(|t| t.cwd.clone()).filter(|p| virt_mode(p).is_none()).collect();
         self.cfg.tabs2 = self
             .tabs
             .iter()
