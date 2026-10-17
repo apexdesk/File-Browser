@@ -178,6 +178,15 @@ impl Player {
         self.started = Some(Instant::now());
     }
 
+    /// Tras volver de otra ventana: si estaba reproduciendo, reinicia la tubería en la posición actual
+    /// (las tuberías de ffmpeg/ffplay pueden haberse quedado desfasadas o bloqueadas mientras la ventana no se dibujaba).
+    pub fn resync(&mut self) {
+        if self.playing() {
+            let p = self.position();
+            self.seek_to(p);
+        }
+    }
+
     pub fn toggle(&mut self) {
         if self.playing() {
             self.base = self.position();
