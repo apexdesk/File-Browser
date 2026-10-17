@@ -85,7 +85,7 @@ impl Default for Config {
             show_menu_btn: true,
             lang: "auto".into(),
             restore_tabs: true,
-            index_enabled: false,
+            index_enabled: true,
             preview_window: true,
             columns: vec!["date".into(), "size".into(), "kind".into()],
             col_w: Vec::new(),
