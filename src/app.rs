@@ -369,6 +369,7 @@ impl PaneState {
 
 pub struct App {
     traced_ui: bool,
+    was_focused: bool,
     cfg: Config,
     pal: Pal,
     ctx: egui::Context,
@@ -1059,6 +1060,7 @@ impl App {
         }
         let mut app = App {
             traced_ui: false,
+            was_focused: true,
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
             pworker: preview::Worker::new(&ctx),
@@ -8838,6 +8840,18 @@ impl eframe::App for App {
                 eprintln!("[trace] primer fotograma: {:?}", crate::T0.get().map(|t| t.elapsed()));
             }
         }
+        // al volver de otra aplicación: forzar repintado (el compositor deja de avisar de fotogramas a las
+        // ventanas ocultas) y resincronizar el vídeo de la vista previa
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused {
+            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(60));
+            ctx.request_repaint_after(Duration::from_millis(250));
+            if let Some(p) = self.preview.as_mut().and_then(|pv| pv.player.as_mut()) {
+                p.resync();
+            }
+        }
+        self.was_focused = focused;
         self.drag_out_tick(&ctx, frame);
         self.window_drag_tick(&ctx);
         let pal = self.pal;
