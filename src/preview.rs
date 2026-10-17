@@ -25,8 +25,11 @@ enum Raw {
     Archive(crate::archive::Listing),
     Binary,
     Mesh(crate::mesh3d::Mesh),
-    /// documento de oficina o PDF (el estado vive en `Preview::doc`)
+    /// documento de oficina, PDF o cómic (el estado vive en `Preview::doc`)
     Doc,
+    Rich(crate::rich::Rich),
+    Tables(Vec<(String, crate::table::Table)>),
+    Tree(crate::tree::Tree, Vec<String>, bool),
     Err(String),
 }
 
@@ -41,6 +44,12 @@ pub enum Body {
     Mesh,
     /// documento paginado (el estado vive en `Preview::doc`)
     Doc,
+    /// Markdown o libro (el estado vive en `Preview::rich`)
+    Rich,
+    /// CSV o base de datos (el estado vive en `Preview::table`)
+    Table,
+    /// JSON o XML: árbol y, en la otra pestaña, el texto
+    Tree { lines: Vec<String>, truncated: bool },
     Error(String),
 }
 
@@ -58,6 +67,30 @@ pub struct Preview {
     pub audio: Option<crate::audio::AudioPlayer>,
     mesh: Option<MeshView>,
     doc: Option<crate::docview::DocView>,
+    rich: Option<crate::rich::RichView>,
+    table: Option<crate::table::TableView>,
+    tree: Option<crate::tree::TreeView>,
+    /// pestaña «Texto» del árbol JSON/XML
+    tree_text: bool,
+    /// datos del archivo (panel «i») y su carga en segundo plano
+    pub meta: Vec<(String, String)>,
+    meta_rx: Option<Receiver<Vec<(String, String)>>>,
+    meta_started: bool,
+    show_meta: bool,
+    /// archivo abierto dentro de un comprimido (vista anidada) y su carpeta temporal
+    inner: Option<Box<(Preview, Worker)>>,
+    entry_pick: Option<String>,
+    tmp: Option<PathBuf>,
+    entry_rx: Option<Receiver<Result<PathBuf, String>>>,
+    entry_busy: Option<String>,
+    entry_err: Option<String>,
+    /// búsqueda y selección de texto en documentos
+    find_open: bool,
+    find_text: String,
+    sel: Option<DocSel>,
+    page_runs: Option<(usize, Vec<crate::docview::Run>)>,
+    doc_rect: Option<Rect>,
+    sel_drag: bool,
     zoom: f32,
     pan: egui::Vec2,
     scroll: f32,
@@ -66,6 +99,14 @@ pub struct Preview {
     /// pestaña «Uso de disco» de las carpetas
     show_usage: bool,
     usage: Option<UsageView>,
+}
+
+/// Selección de texto en una página: (trozo, carácter) de inicio y de fin.
+#[derive(Clone, Copy)]
+struct DocSel {
+    a: (usize, usize),
+    b: (usize, usize),
+    page: usize,
 }
 
 /// Modelo 3D abierto: cámara y última imagen dibujada.
@@ -139,12 +180,133 @@ fn fmt_secs(s: f64) -> String {
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_lines(ctx: &egui::Context, cp: &egui::Painter, content: Rect, in_content: bool, scroll: &mut f32, lines: &[String], truncated: bool, pal: &Pal) {
+    let lh = 18.0;
+    let total = lines.len() as f32 * lh;
+    let max_scroll = (total - content.height() + 20.0).max(0.0);
+    if in_content {
+        let dy = ctx.input(|i| i.smooth_scroll_delta.y);
+        *scroll = (*scroll - dy).clamp(0.0, max_scroll);
+    }
+    let (pg, home, end) = ctx.input(|i| {
+        (
+            i.key_pressed(egui::Key::PageDown) as i32 - i.key_pressed(egui::Key::PageUp) as i32,
+            i.key_pressed(egui::Key::Home),
+            i.key_pressed(egui::Key::End),
+        )
+    });
+    *scroll = (*scroll + pg as f32 * content.height() * 0.9).clamp(0.0, max_scroll);
+    if home {
+        *scroll = 0.0;
+    }
+    if end {
+        *scroll = max_scroll;
+    }
+    cp.rect_filled(content, CornerRadius::same(10), pal.bg);
+    let first = (*scroll / lh) as usize;
+    let n = (content.height() / lh) as usize + 2;
+    let mono = FontId::monospace(13.0);
+    let gutter = 54.0;
+    for (k, line) in lines.iter().enumerate().skip(first).take(n) {
+        let y = content.top() + 10.0 + k as f32 * lh - *scroll;
+        cp.text(pos2(content.left() + gutter - 10.0, y), Align2::RIGHT_TOP, k + 1, mono.clone(), pal.subtle.gamma_multiply(0.6));
+        cp.text(pos2(content.left() + gutter + 4.0, y), Align2::LEFT_TOP, line, mono.clone(), pal.text);
+    }
+    if truncated {
+        cp.text(pos2(content.right() - 12.0, content.bottom() - 8.0), Align2::RIGHT_BOTTOM, t("(vista parcial)"), FontId::proportional(11.5), pal.subtle);
+    }
+}
+
+fn read_limited(path: &std::path::Path, max: u64) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() > max {
+        return None;
+    }
+    let mut b = Vec::new();
+    f.take(max).read_to_end(&mut b).ok()?;
+    Some(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Primeras líneas de un archivo de texto.
+fn text_raw(path: &std::path::Path) -> Raw {
+    let Ok(f) = std::fs::File::open(path) else {
+        return Raw::Err(t("No se pudo abrir").into());
+    };
+    let mut buf = Vec::new();
+    let _ = f.take(256 * 1024).read_to_end(&mut buf);
+    if buf[..buf.len().min(4096)].contains(&0) {
+        return Raw::Binary;
+    }
+    let txt = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = Vec::new();
+    let mut truncated = buf.len() >= 256 * 1024;
+    for l in txt.lines() {
+        if lines.len() >= 6000 {
+            truncated = true;
+            break;
+        }
+        let l = l.replace('\t', "    ");
+        lines.push(if l.chars().count() > 500 { l.chars().take(500).collect() } else { l });
+    }
+    Raw::Text(lines, truncated)
+}
+
 fn load(job: &Job) -> Raw {
-    if job.kind != Kind::Folder && crate::docview::is_doc_path(&job.path) && !crate::sftp::is_remote(&job.path) {
-        return Raw::Doc;
+    let remote = crate::sftp::is_remote(&job.path);
+    if job.kind != Kind::Folder && !remote {
+        if crate::docview::is_paged_path(&job.path) {
+            return Raw::Doc;
+        }
+        let ext = job.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "epub" => {
+                return match crate::rich::epub(&job.path) {
+                    Ok(r) => Raw::Rich(r),
+                    Err(e) => Raw::Err(e),
+                }
+            }
+            "md" | "markdown" | "mdown" => {
+                if let Some(txt) = read_limited(&job.path, 4 << 20) {
+                    return Raw::Rich(crate::rich::markdown(&txt));
+                }
+            }
+            "csv" | "tsv" => {
+                if let Some(txt) = read_limited(&job.path, 24 << 20) {
+                    let tb = crate::table::csv(&txt);
+                    if !tb.head.is_empty() {
+                        return Raw::Tables(vec![(String::new(), tb)]);
+                    }
+                }
+            }
+            "json" | "geojson" | "xml" | "plist" | "opf" | "xsd" | "xsl" => {
+                if let Some(txt) = read_limited(&job.path, 32 << 20) {
+                    let tree = if ext.ends_with("json") { crate::tree::from_json(&txt) } else { crate::tree::from_xml(&txt) };
+                    if let (Some(tree), Raw::Text(lines, tr)) = (tree, text_raw(&job.path)) {
+                        return Raw::Tree(tree, lines, tr);
+                    }
+                }
+            }
+            "sqlite" | "sqlite3" | "db" | "db3" => {
+                let mut m = [0u8; 16];
+                if std::fs::File::open(&job.path).and_then(|mut f| f.read_exact(&mut m)).is_ok() && &m == b"SQLite format 3\0" {
+                    return match crate::sqlite::read(&job.path) {
+                        Ok(t) => Raw::Tables(t),
+                        Err(e) => Raw::Err(e),
+                    };
+                }
+            }
+            e if crate::fontview::is_font_ext(e) => {
+                return match crate::fontview::specimen(&job.path) {
+                    Ok(d) => Raw::Image(d),
+                    Err(e) => Raw::Err(e),
+                }
+            }
+            _ => {}
+        }
     }
     if let Some(ext) = job.path.extension().and_then(|e| e.to_str()) {
-        if job.kind == Kind::Other && crate::mesh3d::is_mesh_ext(ext) && !crate::sftp::is_remote(&job.path) {
+        if job.kind == Kind::Other && crate::mesh3d::is_mesh_ext(ext) && !remote {
             return match crate::mesh3d::load(&job.path) {
                 Ok(m) => Raw::Mesh(m),
                 Err(_) => Raw::Binary,
@@ -186,29 +348,17 @@ fn load(job: &Job) -> Raw {
             Some(d) => Raw::Image(d),
             None => Raw::Binary,
         },
-        Kind::Text | Kind::Other => {
-            let Ok(f) = std::fs::File::open(&job.path) else {
-                return Raw::Err(t("No se pudo abrir").into());
-            };
-            let mut buf = Vec::new();
-            let _ = f.take(256 * 1024).read_to_end(&mut buf);
-            if buf[..buf.len().min(4096)].contains(&0) {
-                return Raw::Binary;
-            }
-            let txt = String::from_utf8_lossy(&buf);
-            let mut lines: Vec<String> = Vec::new();
-            let mut truncated = buf.len() >= 256 * 1024;
-            for l in txt.lines() {
-                if lines.len() >= 6000 {
-                    truncated = true;
-                    break;
-                }
-                let l = l.replace('\t', "    ");
-                lines.push(if l.chars().count() > 500 { l.chars().take(500).collect() } else { l });
-            }
-            Raw::Text(lines, truncated)
-        }
+        Kind::Text | Kind::Other => text_raw(&job.path),
         _ => Raw::Binary,
+    }
+}
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        self.inner = None;
+        if let Some(d) = self.tmp.take() {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
 
@@ -238,6 +388,26 @@ impl Preview {
             audio: None,
             mesh: None,
             doc: None,
+            rich: None,
+            table: None,
+            tree: None,
+            tree_text: false,
+            meta: Vec::new(),
+            meta_rx: None,
+            meta_started: false,
+            show_meta: false,
+            inner: None,
+            entry_pick: None,
+            tmp: None,
+            entry_rx: None,
+            entry_busy: None,
+            entry_err: None,
+            find_open: false,
+            find_text: String::new(),
+            sel: None,
+            page_runs: None,
+            doc_rect: None,
+            sel_drag: false,
             last_pos: None,
             zoom: 1.0,
             pan: vec2(0.0, 0.0),
@@ -285,6 +455,27 @@ impl Preview {
     }
 
     pub fn poll(&mut self, w: &mut Worker, ctx: &egui::Context) {
+        if let Some(rx) = &self.entry_rx {
+            if let Ok(r) = rx.try_recv() {
+                self.entry_rx = None;
+                let name = self.entry_busy.take().unwrap_or_default();
+                match r {
+                    Ok(path) => {
+                        let base = name.rsplit('/').next().unwrap_or(&name).to_string();
+                        let ext = base.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_default();
+                        let kind = crate::fsys::kind_of_ext(&ext);
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let mut iw = Worker::new(ctx);
+                        let pv = Preview::open(&mut iw, path, base, kind, size, 0, String::new(), None);
+                        self.inner = Some(Box::new((pv, iw)));
+                    }
+                    Err(e) => self.entry_err = Some(e),
+                }
+            }
+        }
+        if let Some(i) = &mut self.inner {
+            i.0.poll(&mut i.1, ctx);
+        }
         if self.kind == Kind::Audio && self.audio.is_none() && crate::audio::supported() {
             self.audio = Some(crate::audio::AudioPlayer::new(ctx, &self.path));
         }
@@ -326,6 +517,20 @@ impl Preview {
                 Raw::Doc => {
                     self.doc = Some(crate::docview::DocView::new(ctx, &self.path));
                     Body::Doc
+                }
+                Raw::Rich(r) => {
+                    self.meta.extend(r.meta.iter().cloned());
+                    self.rich = Some(crate::rich::RichView::new(r));
+                    Body::Rich
+                }
+                Raw::Tables(t) => {
+                    self.table = Some(crate::table::TableView::new(t));
+                    Body::Table
+                }
+                Raw::Tree(tree, lines, truncated) => {
+                    self.tree = Some(crate::tree::TreeView::new(tree));
+                    self.tree_text = false;
+                    Body::Tree { lines, truncated }
                 }
                 Raw::Binary => Body::Info,
                 Raw::Err(e) => Body::Error(e),
@@ -401,6 +606,19 @@ impl Preview {
         if over_close && clicked {
             action = Action::Close;
         }
+        if self.kind != Kind::Folder && !crate::sftp::is_remote(&self.path) {
+            let ib = Rect::from_center_size(pos2(close_r.left() - 26.0, head.center().y), vec2(34.0, 34.0));
+            let over = pointer.map(|q| ib.contains(q)).unwrap_or(false);
+            if over || self.show_meta {
+                p.rect_filled(ib, CornerRadius::same(10), if self.show_meta { pal.sel } else { pal.hover });
+            }
+            let ic = if self.show_meta { pal.accent } else { pal.text };
+            p.circle_stroke(ib.center(), 9.0, Stroke::new(1.4, ic));
+            p.text(ib.center(), Align2::CENTER_CENTER, "i", FontId::proportional(13.0), ic);
+            if over && clicked {
+                self.toggle_meta(ctx);
+            }
+        }
         if touch {
             // «Abrir con…» junto al cierre
             let ob = Rect::from_center_size(pos2(close_r.left() - 62.0, head.center().y), vec2(104.0, 34.0));
@@ -456,8 +674,6 @@ impl Preview {
             pos2(card.left() + 14.0, head.bottom() + 12.0),
             pos2(card.right() - 14.0, card.bottom() - foot_h),
         );
-        let cp = p.with_clip_rect(content);
-        let in_content = pointer.map(|q| content.contains(q)).unwrap_or(false);
 
         // anterior / siguiente al tocar los bordes (táctil)
         if touch {
@@ -473,6 +689,130 @@ impl Preview {
             }
         }
 
+        self.draw_body(ctx, &p, content, pal, pointer, clicked);
+        if self.show_meta {
+            self.draw_meta(ctx, &p, content, pal);
+        }
+        action
+    }
+
+    /// Cierra el archivo abierto dentro del comprimido; `false` si no había ninguno.
+    pub fn close_inner(&mut self) -> bool {
+        self.entry_err = None;
+        self.entry_rx = None;
+        self.entry_busy = None;
+        self.inner.take().is_some()
+    }
+
+    fn open_entry(&mut self, ctx: &egui::Context, name: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (src, ctx2, n) = (self.path.clone(), ctx.clone(), name.clone());
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join(format!("inner-{}-{stamp}", std::process::id()));
+        if let Some(old) = self.tmp.replace(dir.clone()) {
+            let _ = std::fs::remove_dir_all(old);
+        }
+        self.entry_err = None;
+        std::thread::spawn(move || {
+            let r = crate::archive::read_entry(&src, &n, &dir, 64 << 20);
+            let _ = tx.send(r);
+            ctx2.request_repaint();
+        });
+        self.entry_rx = Some(rx);
+        self.entry_busy = Some(name);
+    }
+
+    /// ¿Está escribiendo en el cuadro de búsqueda del documento?
+    pub fn typing(&self) -> bool {
+        self.find_open
+    }
+
+    /// Esc dentro de la búsqueda la cierra; `false` si no estaba abierta.
+    pub fn close_find(&mut self) -> bool {
+        if !self.find_open {
+            return false;
+        }
+        self.find_open = false;
+        if let Some(d) = &mut self.doc {
+            d.close_find();
+        }
+        true
+    }
+
+    pub fn toggle_meta(&mut self, ctx: &egui::Context) {
+        self.show_meta = !self.show_meta;
+        if self.show_meta && !self.meta_started {
+            self.meta_started = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (path, kind, size, ctx2) = (self.path.clone(), self.kind, self.size, ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::meta::collect(&path, kind, size));
+                ctx2.request_repaint();
+            });
+            self.meta_rx = Some(rx);
+        }
+    }
+
+    fn draw_meta(&mut self, _ctx: &egui::Context, p: &egui::Painter, content: Rect, pal: &Pal) {
+        if let Some(rx) = &self.meta_rx {
+            if let Ok(rows) = rx.try_recv() {
+                let extra = std::mem::take(&mut self.meta);
+                self.meta = rows;
+                self.meta.extend(extra);
+                self.meta_rx = None;
+            }
+        }
+        let w = 300.0f32.min(content.width() - 20.0);
+        let rows = &self.meta;
+        let h = (46.0 + rows.len() as f32 * 38.0).min(content.height() - 20.0).max(70.0);
+        let r = Rect::from_min_size(pos2(content.right() - w - 10.0, content.top() + 10.0), vec2(w, h));
+        p.rect_filled(r, CornerRadius::same(12), pal.panel.gamma_multiply(0.96));
+        p.rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+        p.text(pos2(r.left() + 14.0, r.top() + 18.0), Align2::LEFT_CENTER, t("Información"), FontId::proportional(14.0), pal.text);
+        let cp = p.with_clip_rect(r);
+        if self.meta_rx.is_some() {
+            cp.text(r.center(), Align2::CENTER_CENTER, t("Cargando…"), FontId::proportional(12.0), pal.subtle);
+            return;
+        }
+        if rows.is_empty() {
+            cp.text(r.center(), Align2::CENTER_CENTER, t("Sin datos"), FontId::proportional(12.0), pal.subtle);
+            return;
+        }
+        let mut y = r.top() + 40.0;
+        for (k, v) in rows {
+            if y + 30.0 > r.bottom() {
+                break;
+            }
+            cp.text(pos2(r.left() + 14.0, y), Align2::LEFT_TOP, k, FontId::proportional(11.0), pal.subtle);
+            let mut val = v.clone();
+            if val.chars().count() > 38 {
+                val = val.chars().take(37).collect::<String>() + "…";
+            }
+            cp.text(pos2(r.left() + 14.0, y + 14.0), Align2::LEFT_TOP, val, FontId::proportional(12.5), pal.text);
+            y += 38.0;
+        }
+    }
+
+    /// Contenido de la tarjeta (todo salvo la cabecera y el pie); también lo usa la vista previa anidada.
+    fn draw_body(&mut self, ctx: &egui::Context, p: &egui::Painter, content: Rect, pal: &Pal, pointer: Option<Pos2>, clicked: bool) {
+        if self.inner.is_some() {
+            let bar = Rect::from_min_size(content.min, vec2(content.width(), 30.0));
+            let hot = pointer.map(|q| bar.contains(q)).unwrap_or(false);
+            p.rect_filled(bar, CornerRadius::same(8), if hot { pal.hover } else { pal.surface });
+            let nm = self.inner.as_ref().map(|i| i.0.name.clone()).unwrap_or_default();
+            p.text(pos2(bar.left() + 12.0, bar.center().y), Align2::LEFT_CENTER, format!("‹  {}  ·  {}", t("Volver al comprimido"), nm), FontId::proportional(13.0), pal.text);
+            if hot && clicked {
+                self.close_inner();
+                return;
+            }
+            let rest = Rect::from_min_max(pos2(content.left(), content.top() + 36.0), content.max);
+            if let Some(i) = &mut self.inner {
+                i.0.draw_body(ctx, p, rest, pal, pointer, clicked);
+            }
+            return;
+        }
+        let cp = p.with_clip_rect(content);
+        let in_content = pointer.map(|q| content.contains(q)).unwrap_or(false);
         let vt = self.player.as_ref().and_then(|p| p.tex.as_ref().map(|t| (t.id(), t.size_vec2())));
         if let Some((id, sz)) = vt {
             self.draw_zoomable(ctx, &cp, content, id, sz, in_content);
@@ -499,46 +839,34 @@ impl Preview {
                 }
             }
             Body::Text { lines, truncated } => {
-                let lh = 18.0;
-                let total = lines.len() as f32 * lh;
-                let max_scroll = (total - content.height() + 20.0).max(0.0);
-                if in_content {
-                    let dy = ctx.input(|i| i.smooth_scroll_delta.y);
-                    self.scroll = (self.scroll - dy).clamp(0.0, max_scroll);
+                draw_lines(ctx, &cp, content, in_content, &mut self.scroll, lines, *truncated, pal);
+            }
+            Body::Rich => {
+                if let Some(r) = &mut self.rich {
+                    r.draw(ctx, &cp, content, pal, in_content);
                 }
-                let (pg, home, end) = ctx.input(|i| {
-                    (
-                        i.key_pressed(egui::Key::PageDown) as i32 - i.key_pressed(egui::Key::PageUp) as i32,
-                        i.key_pressed(egui::Key::Home),
-                        i.key_pressed(egui::Key::End),
-                    )
-                });
-                self.scroll = (self.scroll + pg as f32 * content.height() * 0.9).clamp(0.0, max_scroll);
-                if home {
-                    self.scroll = 0.0;
+            }
+            Body::Table => {
+                if let Some(tv) = &mut self.table {
+                    tv.draw(ctx, &cp, content, pal, in_content, pointer, clicked);
                 }
-                if end {
-                    self.scroll = max_scroll;
+            }
+            Body::Tree { lines, truncated } => {
+                for (i, label) in [t("Árbol"), t("Texto")].into_iter().enumerate() {
+                    let r = Rect::from_min_size(pos2(content.left() + 18.0 + i as f32 * 98.0, content.top() + 8.0), vec2(90.0, 28.0));
+                    let on = self.tree_text == (i == 1);
+                    let hot = pointer.map(|q| r.contains(q)).unwrap_or(false);
+                    cp.rect_filled(r, CornerRadius::same(8), if on { pal.sel } else if hot { pal.hover } else { pal.surface });
+                    cp.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), if on { pal.accent } else { pal.text });
+                    if hot && clicked {
+                        self.tree_text = i == 1;
+                    }
                 }
-                let bg = Rect::from_min_max(content.min, content.max);
-                cp.rect_filled(bg, CornerRadius::same(10), pal.bg);
-                let first = (self.scroll / lh) as usize;
-                let n = (content.height() / lh) as usize + 2;
-                let mono = FontId::monospace(13.0);
-                let gutter = 54.0;
-                for (k, line) in lines.iter().enumerate().skip(first).take(n) {
-                    let y = content.top() + 10.0 + k as f32 * lh - self.scroll;
-                    cp.text(pos2(content.left() + gutter - 10.0, y), Align2::RIGHT_TOP, k + 1, mono.clone(), pal.subtle.gamma_multiply(0.6));
-                    cp.text(pos2(content.left() + gutter + 4.0, y), Align2::LEFT_TOP, line, mono.clone(), pal.text);
-                }
-                if *truncated {
-                    cp.text(
-                        pos2(content.right() - 12.0, content.bottom() - 8.0),
-                        Align2::RIGHT_BOTTOM,
-                        t("(vista parcial)"),
-                        FontId::proportional(11.5),
-                        pal.subtle,
-                    );
+                let area = Rect::from_min_max(pos2(content.left(), content.top() + 44.0), content.max);
+                if self.tree_text {
+                    draw_lines(ctx, &cp.with_clip_rect(area), area, in_content, &mut self.scroll, lines, *truncated, pal);
+                } else if let Some(tv) = &mut self.tree {
+                    tv.draw(ctx, &cp, area, pal, in_content, pointer, clicked);
                 }
             }
             Body::Folder { count, names } => {
@@ -598,12 +926,23 @@ impl Preview {
                         g = cp.layout_no_wrap(format!("{name}…"), FontId::proportional(13.0), pal.text);
                     }
                     let col = if *dir { pal.accent } else { pal.text };
+                    let rr = Rect::from_min_max(pos2(content.left() + 8.0, y - 10.0), pos2(content.right() - 8.0, y + 10.0));
+                    if !*dir && self.entry_busy.is_none() && pointer.map(|q| rr.contains(q)).unwrap_or(false) {
+                        cp.rect_filled(rr, CornerRadius::same(6), pal.hover);
+                        if clicked {
+                            self.entry_pick = Some(n.clone());
+                        }
+                    }
                     cp.galley(pos2(content.left() + 18.0, y - g.size().y / 2.0), g, col);
                     if !*dir {
                         cp.text(pos2(content.right() - 18.0, y), Align2::RIGHT_CENTER, human_size(*sz), FontId::proportional(12.0), pal.subtle);
                     }
                 }
-                if rows.len() > fit {
+                if let Some(n) = &self.entry_busy {
+                    cp.text(pos2(content.center().x, content.bottom() - 12.0), Align2::CENTER_CENTER, format!("{} {n}", t("Abriendo")), FontId::proportional(12.0), pal.accent);
+                } else if let Some(e) = &self.entry_err {
+                    cp.text(pos2(content.center().x, content.bottom() - 12.0), Align2::CENTER_CENTER, e, FontId::proportional(12.0), Color32::from_rgb(220, 90, 90));
+                } else if rows.len() > fit {
                     cp.text(
                         pos2(content.center().x, content.bottom() - 12.0),
                         Align2::CENTER_CENTER,
@@ -654,10 +993,12 @@ impl Preview {
             }
         }
         }
-        if matches!(self.kind, Kind::Video | Kind::Audio) {
-            self.video_controls(ctx, &p, content, pal, pointer, clicked);
+        if let Some(n) = self.entry_pick.take() {
+            self.open_entry(ctx, n);
         }
-        action
+        if matches!(self.kind, Kind::Video | Kind::Audio) {
+            self.video_controls(ctx, p, content, pal, pointer, clicked);
+        }
     }
 
     fn video_controls(
@@ -847,9 +1188,47 @@ impl Preview {
                 i.key_pressed(egui::Key::End),
             )
         });
-        let Some(doc) = &mut self.doc else { return };
+        if self.doc.is_none() {
+            return;
+        }
+        // Ctrl+F abre la búsqueda; mientras está abierta el teclado es suyo
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.find_open = true;
+        }
+        let mut find_changed = false;
+        let mut hit_step = 0isize;
+        if self.find_open {
+            let (txt, back, enter, shift) = ctx.input_mut(|i| {
+                let mut t = String::new();
+                for e in &i.events {
+                    if let egui::Event::Text(s) = e {
+                        t.push_str(s);
+                    }
+                }
+                let shift = i.modifiers.shift;
+                (t, i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace), i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter), shift)
+            });
+            if !txt.is_empty() {
+                self.find_text.push_str(&txt.replace(['\n', '\r'], ""));
+                find_changed = true;
+            }
+            if back && self.find_text.pop().is_some() {
+                find_changed = true;
+            }
+            if enter {
+                hit_step = if shift { -1 } else { 1 };
+            }
+        }
+        let doc = self.doc.as_mut().unwrap();
         doc.poll(ctx);
-        let mut step = pg;
+        if find_changed {
+            let q = self.find_text.clone();
+            doc.search(&q);
+        }
+        if hit_step != 0 {
+            doc.next_hit(hit_step);
+        }
+        let mut step = if self.find_open { 0 } else { pg };
         if hot && !ctrl && dy != 0.0 {
             self.scroll += dy;
             if self.scroll.abs() >= 60.0 {
@@ -862,24 +1241,36 @@ impl Preview {
             self.zoom = 1.0;
             self.pan = vec2(0.0, 0.0);
         }
-        if home {
+        if home && !self.find_open {
             doc.goto(0);
         }
-        if end {
+        if end && !self.find_open {
             doc.goto(usize::MAX);
         }
         // dibuja con la resolución necesaria para el zoom actual
         doc.want(area.width() * ppp * self.zoom.max(1.0));
         let tex = doc.texture().map(|t| (t.id(), t.size_vec2()));
+        let shown = doc.tex_page();
         let (count, page, error, busy) = (doc.count, doc.page, doc.error.clone(), doc.busy());
-        let mut nav = 0isize;
-        if let Some((id, sz)) = tex {
-            self.draw_zoomable(ctx, p, area, id, sz, hot);
+        // texto de la página (para seleccionar y copiar)
+        if let Some(r) = doc.runs() {
+            if self.page_runs.as_ref().map(|x| x.0) != Some(page) {
+                self.page_runs = Some((page, r.to_vec()));
+            }
         }
+        let mut nav = 0isize;
+        let mut page_rect = None;
+        if let Some((id, sz)) = tex {
+            page_rect = Some(self.draw_zoomable(ctx, p, area, id, sz, hot));
+        }
+        self.doc_rect = page_rect.filter(|_| shown == Some(page));
         if let Some(e) = error {
             p.text(area.center(), Align2::CENTER_CENTER, e, FontId::proportional(15.0), pal.subtle);
         } else if tex.is_none() {
             p.text(area.center(), Align2::CENTER_CENTER, t("Cargando documento…"), FontId::proportional(14.0), pal.subtle);
+        }
+        if let Some(pr) = self.doc_rect {
+            self.doc_text_layer(ctx, p, pr, hot, page);
         }
         if count > 1 {
             let label = format!("{} / {}", page + 1, count);
@@ -902,12 +1293,129 @@ impl Preview {
             self.zoom = 1.0;
             self.pan = vec2(0.0, 0.0);
         }
-        if busy {
+        if self.find_open {
+            self.draw_find_bar(ctx, p, area, pal, click);
+        }
+        if busy || self.doc.as_ref().and_then(|d| d.find.as_ref()).map(|f| !f.done).unwrap_or(false) {
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
     }
 
-    fn draw_zoomable(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, tex: egui::TextureId, sz: egui::Vec2, hot: bool) {
+    /// Coincidencias de la búsqueda, selección con el ratón y copia del texto de la página.
+    fn doc_text_layer(&mut self, ctx: &egui::Context, p: &egui::Painter, pr: Rect, hot: bool, page: usize) {
+        let to_screen = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(pr.left() + x * pr.width(), pr.top() + y * pr.height()), vec2(w * pr.width(), h * pr.height()));
+        if let Some(f) = self.doc.as_ref().and_then(|d| d.find.as_ref()) {
+            for (k, h) in f.hits.iter().enumerate().filter(|(_, h)| h.page == page) {
+                let col = if k == f.cur { Color32::from_rgba_unmultiplied(255, 140, 0, 120) } else { Color32::from_rgba_unmultiplied(255, 220, 0, 90) };
+                p.rect_filled(to_screen(h.x, h.y, h.w, h.h).expand(1.0), CornerRadius::same(2), col);
+            }
+        }
+        let runs: &[crate::docview::Run] = match &self.page_runs {
+            Some((pg, r)) if *pg == page => r,
+            _ => &[],
+        };
+        // posición (trozo, carácter) bajo el puntero
+        let at = |q: Pos2, near: bool| -> Option<(usize, usize)> {
+            let (fx, fy) = ((q.x - pr.left()) / pr.width(), (q.y - pr.top()) / pr.height());
+            let mut best: Option<(usize, f32)> = None;
+            for (i, r) in runs.iter().enumerate() {
+                let dy = if fy < r.y { r.y - fy } else if fy > r.y + r.h { fy - (r.y + r.h) } else { 0.0 };
+                let dx = if fx < r.x { r.x - fx } else if fx > r.x + r.w { fx - (r.x + r.w) } else { 0.0 };
+                let d = dy * 4.0 + dx;
+                if best.map(|b| d < b.1).unwrap_or(true) {
+                    best = Some((i, d));
+                }
+            }
+            let (i, d) = best?;
+            if !near && d > 0.0 {
+                return None;
+            }
+            let r = &runs[i];
+            let n = r.text.chars().count();
+            let c = (((fx - r.x) / r.w.max(1e-6)) * n as f32).round().clamp(0.0, n as f32) as usize;
+            Some((i, c))
+        };
+        let (pressed, down, pos) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.latest_pos()));
+        if hot && pressed {
+            self.sel = None;
+            self.sel_drag = false;
+            if let Some(q) = pos.filter(|q| pr.contains(*q)) {
+                if let Some(a) = at(q, false) {
+                    self.sel = Some(DocSel { a, b: a, page });
+                    self.sel_drag = true;
+                }
+            }
+        }
+        if self.sel_drag {
+            if down {
+                if let (Some(q), Some(s)) = (pos, self.sel.as_mut()) {
+                    if let Some(b) = at(q, true) {
+                        s.b = b;
+                    }
+                }
+            } else {
+                self.sel_drag = false;
+            }
+        }
+        let sel = self.sel.filter(|s| s.page == page && s.a != s.b);
+        let range = sel.map(|s| if s.a <= s.b { (s.a, s.b) } else { (s.b, s.a) });
+        if let Some((a, b)) = range {
+            for i in a.0..=b.0.min(runs.len().saturating_sub(1)) {
+                let r = &runs[i];
+                let n = r.text.chars().count().max(1) as f32;
+                let (c0, c1) = (if i == a.0 { a.1 as f32 } else { 0.0 }, if i == b.0 { b.1 as f32 } else { n });
+                p.rect_filled(to_screen(r.x + r.w * c0 / n, r.y, r.w * (c1 - c0).max(0.0) / n, r.h), CornerRadius::same(1), Color32::from_rgba_unmultiplied(60, 120, 255, 90));
+            }
+        }
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) && !runs.is_empty() {
+            let text = match range {
+                Some((a, b)) => crate::docview::join_runs(runs[a.0..=b.0.min(runs.len() - 1)].iter(), Some((a.1, b.1))),
+                None => crate::docview::join_runs(runs.iter(), None),
+            };
+            ctx.copy_text(text);
+        }
+        if self.sel_drag {
+            ctx.set_cursor_icon(egui::CursorIcon::Text);
+        } else if hot && pos.map(|q| pr.contains(q) && at(q, false).is_some()).unwrap_or(false) {
+            ctx.set_cursor_icon(egui::CursorIcon::Text);
+        }
+    }
+
+    fn draw_find_bar(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, click: Option<Pos2>) {
+        let r = Rect::from_min_size(pos2(area.center().x - 190.0, area.top() + 10.0), vec2(380.0, 36.0));
+        p.rect_filled(r.translate(vec2(0.0, 2.0)), CornerRadius::same(10), Color32::from_black_alpha(60));
+        p.rect_filled(r, CornerRadius::same(10), pal.panel);
+        p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+        let blink = (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+        let shown = if self.find_text.is_empty() { t("Buscar en el documento").to_string() } else { format!("{}{}", self.find_text, if blink { "|" } else { "" }) };
+        let col = if self.find_text.is_empty() { pal.subtle } else { pal.text };
+        p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.right() - 130.0, r.bottom()))).text(pos2(r.left() + 12.0, r.center().y), Align2::LEFT_CENTER, shown, FontId::proportional(14.0), col);
+        let (cur, total, done) = match self.doc.as_ref().and_then(|d| d.find.as_ref()) {
+            Some(f) => (f.cur, f.hits.len(), f.done),
+            None => (0, 0, true),
+        };
+        let info = if self.find_text.is_empty() { String::new() } else if total == 0 { if done { t("Sin resultados").to_string() } else { "…".into() } } else { format!("{} / {}{}", cur + 1, total, if done { "" } else { "+" }) };
+        p.text(pos2(r.right() - 108.0, r.center().y), Align2::RIGHT_CENTER, info, FontId::proportional(12.0), pal.subtle);
+        let mut step = 0isize;
+        let mut close = false;
+        for (k, (g, d)) in [("‹", -1isize), ("›", 1), ("✕", 0)].into_iter().enumerate() {
+            let b = Rect::from_center_size(pos2(r.right() - 84.0 + k as f32 * 28.0 + 14.0, r.center().y), vec2(26.0, 26.0));
+            if click.map(|q| b.contains(q)).unwrap_or(false) {
+                if k == 2 { close = true } else { step = d }
+            }
+            p.text(b.center(), Align2::CENTER_CENTER, g, FontId::proportional(18.0), pal.text);
+        }
+        if step != 0 {
+            if let Some(d) = &mut self.doc {
+                d.next_hit(step);
+            }
+        }
+        if close {
+            self.close_find();
+        }
+    }
+
+    fn draw_zoomable(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, tex: egui::TextureId, sz: egui::Vec2, hot: bool) -> Rect {
         if hot {
             let pinch = ctx.input(|i| i.zoom_delta());
             if pinch != 1.0 {
@@ -924,7 +1432,9 @@ impl Preview {
             if dy != 0.0 && self.doc.is_none() {
                 self.zoom = (self.zoom * (dy * 0.0015).exp()).clamp(0.25, 24.0);
             }
-            self.pan += drag;
+            if !self.sel_drag {
+                self.pan += drag;
+            }
             if dbl {
                 self.zoom = 1.0;
                 self.pan = vec2(0.0, 0.0);
@@ -942,7 +1452,7 @@ impl Preview {
         let shape = egui::epaint::RectShape::filled(rect, CornerRadius::same(8), Color32::WHITE)
             .with_texture(tex, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
         p.add(shape);
-        let _: Option<Pos2> = None;
+        rect
     }
 }
 

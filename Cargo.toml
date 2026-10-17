@@ -20,16 +20,19 @@ dirs = "7.0.0"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 egui = { version = "0.36.2", default-features = false }
 flate2 = "1.1.10"
-image = { version = "0.25.10", default-features = false, features = ["png", "gif", "webp", "bmp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "gif", "webp", "bmp", "tiff", "ico"] }
 jpeg-decoder = "0.3.2"
 md-5 = "0.11.0"
 portable-pty = "0.9.0"
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 resvg = { version = "0.48.1", default-features = false }
+skrifa = "0.44"
 sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util", "compress"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "aac", "isomp4", "alac", "pcm"] }
 tar = "0.4.46"
+tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 vt100 = "0.16.2"
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
@@ -39,6 +42,22 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# apex-view y sus bibliotecas se compilan por tamaño (según su README): ~1 MB menos en el binario
+[profile.release.package]
+apex-view.opt-level = "z"
+vello_cpu.opt-level = "s"
+vello_common.opt-level = "s"
+fearless_simd.opt-level = "s"
+skrifa.opt-level = "s"
+read-fonts.opt-level = "s"
+font-types.opt-level = "s"
+kurbo.opt-level = "s"
+peniko.opt-level = "s"
+color.opt-level = "s"
+encoding_rs.opt-level = "s"
+zune-jpeg.opt-level = "s"
+zune-core.opt-level = "s"
 
 [profile.dev]
 opt-level = 2

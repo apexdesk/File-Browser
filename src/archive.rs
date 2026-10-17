@@ -154,6 +154,93 @@ pub fn list(path: &Path, max: usize, budget: Duration) -> Result<Listing, String
     Ok(Listing { items, truncated })
 }
 
+/// Extrae una sola entrada (`entry`, tal como la da `list`) dentro de `dst` y devuelve su ruta.
+/// Rechaza entradas mayores que `max` bytes o con rutas que escapan de `dst`.
+pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::path::PathBuf, String> {
+    let fmt = detect(src).ok_or("formato no soportado")?;
+    if !safe(Path::new(entry)) {
+        return Err("ruta no válida".into());
+    }
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let out = dst.join(entry);
+    if let Some(d) = out.parent() {
+        fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let too_big = || "el archivo es demasiado grande para la vista previa".to_string();
+    let copy_limited = |r: &mut dyn Read, size: u64| -> Result<(), String> {
+        if size > max {
+            return Err(too_big());
+        }
+        let mut f = File::create(&out).map_err(|e| e.to_string())?;
+        io::copy(&mut r.take(max), &mut f).map_err(|e| e.to_string())?;
+        Ok(())
+    };
+    match fmt {
+        Format::Zip => {
+            let f = File::open(src).map_err(|e| e.to_string())?;
+            let mut ar = zip::ZipArchive::new(BufReader::new(f)).map_err(|e| e.to_string())?;
+            let mut z = ar.by_name(entry).map_err(|e| e.to_string())?;
+            let size = z.size();
+            copy_limited(&mut z, size)?;
+        }
+        Format::Tar | Format::TarGz => {
+            let f = BufReader::new(File::open(src).map_err(|e| e.to_string())?);
+            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(f)) } else { Box::new(f) };
+            let mut ar = tar::Archive::new(rd);
+            let mut found = false;
+            for e in ar.entries().map_err(|e| e.to_string())? {
+                let mut e = e.map_err(|e| e.to_string())?;
+                if e.path().map(|p| p.to_string_lossy() == entry).unwrap_or(false) {
+                    let size = e.size();
+                    copy_limited(&mut e, size)?;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err("no se encontró la entrada".into());
+            }
+        }
+        Format::SevenZ => {
+            let ar = sevenz_rust2::Archive::open(src).map_err(|e| e.to_string())?;
+            if ar.files.iter().any(|f| f.name() == entry && f.size() > max) {
+                return Err(too_big());
+            }
+            let f = File::open(src).map_err(|e| e.to_string())?;
+            sevenz_rust2::decompress_with_extract_fn(f, dst, |e, rd, dest| {
+                if e.name() == entry {
+                    sevenz_rust2::default_entry_extract_fn(e, rd, dest)
+                } else {
+                    Ok(true)
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "android")]
+        Format::Rar => return Err("RAR no está soportado en Android".into()),
+        #[cfg(not(target_os = "android"))]
+        Format::Rar => {
+            let mut cur = unrar::Archive::new(src).open_for_processing().map_err(|e| e.to_string())?;
+            loop {
+                let Some(h) = cur.read_header().map_err(|e| e.to_string())? else { return Err("no se encontró la entrada".into()) };
+                let e = h.entry();
+                if e.filename.to_string_lossy() == entry {
+                    if e.is_encrypted() {
+                        return Err("el archivo está protegido con contraseña".into());
+                    }
+                    if e.unpacked_size > max {
+                        return Err(too_big());
+                    }
+                    h.extract_with_base(dst).map_err(|e| e.to_string())?;
+                    break;
+                }
+                cur = h.skip().map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    if out.is_file() { Ok(out) } else { Err("no se pudo extraer".into()) }
+}
+
 /// Extrae todo `src` dentro de `dst`. Devuelve los nombres de primer nivel.
 pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) -> Result<Vec<String>, String> {
     let fmt = detect(src).ok_or("formato no soportado")?;
