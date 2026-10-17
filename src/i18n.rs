@@ -193,6 +193,10 @@ fn cjk_font(lang: &str) -> Option<(Vec<u8>, u32)> {
 /// Instala la fuente de respaldo CJK si el idioma la necesita. Devuelve `false` si no se encontró.
 pub fn install_fonts(ctx: &egui::Context, lang_idx: usize) -> bool {
     let code = LANGS[lang_idx.min(LANGS.len() - 1)].0;
+    // sin CJK, las fuentes por defecto de egui ya están puestas: no se reconstruyen
+    if !matches!(code, "zh" | "ja" | "ko") {
+        return true;
+    }
     let mut defs = egui::FontDefinitions::default();
     let mut ok = true;
     if matches!(code, "zh" | "ja" | "ko") {

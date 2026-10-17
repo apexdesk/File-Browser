@@ -7,8 +7,11 @@ use std::collections::HashMap;
 pub struct SysIcons {
     cache: HashMap<String, Option<TextureHandle>>,
     budget: u32,
+    /// El tema de iconos se carga en segundo plano para no retrasar el arranque.
     #[cfg(target_os = "linux")]
-    lin: linux::Lookup,
+    lin: Option<linux::Lookup>,
+    #[cfg(target_os = "linux")]
+    lin_rx: Option<std::sync::mpsc::Receiver<linux::Lookup>>,
 }
 
 impl SysIcons {
@@ -17,8 +20,39 @@ impl SysIcons {
             cache: HashMap::new(),
             budget: 0,
             #[cfg(target_os = "linux")]
-            lin: linux::Lookup::new(),
+            lin: None,
+            #[cfg(target_os = "linux")]
+            lin_rx: {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(linux::Lookup::new());
+                });
+                Some(rx)
+            },
         }
+    }
+
+    /// `true` cuando ya se puede resolver iconos (en Linux, cuando terminó de leerse el tema).
+    fn ready(&mut self, ctx: &Context) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if self.lin.is_none() {
+                match self.lin_rx.as_ref().map(|r| r.try_recv()) {
+                    Some(Ok(l)) => {
+                        self.lin = Some(l);
+                        self.lin_rx = None;
+                        ctx.request_repaint();
+                    }
+                    Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(20));
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        let _ = ctx;
+        true
     }
 
     /// Limita cuántos iconos nuevos se resuelven por fotograma (la búsqueda toca disco).
@@ -45,6 +79,9 @@ impl SysIcons {
         if let Some(t) = self.cache.get(&key) {
             return t.as_ref().map(|t| t.id());
         }
+        if !self.ready(ctx) {
+            return None;
+        }
         if self.budget == 0 {
             ctx.request_repaint();
             return None;
@@ -58,6 +95,9 @@ impl SysIcons {
         let key = format!("ext:{}", ext.to_ascii_lowercase());
         if let Some(t) = self.cache.get(&key) {
             return t.as_ref().map(|t| t.id());
+        }
+        if !self.ready(ctx) {
+            return None;
         }
         if self.budget == 0 {
             ctx.request_repaint();
@@ -81,13 +121,14 @@ impl SysIcons {
             Some("drive") => &["drive-harddisk", "drive-removable-media", "folder"],
             _ => &["folder"],
         };
-        self.lin.load_any(names)
+        self.lin.as_mut()?.load_any(names)
     }
     #[cfg(target_os = "linux")]
     fn load_file(&mut self, ext: &str) -> Option<Decoded> {
-        let names = self.lin.names_for_ext(ext);
+        let lin = self.lin.as_mut()?;
+        let names = lin.names_for_ext(ext);
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        self.lin.load_any(&refs)
+        lin.load_any(&refs)
     }
 
     #[cfg(windows)]
