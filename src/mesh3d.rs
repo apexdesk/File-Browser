@@ -157,8 +157,6 @@ pub fn render(m: &Mesh, yaw: f32, pitch: f32, zoom: f32, w: usize, h: usize, bg:
     let n_tris = m.count();
     let ss = if n_tris < 60_000 && w * h <= 700_000 { 2 } else { 1 };
     let (rw, rh) = (w * ss, h * ss);
-    let mut z = vec![f32::INFINITY; rw * rh];
-    let mut col = vec![[bg[0], bg[1], bg[2]]; rw * rh];
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     let scale = 0.9 * (rw.min(rh) as f32) / (2.0 * m.radius) * zoom;
@@ -173,10 +171,14 @@ pub fn render(m: &Mesh, yaw: f32, pitch: f32, zoom: f32, w: usize, h: usize, bg:
     let l1 = norm([-0.35, 0.55, -0.75]);
     let l2 = norm([0.6, -0.2, -0.4]);
     let step = if full || n_tris <= 400_000 { 1 } else { n_tris / 400_000 + 1 };
-    let mut t = 0;
+    let threads = if n_tris >= 20_000 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8) } else { 1 };
+    let raster = |first: usize| -> (Vec<f32>, Vec<[u8; 3]>) {
+    let mut z = vec![f32::INFINITY; rw * rh];
+    let mut col = vec![[bg[0], bg[1], bg[2]]; rw * rh];
+    let mut t = first * step;
     while t < n_tris {
         let d = &m.tris[t * 9..t * 9 + 9];
-        t += step;
+        t += step * threads;
         let a = rot([d[0], d[1], d[2]]);
         let b = rot([d[3], d[4], d[5]]);
         let c = rot([d[6], d[7], d[8]]);
@@ -224,6 +226,27 @@ pub fn render(m: &Mesh, yaw: f32, pitch: f32, zoom: f32, w: usize, h: usize, bg:
             }
         }
     }
+    (z, col)
+    };
+    let col = if threads == 1 {
+        raster(0).1
+    } else {
+        let parts: Vec<(Vec<f32>, Vec<[u8; 3]>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || raster(k))).collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        let mut it = parts.into_iter();
+        let (mut z, mut col) = it.next().unwrap();
+        for (z2, c2) in it {
+            for i in 0..z.len() {
+                if z2[i] < z[i] {
+                    z[i] = z2[i];
+                    col[i] = c2[i];
+                }
+            }
+        }
+        col
+    };
     let mut out = vec![255u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
@@ -279,6 +302,19 @@ mod tests {
         let img = render(&m, 0.3, 0.4, 1.0, 64, 64, [0, 0, 0], [200, 200, 255], true);
         assert!(img.chunks_exact(4).any(|p| p[2] > 20));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        let m = load(std::path::Path::new(&std::env::var("MESH").unwrap())).unwrap();
+        for full in [true, false] {
+            let t = std::time::Instant::now();
+            for k in 0..5 {
+                render(&m, k as f32 * 0.1, 0.5, 1.0, 800, 600, [20, 20, 30], [150, 185, 255], full);
+            }
+            println!("full={full}: {:?} por imagen", t.elapsed() / 5);
+        }
     }
 
     #[test]
