@@ -216,6 +216,8 @@ pub fn start(roots: Vec<PathBuf>, ctx: egui::Context) {
     }
     let gener = GENERATION.load(AO::SeqCst);
     std::thread::spawn(move || {
+        // no compite con el arranque: el primer fotograma y el listado inicial van antes
+        std::thread::sleep(Duration::from_millis(2500));
         if let Some(idx) = Index::load(&cache_file()) {
             if idx.roots() == roots && GENERATION.load(AO::SeqCst) == gener {
                 PROGRESS.store(idx.count(), AO::Relaxed);
@@ -269,7 +271,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
         }
         let shared = Arc::new((Mutex::new(Work { stack, active: 0 }), Condvar::new()));
         let idx = Arc::new(Mutex::new(idx));
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8);
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4);
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 let (shared, idx, ctx) = (shared.clone(), idx.clone(), ctx.clone());
