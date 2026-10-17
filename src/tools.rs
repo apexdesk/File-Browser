@@ -207,7 +207,7 @@ fn add_tree<W: Write + io::Seek>(
 }
 
 /// Extrae `src` dentro de `dst` (carpeta ya creada). Devuelve los nombres de primer nivel.
-pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) -> Result<Vec<String>, String> {
+pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pass: Option<&str>) -> Result<Vec<String>, String> {
     let f = File::open(src).map_err(|e| e.to_string())?;
     let mut ar = zip::ZipArchive::new(io::BufReader::new(f)).map_err(|e| e.to_string())?;
     p.total.store(ar.len() as u64, AO::Relaxed);
@@ -217,7 +217,22 @@ pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) -> Re
         if p.cancelled() {
             return Err("cancelado".into());
         }
-        let mut zf = ar.by_index(i).map_err(|e| e.to_string())?;
+        let bad = |e: String| -> String {
+            let m = e.to_lowercase();
+            if m.contains("password required") {
+                if pass.is_some() { crate::archive::BAD_PASS.into() } else { crate::archive::NEED_PASS.into() }
+            } else if m.contains("password") && m.contains("incorrect") {
+                crate::archive::BAD_PASS.into()
+            } else {
+                e
+            }
+        };
+        let mut zf = match pass {
+            Some(pw) => ar.by_index_decrypt(i, pw.as_bytes()),
+            None => ar.by_index(i),
+        }
+        .map_err(|e| bad(e.to_string()))?;
+        let encrypted = zf.encrypted();
         let Some(rel) = zf.enclosed_name() else { continue }; // descarta rutas peligrosas (../)
         if let Some(first) = rel.components().next() {
             let n = first.as_os_str().to_string_lossy().into_owned();
@@ -233,7 +248,10 @@ pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) -> Re
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let mut out = File::create(&target).map_err(|e| format!("{}: {e}", rel.display()))?;
-            io::copy(&mut zf, &mut out).map_err(|e| format!("{}: {e}", rel.display()))?;
+            if let Err(e) = io::copy(&mut zf, &mut out) {
+                // ZipCrypto con contraseña errónea sólo falla al comprobar el CRC
+                return Err(if encrypted && pass.is_some() { crate::archive::BAD_PASS.into() } else { format!("{}: {e}", rel.display()) });
+            }
         }
         p.done.fetch_add(1, AO::Relaxed);
         if i % 32 == 0 {
@@ -768,7 +786,7 @@ mod compress_tests {
                 let o = CompressOpts { fmt, level, password: None };
                 compress_paths(&[d.join("src")], &out, &o, &Progress::default(), &ctx).unwrap();
                 let dst = d.join(format!("x_{level}_{}", fmt.ext()));
-                crate::archive::extract_all(&out, &dst, &Progress::default(), &ctx).unwrap();
+                crate::archive::extract_all(&out, &dst, &Progress::default(), &ctx, None).unwrap();
                 same(&d.join("src"), &dst.join("src"));
             }
         }
@@ -795,6 +813,25 @@ mod compress_tests {
         sevenz_rust2::decompress_file_with_password(&sp, &dst, "clave".into()).unwrap();
         same(&d.join("src"), &dst.join("src"));
         assert!(sevenz_rust2::decompress_file_with_password(&sp, d.join("bad"), "otra".into()).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn extract_asks_for_password() {
+        use crate::archive::{extract_all, BAD_PASS, NEED_PASS};
+        let d = tree("pw");
+        let ctx = egui::Context::default();
+        for fmt in [ArchFmt::Zip, ArchFmt::SevenZ] {
+            let o = CompressOpts { fmt, level: 6, password: Some("clave".into()) };
+            let out = d.join(format!("p.{}", fmt.ext()));
+            compress_paths(&[d.join("src")], &out, &o, &Progress::default(), &ctx).unwrap();
+            let run = |pw: Option<&str>, n: &str| extract_all(&out, &d.join(n), &Progress::default(), &ctx, pw);
+            assert_eq!(run(None, "n").unwrap_err(), NEED_PASS, "{}", fmt.ext());
+            assert_eq!(run(Some("otra"), "m").unwrap_err(), BAD_PASS, "{}", fmt.ext());
+            let ok = format!("ok_{}", fmt.ext());
+            run(Some("clave"), &ok).unwrap();
+            same(&d.join("src"), &d.join(&ok).join("src"));
+        }
         let _ = fs::remove_dir_all(&d);
     }
 
