@@ -301,6 +301,8 @@ pub const TABLE: &[[&str; 10]] = &[
     ["Árbol", "Tree", "Arbre", "Baum", "Árvore", "Albero", "Дерево", "树", "ツリー", "트리"],
     ["Buscar en el documento", "Search in document", "Rechercher dans le document", "Im Dokument suchen", "Procurar no documento", "Cerca nel documento", "Поиск в документе", "在文档中查找", "ドキュメント内を検索", "문서에서 찾기"],
     ["Sin resultados", "No results", "Aucun résultat", "Keine Treffer", "Sem resultados", "Nessun risultato", "Нет результатов", "无结果", "結果なし", "결과 없음"],
+    ["Volver al comprimido", "Back to archive", "Retour à l’archive", "Zurück zum Archiv", "Voltar ao arquivo", "Torna all’archivio", "Назад к архиву", "返回压缩文件", "アーカイブに戻る", "압축 파일로 돌아가기"],
+    ["Abriendo", "Opening", "Ouverture de", "Öffne", "A abrir", "Apertura di", "Открытие", "正在打开", "開いています", "여는 중"],
     ["Comprimido", "Archive", "Archive", "Archiv", "Comprimido", "Archivio", "Архив", "压缩文件", "圧縮ファイル", "압축 파일"],
     ["Documento", "Document", "Document", "Dokument", "Documento", "Documento", "Документ", "文档", "ドキュメント", "문서"],
     ["{name}: no se puede copiar dentro de sí misma", "{name}: cannot copy into itself", "{name} : impossible de copier dans lui-même", "{name}: kann nicht in sich selbst kopiert werden", "{name}: não é possível copiar para dentro de si própria", "{name}: impossibile copiare dentro se stessa", "{name}: нельзя скопировать в саму себя", "{name}：无法复制到自身内部", "{name}: 自身の中にはコピーできません", "{name}: 자기 자신 안으로 복사할 수 없음"],
