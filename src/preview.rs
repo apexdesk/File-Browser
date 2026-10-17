@@ -119,7 +119,11 @@ struct MeshView {
     /// parámetros de la última imagen: (ancho, alto, guiñada, inclinación, zoom, oscuro, completa)
     key: Option<(usize, usize, i32, i32, i32, bool, bool)>,
     dragging: bool,
+    /// imagen en preparación en otro hilo (el visor no se bloquea al dibujar)
+    job: Option<(MeshKey, std::sync::mpsc::Receiver<Vec<u8>>)>,
 }
+
+type MeshKey = (usize, usize, i32, i32, i32, bool, bool);
 
 /// Gráfico de uso de disco de una carpeta: análisis en curso, árbol resultante y nivel mostrado.
 pub struct UsageView {
@@ -511,7 +515,7 @@ impl Preview {
                     Body::Archive { rows, truncated: l.truncated }
                 }
                 Raw::Mesh(m) => {
-                    self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false });
+                    self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false, job: None });
                     Body::Mesh
                 }
                 Raw::Doc => {
@@ -1143,22 +1147,42 @@ impl Preview {
             }
         }
         mv.dragging = moving || (hot && down && mv.dragging);
-        let rw = (area.width() as usize).clamp(64, 900);
-        let rh = ((area.height() * rw as f32 / area.width().max(1.0)) as usize).clamp(64, 900);
+        // al arrastrar se dibuja a media resolución y con menos triángulos
         let full = !mv.dragging;
-        let key = (rw, rh, (mv.yaw * 1000.0) as i32, (mv.pitch * 1000.0) as i32, (mv.zoom * 1000.0) as i32, dark, full);
-        if mv.key != Some(key) {
-            let (bg, base) = if dark { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [150, 185, 255]) } else { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [70, 110, 220]) };
-            let rgba = crate::mesh3d::render(&mv.mesh, mv.yaw, mv.pitch, mv.zoom, rw, rh, bg, base, full);
-            let img = egui::ColorImage::from_rgba_unmultiplied([rw, rh], &rgba);
+        let div = if full { 1.0 } else { 2.0 };
+        let rw = ((area.width() / div) as usize).clamp(64, 900);
+        let rh = (((area.height() / div) * rw as f32 / (area.width() / div).max(1.0)) as usize).clamp(64, 900);
+        let key: MeshKey = (rw, rh, (mv.yaw * 1000.0) as i32, (mv.pitch * 1000.0) as i32, (mv.zoom * 1000.0) as i32, dark, full);
+        // ¿ha terminado el dibujo en curso?
+        let mut done = None;
+        if let Some((k, rx)) = &mv.job {
+            match rx.try_recv() {
+                Ok(rgba) => done = Some((*k, rgba)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => mv.job = None,
+                Err(_) => {}
+            }
+        }
+        if let Some((k, rgba)) = done {
+            mv.job = None;
+            let img = egui::ColorImage::from_rgba_unmultiplied([k.0, k.1], &rgba);
             match &mut mv.tex {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => mv.tex = Some(ctx.load_texture("mesh", img, egui::TextureOptions::LINEAR)),
             }
-            mv.key = Some(key);
-            if !full {
-                ctx.request_repaint(); // al soltar se redibuja a calidad completa
-            }
+            mv.key = Some(k);
+        }
+        if mv.key != Some(key) && mv.job.is_none() {
+            let (bg, base) = if dark { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [150, 185, 255]) } else { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [70, 110, 220]) };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (mesh, ctx2, yaw, pitch, zoom) = (mv.mesh.clone(), ctx.clone(), mv.yaw, mv.pitch, mv.zoom);
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::mesh3d::render(&mesh, yaw, pitch, zoom, rw, rh, bg, base, full));
+                ctx2.request_repaint();
+            });
+            mv.job = Some((key, rx));
+        }
+        if mv.job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if let Some(t) = &mv.tex {
             let shape = egui::epaint::RectShape::filled(area, CornerRadius::same(10), Color32::WHITE)

@@ -105,6 +105,24 @@ struct PropsDlg {
     ok: bool,
 }
 
+/// Consume la tecla sólo si los modificadores coinciden exactamente (Ctrl+Mayús+F no dispara Ctrl+F,
+/// AltGr = Ctrl+Alt no dispara atajos de una sola tecla). En teclas de símbolo se tolera Mayús, porque
+/// según la distribución del teclado hace falta para escribirlas (p. ej. «+» o «?» en teclado inglés).
+fn consume_exact(i: &mut egui::InputState, m: Modifiers, key: Key) -> bool {
+    let named = matches!(key, Key::Plus | Key::Minus | Key::Equals | Key::Questionmark | Key::Colon | Key::Slash | Key::Backslash | Key::Comma | Key::Period | Key::Semicolon | Key::Quote | Key::OpenBracket | Key::CloseBracket | Key::Backtick | Key::Pipe | Key::Exclamationmark | Key::OpenCurlyBracket | Key::CloseCurlyBracket);
+    let mut hit = false;
+    i.events.retain(|e| {
+        if let egui::Event::Key { key: k, modifiers: em, pressed: true, .. } = e {
+            if *k == key && (em.matches_exact(m) || (named && !m.shift && em.matches_exact(m | Modifiers::SHIFT))) {
+                hit = true;
+                return false;
+            }
+        }
+        true
+    });
+    hit
+}
+
 impl Drop for PropsDlg {
     fn drop(&mut self) {
         self.stats.cancel.store(true, Ordering::Relaxed);
@@ -2374,7 +2392,7 @@ impl App {
 
     /// Teclado del visor (overlay o ventana aparte).
     fn preview_keys(&mut self, ctx: &egui::Context) {
-        let k = |m: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(m, key));
+        let k = |m: Modifiers, key: Key| ctx.input_mut(|i| consume_exact(i, m, key));
         let (is_video, active) = self
             .preview
             .as_ref()
@@ -2767,7 +2785,7 @@ impl App {
                 t,
             )
         });
-        let k = |m: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(m, key));
+        let k = |m: Modifiers, key: Key| ctx.input_mut(|i| consume_exact(i, m, key));
 
         if let Some((m, key)) = self.binding(Cmd::Palette) {
             if k(m, key) {
@@ -8690,8 +8708,12 @@ impl eframe::App for App {
                 }
             }
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::BrowserBack)) {
+        // botones laterales del ratón: atrás / adelante
+        let (mb_back, mb_fwd) = ctx.input(|i| (i.pointer.button_pressed(egui::PointerButton::Extra1), i.pointer.button_pressed(egui::PointerButton::Extra2)));
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::BrowserBack)) || mb_back {
             self.on_back_key();
+        } else if mb_fwd && self.preview.is_none() && matches!(self.dlg, Dlg::None) {
+            self.run_cmd(Cmd::Forward);
         }
         if !self.touch && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. }))) {
             self.touch = true;
