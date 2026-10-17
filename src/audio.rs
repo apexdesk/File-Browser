@@ -15,7 +15,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 pub fn supported() -> bool {
-    cfg!(not(target_os = "android"))
+    true
 }
 
 /// Datos de cabecera: duración, etiquetas y carátula.
@@ -154,7 +154,7 @@ impl AudioPlayer {
             artist: String::new(),
             album: String::new(),
             tex: None,
-            error: if supported() { None } else { Some("Android".into()) },
+            error: None,
             meta,
             epoch: Arc::new(AtomicU64::new(0)),
             sess: Arc::new(Session::default()),
@@ -252,12 +252,6 @@ impl Drop for AudioPlayer {
     }
 }
 
-#[cfg(target_os = "android")]
-fn run(_path: &Path, _start: f64, _sess: &Session, _epoch: &AtomicU64, _my: u64) -> Result<(), String> {
-    Err("sin salida de sonido en Android".into())
-}
-
-#[cfg(not(target_os = "android"))]
 fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> Result<(), String> {
     use std::collections::VecDeque;
     use symphonia::core::audio::SampleBuffer;
@@ -273,15 +267,9 @@ fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> R
     }
 
     // dispositivo de salida
-    let (dev, cfg) = output_device()?;
-    let (rate_out, ch_out) = (cfg.sample_rate().0, cfg.channels() as usize);
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let played = Arc::new(AtomicU64::new(0));
-    let stream = build_stream(&dev, &cfg, ring.clone(), played.clone())?;
-    {
-        use cpal::traits::StreamTrait;
-        stream.play().map_err(|e| e.to_string())?;
-    }
+    let (stream, rate_out, ch_out) = open_out(&ring, &played)?;
     sess.rate.store(rate_out, Ordering::Relaxed);
     let high = rate_out as usize * ch_out / 2; // ~0,5 s de audio en cola
 
@@ -391,6 +379,24 @@ fn map_channel(f: &[f32], o: usize, ch_out: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Abre la salida de sonido (cpal en escritorio, AAudio en Android). El valor devuelto mantiene
+/// el flujo abierto mientras viva.
+#[cfg(target_os = "android")]
+fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
+    let s = crate::droid::Sink::open(0, 2, ring.clone(), played.clone())?;
+    let (r, c) = (s.rate, s.ch);
+    Ok((Box::new(s), r, c))
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
+    use cpal::traits::StreamTrait;
+    let (dev, cfg) = output_device()?;
+    let stream = build_stream(&dev, &cfg, ring.clone(), played.clone())?;
+    stream.play().map_err(|e| e.to_string())?;
+    Ok((Box::new(stream), cfg.sample_rate().0, cfg.channels() as usize))
 }
 
 #[cfg(not(target_os = "android"))]

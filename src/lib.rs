@@ -42,7 +42,13 @@ pub mod system;
 pub mod terminal;
 pub mod theme;
 pub mod tools;
+#[cfg(not(target_os = "android"))]
 pub mod video;
+#[cfg(target_os = "android")]
+#[path = "droid_video.rs"]
+pub mod video;
+#[cfg(target_os = "android")]
+pub mod droid;
 pub mod thumbs;
 
 

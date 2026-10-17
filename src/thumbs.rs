@@ -102,7 +102,14 @@ fn from_png_bytes(bytes: &[u8], max: u32) -> Option<Decoded> {
     Some(Decoded { w: rgba.width() as usize, h: rgba.height() as usize, rgba: rgba.into_raw() })
 }
 
+#[allow(unreachable_code)]
 fn ffmpeg_frame(path: &Path, max: u32, video: bool) -> Option<Decoded> {
+    #[cfg(target_os = "android")]
+    {
+        // sin ffmpeg: los códecs del sistema dan el fotograma
+        return if video { crate::droid::frame(path, max) } else { None };
+    }
+    #[cfg(not(target_os = "android"))]
     if !have_ffmpeg() {
         return None;
     }
