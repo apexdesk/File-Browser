@@ -58,8 +58,14 @@ fn run(path: &Path) {
             let _ = crate::rich::epub(path);
             let _ = crate::rich::epub_cover(path, 128);
         }
-        "zip" | "docx" => {
+        "zip" | "docx" | "gz" => {
             let _ = crate::archive::list(path, 1000, Duration::from_secs(2));
+            if ext == "docx" {
+                let _ = crate::docview::thumb(path, 128);
+            }
+        }
+        "pdf" | "rtf" | "odt" => {
+            let _ = crate::docview::thumb(path, 128);
         }
         "jpg" | "jpeg" => {
             let _ = crate::exif::summary(path);
@@ -142,4 +148,35 @@ fn fuzz_readers() {
         eprintln!("{b}");
     }
     assert!(bad.is_empty(), "{} problemas", bad.len());
+}
+
+#[test]
+#[ignore]
+fn fuzz_one() {
+    if let Some(f) = std::env::var_os("FUZZ_FILE") {
+        run(Path::new(&f));
+    }
+}
+
+#[test]
+#[ignore]
+fn fuzz_dir_once() {
+    let Some(dir) = std::env::var_os("FUZZ_ONCE") else { return };
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    for f in files {
+        let t = Instant::now();
+        eprintln!("{} ...", f.display());
+        run(&f);
+        eprintln!("   {:?}", t.elapsed());
+    }
+}
+
+#[test]
+fn markdown_pathological_lines_are_bounded() {
+    let t = Instant::now();
+    for s in ["[".repeat(100_000), "![a](".repeat(30_000), format!("{}x{}", "[x](".repeat(5_000), ")".repeat(5_000))] {
+        let _ = crate::rich::markdown(&s);
+    }
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
 }

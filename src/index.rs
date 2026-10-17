@@ -59,7 +59,8 @@ impl Index {
         loop {
             parts.push(i);
             let p = self.parent[i];
-            if p == NO_PARENT {
+            // tope de profundidad: un índice dañado con ciclos de padres no debe colgar la búsqueda
+            if p == NO_PARENT || parts.len() > 4096 {
                 break;
             }
             i = p as usize;
@@ -134,7 +135,7 @@ impl Index {
         let built = u64_at(8);
         let n = u32_at(16) as usize;
         let alen = u32_at(20) as usize;
-        if b.len() != 24 + alen + n * 11 {
+        if n.checked_mul(11).and_then(|x| x.checked_add(24 + alen)) != Some(b.len()) {
             return None;
         }
         let mut o = 24;

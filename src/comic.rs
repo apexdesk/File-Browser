@@ -93,6 +93,15 @@ fn open_rar(path: &Path, only_first: bool) -> Result<Comic, String> {
     while let Some(h) = cur.read_header().map_err(|_| fail())? {
         let name = h.entry().filename.to_string_lossy().into_owned();
         if let Some(i) = keep.iter().position(|n| *n == name).filter(|_| h.entry().is_file()) {
+            // una página que declara un tamaño absurdo (bomba de descompresión) se salta en vez de cargarla entera en memoria
+            if h.entry().unpacked_size > MAX_PAGE_BYTES {
+                cur = h.skip().map_err(|_| fail())?;
+                done += 1;
+                if done == keep.len() {
+                    break;
+                }
+                continue;
+            }
             let (data, next) = h.read().map_err(|_| fail())?;
             total += data.len() as u64;
             if total > 1 << 30 {

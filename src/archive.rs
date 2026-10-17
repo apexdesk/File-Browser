@@ -274,6 +274,10 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context) ->
                 if p.cancelled() {
                     return Ok(false);
                 }
+                // un nombre absoluto o con `..` escaparía de `dst` (PathBuf::join lo sustituiría entero)
+                if !safe(Path::new(entry.name())) {
+                    return Ok(true);
+                }
                 sevenz_rust2::default_entry_extract_fn(entry, rd, dest)
             })
             .map_err(|e| e.to_string())?;

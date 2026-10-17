@@ -279,20 +279,39 @@ pub fn launch(app: Option<&App>, custom: &str, path: &Path) {
                 #[cfg(not(target_os = "macos"))]
                 {
                     let q = sh_quote(path);
+                    let raw = path.display().to_string();
                     let mut s = String::new();
                     let mut it = a.exec.chars().peekable();
                     let mut used = false;
+                    let (mut in_dq, mut in_sq) = (false, false);
                     while let Some(c) = it.next() {
                         if c == '%' {
                             match it.next() {
                                 Some('f' | 'F' | 'u' | 'U') => {
-                                    s.push_str(&q);
+                                    // la ruta se cita según el contexto en que cae (un nombre con `$(…)` no debe ejecutarse)
+                                    if in_dq {
+                                        for ch in raw.chars() {
+                                            if matches!(ch, '\\' | '$' | '`' | '"') {
+                                                s.push('\\');
+                                            }
+                                            s.push(ch);
+                                        }
+                                    } else if in_sq {
+                                        s.push_str(&raw.replace('\'', "'\\''"));
+                                    } else {
+                                        s.push_str(&q);
+                                    }
                                     used = true;
                                 }
                                 Some('%') => s.push('%'),
                                 _ => {}
                             }
                         } else {
+                            match c {
+                                '"' if !in_sq => in_dq = !in_dq,
+                                '\'' if !in_dq => in_sq = !in_sq,
+                                _ => {}
+                            }
                             s.push(c);
                         }
                     }
