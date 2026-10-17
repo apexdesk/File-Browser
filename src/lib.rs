@@ -6,6 +6,16 @@ pub mod index;
 pub mod commands;
 pub mod diskusage;
 pub mod docview;
+pub mod comic;
+pub mod exif;
+pub mod meta;
+pub mod fontview;
+pub mod tree;
+pub mod sqlite;
+pub mod table;
+pub mod rich;
+pub mod markup;
+pub mod imgx;
 pub mod dragout;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod dragout_linux;

@@ -42,7 +42,7 @@ impl Mesh {
 }
 
 pub fn is_mesh_ext(ext: &str) -> bool {
-    matches!(ext.to_ascii_lowercase().as_str(), "stl" | "obj")
+    matches!(ext.to_ascii_lowercase().as_str(), "stl" | "obj" | "ply" | "glb" | "gltf" | "3mf")
 }
 
 pub fn load(path: &Path) -> Result<Mesh, String> {
@@ -55,6 +55,9 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
     match ext.as_str() {
         "stl" => load_stl(f, len),
         "obj" => load_obj(f),
+        "ply" => load_ply(f),
+        "glb" | "gltf" => load_gltf(path),
+        "3mf" => load_3mf(path),
         _ => Err("formato no admitido".into()),
     }
 }
@@ -85,7 +88,7 @@ fn load_stl(f: std::fs::File, len: u64) -> Result<Mesh, String> {
     let mut text = String::from_utf8_lossy(&head[..n]).into_owned();
     text.push('\n');
     let mut tris: Vec<f32> = Vec::new();
-    let mut parse = |line: &str, tris: &mut Vec<f32>| {
+    let parse = |line: &str, tris: &mut Vec<f32>| {
         let l = line.trim();
         if let Some(rest) = l.strip_prefix("vertex") {
             let v: Vec<f32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
@@ -294,4 +297,408 @@ mod tests {
         assert_eq!(load(&p).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+// ---------------------------------------------------------------------------
+// PLY (ASCII y binario)
+// ---------------------------------------------------------------------------
+
+fn load_ply(f: std::fs::File) -> Result<Mesh, String> {
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    let mut line = String::new();
+    let read_line = |r: &mut BufReader<std::fs::File>, line: &mut String| -> Result<bool, String> {
+        line.clear();
+        Ok(r.read_line(line).map_err(|e| e.to_string())? > 0)
+    };
+    read_line(&mut r, &mut line)?;
+    if line.trim() != "ply" {
+        return Err("no es un PLY".into());
+    }
+    // (nombre, cuenta, propiedades (nombre, tipo, tipo del contador si es lista, tipo de elemento))
+    struct Prop {
+        name: String,
+        ty: String,
+        list: Option<String>,
+    }
+    let mut format = String::new();
+    let mut elems: Vec<(String, usize, Vec<Prop>)> = Vec::new();
+    loop {
+        if !read_line(&mut r, &mut line)? {
+            return Err("cabecera incompleta".into());
+        }
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.as_slice() {
+            ["format", f, ..] => format = f.to_string(),
+            ["element", n, c] => elems.push((n.to_string(), c.parse().map_err(|_| "cuenta no válida")?, Vec::new())),
+            ["property", "list", ct, it, n] => {
+                if let Some(e) = elems.last_mut() {
+                    e.2.push(Prop { name: n.to_string(), ty: it.to_string(), list: Some(ct.to_string()) });
+                }
+            }
+            ["property", t, n] => {
+                if let Some(e) = elems.last_mut() {
+                    e.2.push(Prop { name: n.to_string(), ty: t.to_string(), list: None });
+                }
+            }
+            ["end_header"] => break,
+            _ => {}
+        }
+    }
+    let size = |t: &str| match t {
+        "char" | "uchar" | "int8" | "uint8" => 1,
+        "short" | "ushort" | "int16" | "uint16" => 2,
+        "int" | "uint" | "float" | "int32" | "uint32" | "float32" => 4,
+        _ => 8,
+    };
+    let be = format == "binary_big_endian";
+    let ascii = format == "ascii";
+    let mut verts: Vec<[f32; 3]> = Vec::new();
+    let mut tris: Vec<f32> = Vec::new();
+    // lector de valores numéricos como f64
+    let mut toks: Vec<String> = Vec::new();
+    let mut tok_i = 0usize;
+    let mut next_val = |r: &mut BufReader<std::fs::File>, ty: &str| -> Result<f64, String> {
+        if ascii {
+            while tok_i >= toks.len() {
+                let mut l = String::new();
+                if r.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+                    return Err("datos incompletos".into());
+                }
+                toks = l.split_whitespace().map(|s| s.to_string()).collect();
+                tok_i = 0;
+            }
+            tok_i += 1;
+            return toks[tok_i - 1].parse().map_err(|_| "número no válido".into());
+        }
+        let mut b = [0u8; 8];
+        let n = size(ty);
+        r.read_exact(&mut b[..n]).map_err(|e| e.to_string())?;
+        if be {
+            b[..n].reverse();
+        }
+        Ok(match ty {
+            "char" | "int8" => b[0] as i8 as f64,
+            "uchar" | "uint8" => b[0] as f64,
+            "short" | "int16" => i16::from_le_bytes([b[0], b[1]]) as f64,
+            "ushort" | "uint16" => u16::from_le_bytes([b[0], b[1]]) as f64,
+            "int" | "int32" => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+            "uint" | "uint32" => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+            "float" | "float32" => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+            _ => f64::from_le_bytes(b),
+        })
+    };
+    for (name, count, props) in &elems {
+        if *count > 20_000_000 {
+            return Err("demasiado grande".into());
+        }
+        for _ in 0..*count {
+            let mut xyz = [0f32; 3];
+            let mut idx: Vec<usize> = Vec::new();
+            for p in props {
+                if let Some(ct) = &p.list {
+                    let n = next_val(&mut r, ct)? as usize;
+                    if n > 1000 {
+                        return Err("polígono no válido".into());
+                    }
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        v.push(next_val(&mut r, &p.ty)? as usize);
+                    }
+                    if name == "face" && (p.name == "vertex_indices" || p.name == "vertex_index") {
+                        idx = v;
+                    }
+                } else {
+                    let v = next_val(&mut r, &p.ty)?;
+                    if name == "vertex" {
+                        match p.name.as_str() {
+                            "x" => xyz[0] = v as f32,
+                            "y" => xyz[1] = v as f32,
+                            "z" => xyz[2] = v as f32,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if name == "vertex" {
+                verts.push(xyz);
+            } else if name == "face" {
+                for w in 1..idx.len().saturating_sub(1) {
+                    for &i in &[idx[0], idx[w], idx[w + 1]] {
+                        tris.extend_from_slice(verts.get(i).ok_or("índice fuera de rango")?);
+                    }
+                }
+                if tris.len() / 9 > MAX_TRIS {
+                    return Err("demasiados triángulos".into());
+                }
+            }
+        }
+    }
+    Mesh::finish(tris)
+}
+
+// ---------------------------------------------------------------------------
+// 3MF (zip con XML)
+// ---------------------------------------------------------------------------
+
+fn load_3mf(path: &Path) -> Result<Mesh, String> {
+    use crate::markup::{self, Tok};
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut ar = zip::ZipArchive::new(BufReader::new(f)).map_err(|e| e.to_string())?;
+    let mut name = None;
+    for i in 0..ar.len() {
+        if let Ok(z) = ar.by_index_raw(i) {
+            if let Ok(n) = z.name() {
+                if n.to_ascii_lowercase().ends_with(".model") {
+                    name = Some(n.into_owned());
+                    break;
+                }
+            }
+        }
+    }
+    let name = name.ok_or("sin modelo")?;
+    let mut text = String::new();
+    ar.by_name(&name).map_err(|e| e.to_string())?.take(MAX_BYTES).read_to_string(&mut text).map_err(|e| e.to_string())?;
+    let mut verts: Vec<[f32; 3]> = Vec::new();
+    let mut tris: Vec<f32> = Vec::new();
+    for t in markup::tokens(&text, false) {
+        let Tok::Open { name, attrs, .. } = t else { continue };
+        let num = |k: &str| markup::attr(&attrs, k).and_then(|v| v.parse::<f32>().ok());
+        match markup::local(&name) {
+            "mesh" => verts.clear(),
+            "vertex" => verts.push([num("x").unwrap_or(0.0), num("y").unwrap_or(0.0), num("z").unwrap_or(0.0)]),
+            "triangle" => {
+                for k in ["v1", "v2", "v3"] {
+                    let i = num(k).ok_or("triángulo no válido")? as usize;
+                    tris.extend_from_slice(verts.get(i).ok_or("índice fuera de rango")?);
+                }
+                if tris.len() / 9 > MAX_TRIS {
+                    return Err("demasiados triángulos".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    Mesh::finish(tris)
+}
+
+// ---------------------------------------------------------------------------
+// glTF / GLB (mallas y transformaciones; sin texturas ni compresión Draco)
+// ---------------------------------------------------------------------------
+
+fn b64(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+type M4 = [f32; 16];
+
+fn mul(a: &M4, b: &M4) -> M4 {
+    // matrices en columnas (como glTF): r = a * b
+    let mut r = [0f32; 16];
+    for c in 0..4 {
+        for row in 0..4 {
+            r[c * 4 + row] = (0..4).map(|k| a[k * 4 + row] * b[c * 4 + k]).sum();
+        }
+    }
+    r
+}
+
+fn node_matrix(n: &crate::markup::Json) -> M4 {
+    let ident: M4 = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    if let Some(m) = n.get("matrix") {
+        let v: Vec<f32> = m.arr().iter().filter_map(|x| x.num()).map(|x| x as f32).collect();
+        if v.len() == 16 {
+            let mut o = ident;
+            o.copy_from_slice(&v);
+            return o;
+        }
+    }
+    let f = |k: &str, d: &[f32]| -> Vec<f32> {
+        let v: Vec<f32> = n.get(k).map(|a| a.arr().iter().filter_map(|x| x.num()).map(|x| x as f32).collect()).unwrap_or_default();
+        if v.len() == d.len() { v } else { d.to_vec() }
+    };
+    let (t, q, s) = (f("translation", &[0., 0., 0.]), f("rotation", &[0., 0., 0., 1.]), f("scale", &[1., 1., 1.]));
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    [
+        (1.0 - 2.0 * (y * y + z * z)) * s[0], (2.0 * (x * y + z * w)) * s[0], (2.0 * (x * z - y * w)) * s[0], 0.0,
+        (2.0 * (x * y - z * w)) * s[1], (1.0 - 2.0 * (x * x + z * z)) * s[1], (2.0 * (y * z + x * w)) * s[1], 0.0,
+        (2.0 * (x * z + y * w)) * s[2], (2.0 * (y * z - x * w)) * s[2], (1.0 - 2.0 * (x * x + y * y)) * s[2], 0.0,
+        t[0], t[1], t[2], 1.0,
+    ]
+}
+
+struct Gltf {
+    json: crate::markup::Json,
+    buffers: Vec<Vec<u8>>,
+}
+
+impl Gltf {
+    /// Elementos de un accessor como `Vec<f64>` por elemento (1 o 3 componentes).
+    fn accessor(&self, idx: usize) -> Option<(Vec<f64>, usize)> {
+        let a = self.json.get("accessors")?.at(idx)?;
+        let view = self.json.get("bufferViews")?.at(a.get("bufferView")?.num()? as usize)?;
+        let buf = self.buffers.get(view.get("buffer")?.num()? as usize)?;
+        let count = a.get("count")?.num()? as usize;
+        let ncomp = match a.get("type")?.str()? {
+            "SCALAR" => 1,
+            "VEC3" => 3,
+            _ => return None,
+        };
+        let ct = a.get("componentType")?.num()? as u32;
+        let csz = match ct {
+            5120 | 5121 => 1,
+            5122 | 5123 => 2,
+            _ => 4,
+        };
+        let base = view.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize + a.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize;
+        let stride = view.get("byteStride").and_then(|x| x.num()).map(|x| x as usize).filter(|s| *s > 0).unwrap_or(csz * ncomp);
+        if count > 20_000_000 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count * ncomp);
+        for i in 0..count {
+            for c in 0..ncomp {
+                let o = base + i * stride + c * csz;
+                let d = buf.get(o..o + csz)?;
+                out.push(match ct {
+                    5120 => d[0] as i8 as f64,
+                    5121 => d[0] as f64,
+                    5122 => i16::from_le_bytes([d[0], d[1]]) as f64,
+                    5123 => u16::from_le_bytes([d[0], d[1]]) as f64,
+                    5125 => u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64,
+                    5126 => f32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64,
+                    _ => return None,
+                });
+            }
+        }
+        Some((out, ncomp))
+    }
+
+    fn mesh_into(&self, mesh: usize, m: &M4, tris: &mut Vec<f32>) -> Option<()> {
+        for prim in self.json.get("meshes")?.at(mesh)?.get("primitives")?.arr() {
+            let mode = prim.get("mode").and_then(|x| x.num()).unwrap_or(4.0) as u32;
+            let pos_idx = prim.get("attributes")?.get("POSITION")?.num()? as usize;
+            let (pos, _) = self.accessor(pos_idx)?;
+            let idx: Vec<usize> = match prim.get("indices").and_then(|x| x.num()) {
+                Some(i) => self.accessor(i as usize)?.0.into_iter().map(|v| v as usize).collect(),
+                None => (0..pos.len() / 3).collect(),
+            };
+            let order: Vec<[usize; 3]> = match mode {
+                4 => idx.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+                5 => (0..idx.len().saturating_sub(2)).map(|i| if i % 2 == 0 { [idx[i], idx[i + 1], idx[i + 2]] } else { [idx[i + 1], idx[i], idx[i + 2]] }).collect(),
+                6 => (1..idx.len().saturating_sub(1)).map(|i| [idx[0], idx[i], idx[i + 1]]).collect(),
+                _ => continue,
+            };
+            for t in order {
+                for i in t {
+                    let p = pos.get(i * 3..i * 3 + 3)?;
+                    let (x, y, z) = (p[0] as f32, p[1] as f32, p[2] as f32);
+                    let wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+                    let wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+                    let wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+                    // glTF es Y arriba; el visor, Z arriba
+                    tris.extend_from_slice(&[wx, -wz, wy]);
+                }
+                if tris.len() / 9 > MAX_TRIS {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn walk(&self, node: usize, parent: &M4, tris: &mut Vec<f32>, depth: u32) -> Option<()> {
+        if depth > 64 {
+            return Some(());
+        }
+        let n = self.json.get("nodes")?.at(node)?;
+        let m = mul(parent, &node_matrix(n));
+        if let Some(mesh) = n.get("mesh").and_then(|x| x.num()) {
+            self.mesh_into(mesh as usize, &m, tris)?;
+        }
+        for c in n.get("children").map(|c| c.arr()).unwrap_or(&[]) {
+            if let Some(i) = c.num() {
+                self.walk(i as usize, &m, tris, depth + 1)?;
+            }
+        }
+        Some(())
+    }
+}
+
+fn load_gltf(path: &Path) -> Result<Mesh, String> {
+    use crate::markup::parse_json;
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let (json_text, glb_bin): (String, Option<Vec<u8>>) = if data.starts_with(b"glTF") {
+        let mut json = None;
+        let mut bin = None;
+        let mut p = 12;
+        while p + 8 <= data.len() {
+            let len = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
+            let ty = &data[p + 4..p + 8];
+            let body = data.get(p + 8..p + 8 + len).ok_or("trozo incompleto")?;
+            if ty == b"JSON" {
+                json = Some(String::from_utf8_lossy(body).into_owned());
+            } else if ty == b"BIN\0" {
+                bin = Some(body.to_vec());
+            }
+            p += 8 + len.next_multiple_of(4);
+        }
+        (json.ok_or("sin JSON")?, bin)
+    } else {
+        (String::from_utf8_lossy(&data).into_owned(), None)
+    };
+    let json = parse_json(&json_text).ok_or("JSON no válido")?;
+    if json.get("extensionsRequired").map(|e| e.arr().iter().any(|x| x.str() == Some("KHR_draco_mesh_compression"))).unwrap_or(false) {
+        return Err("compresión Draco no admitida".into());
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut buffers = Vec::new();
+    for (i, b) in json.get("buffers").map(|b| b.arr()).unwrap_or(&[]).iter().enumerate() {
+        buffers.push(match b.get("uri").and_then(|u| u.str()) {
+            Some(u) if u.starts_with("data:") => b64(u.split_once(',').map(|x| x.1).unwrap_or("")),
+            Some(u) => {
+                let rel = u.replace("%20", " ");
+                // sólo dentro de la carpeta del modelo
+                if rel.contains("..") || rel.starts_with('/') {
+                    return Err("ruta no permitida".into());
+                }
+                std::fs::read(dir.join(rel)).map_err(|e| e.to_string())?
+            }
+            None if i == 0 => glb_bin.clone().ok_or("sin datos binarios")?,
+            None => Vec::new(),
+        });
+    }
+    let g = Gltf { json, buffers };
+    let ident: M4 = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    let mut tris = Vec::new();
+    let scene = g.json.get("scene").and_then(|s| s.num()).unwrap_or(0.0) as usize;
+    let roots: Vec<usize> = g.json.get("scenes").and_then(|s| s.at(scene)).and_then(|s| s.get("nodes")).map(|n| n.arr().iter().filter_map(|x| x.num()).map(|x| x as usize).collect()).unwrap_or_default();
+    if roots.is_empty() {
+        // sin escena: todas las mallas tal cual
+        for i in 0..g.json.get("meshes").map(|m| m.arr().len()).unwrap_or(0) {
+            g.mesh_into(i, &ident, &mut tris).ok_or("malla no válida")?;
+        }
+    } else {
+        for r in roots {
+            g.walk(r, &ident, &mut tris, 0).ok_or("malla no válida")?;
+        }
+    }
+    Mesh::finish(tris)
 }

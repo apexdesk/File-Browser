@@ -195,6 +195,16 @@ fn orient(img: image::RgbaImage, o: u8) -> image::RgbaImage {
     }
 }
 
+/// ¿Este archivo tiene miniatura propia (imagen, vídeo, documento, libro o cómic)?
+pub fn thumbable(kind: crate::fsys::Kind, ext: &str) -> bool {
+    use crate::fsys::Kind;
+    match kind {
+        Kind::Image | Kind::Video => true,
+        Kind::Doc => crate::docview::is_doc_ext(ext) || crate::comic::is_comic_ext(ext) || ext.eq_ignore_ascii_case("epub"),
+        _ => false,
+    }
+}
+
 /// Decodifica una imagen/SVG/vídeo a RGBA limitando el lado mayor a `max`.
 pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
@@ -206,8 +216,11 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
         }
         "svg" => return decode_svg(path, max),
         e if crate::docview::is_doc_ext(e) => return crate::docview::thumb(path, max),
+        e if crate::comic::is_comic_ext(e) => return crate::comic::thumb(path, max),
+        "epub" => return crate::rich::epub_cover(path, max),
         e if is_video_ext(e) => return ffmpeg_frame(path, max, true),
-        "png" | "gif" | "webp" | "bmp" => {}
+        e if crate::imgx::handles(e) => return crate::imgx::decode(path, e, max).or_else(|| magick_frame(path, max)),
+        "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" => {}
         _ => return ffmpeg_frame(path, max, false).or_else(|| magick_frame(path, max)),
     }
     let md = std::fs::metadata(path).ok()?;
@@ -226,7 +239,12 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
 
 fn decode_jpeg(path: &Path, max: u32) -> Option<Decoded> {
     let f = File::open(path).ok()?;
-    let mut dec = jpeg_decoder::Decoder::new(BufReader::with_capacity(64 * 1024, f));
+    decode_jpeg_from(BufReader::with_capacity(64 * 1024, f), max, exif_orientation(path))
+}
+
+/// JPEG desde cualquier lector (también las vistas previas incrustadas en RAW), con la orientación dada.
+pub fn decode_jpeg_from<R: std::io::Read>(r: R, max: u32, orientation: u8) -> Option<Decoded> {
+    let mut dec = jpeg_decoder::Decoder::new(r);
     dec.read_info().ok()?;
     let info = dec.info()?;
     let (w0, h0) = (info.width as u32, info.height as u32);
@@ -259,7 +277,7 @@ fn decode_jpeg(path: &Path, max: u32) -> Option<Decoded> {
         img
     };
     let rgba = image::DynamicImage::ImageRgb8(img).into_rgba8();
-    let rgba = orient(rgba, exif_orientation(path));
+    let rgba = orient(rgba, orientation);
     Some(Decoded { w: rgba.width() as usize, h: rgba.height() as usize, rgba: rgba.into_raw() })
 }
 

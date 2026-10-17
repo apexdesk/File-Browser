@@ -79,7 +79,8 @@ pub fn kind_of_ext(ext: &str) -> Kind {
     let e = std::str::from_utf8(&buf[..ext.len()]).unwrap_or("");
     match e {
         "jpg" | "jpeg" | "jpe" | "png" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "svg"
-        | "avif" | "heic" | "heif" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "xcf" => {
+        | "avif" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "nrw" | "arw" | "srf" | "sr2" | "dng" | "orf" | "rw2"
+        | "pef" | "raf" | "srw" | "3fr" | "erf" | "kdc" | "mrw" | "x3f" | "psd" | "psb" | "xcf" | "blend" | "blend1" => {
             Kind::Image
         }
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg" | "ts" => {
@@ -93,7 +94,7 @@ pub fn kind_of_ext(ext: &str) -> Kind {
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "iso" | "deb" | "rpm"
         | "tgz" | "jar" => Kind::Archive,
         "pdf" | "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods" | "ppt" | "pptx" | "odp" | "rtf"
-        | "epub" => Kind::Doc,
+        | "epub" | "cbz" | "cbr" => Kind::Doc,
         _ => Kind::Other,
     }
 }

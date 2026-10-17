@@ -2323,7 +2323,7 @@ impl App {
         let pos = self.pos_of(i).map(|p| p + 1).unwrap_or(0);
         let label = format!("{} de {}", pos, self.order.len());
         let key = self.thumb_key(e);
-        let thumb = if matches!(e.kind, Kind::Image | Kind::Video) { self.thumbs.get(key).cloned() } else { None };
+        let thumb = if crate::thumbs::thumbable(e.kind, e.ext()) { self.thumbs.get(key).cloned() } else { None };
         self.preview = Some(Preview::open(
             &mut self.pworker,
             path,
@@ -2381,7 +2381,12 @@ impl App {
             .map(|p| (p.can_play(), p.player_active()))
             .unwrap_or((false, false));
         if k(Modifiers::NONE, Key::Escape) {
-            self.preview = None;
+            let closed = self.preview.as_mut().map(|p| p.close_find() || p.close_inner()).unwrap_or(false);
+            if !closed {
+                self.preview = None;
+            }
+        } else if self.preview.as_ref().map(|p| p.typing()).unwrap_or(false) {
+            // el cuadro de búsqueda del documento se queda con el teclado
         } else if k(Modifiers::NONE, Key::Space) {
             if is_video {
                 if let Some(p) = &mut self.preview {
@@ -2389,6 +2394,10 @@ impl App {
                 }
             } else {
                 self.preview = None;
+            }
+        } else if k(Modifiers::NONE, Key::I) {
+            if let Some(p) = &mut self.preview {
+                p.toggle_meta(ctx);
             }
         } else if k(Modifiers::NONE, Key::ArrowDown) {
             self.preview_step(1);
@@ -5414,7 +5423,7 @@ impl App {
     }
 
     fn want_thumb(&self, e: &Entry, pos: usize, want: &mut Vec<(usize, Request)>) {
-        if !self.cfg.thumbs_on || !matches!(e.kind, Kind::Image | Kind::Video) || e.size == 0 {
+        if !self.cfg.thumbs_on || !crate::thumbs::thumbable(e.kind, e.ext()) || e.size == 0 {
             return;
         }
         let key = self.thumb_key(e);
@@ -5453,7 +5462,7 @@ impl App {
 
     fn paint_icon(&mut self, p: &egui::Painter, r: Rect, e: &Entry, big: bool, want: &mut Vec<(usize, Request)>, pos: usize) {
         let pal = self.pal;
-        let thumbable = self.cfg.thumbs_on && matches!(e.kind, Kind::Image | Kind::Video);
+        let thumbable = self.cfg.thumbs_on && crate::thumbs::thumbable(e.kind, e.ext());
         if thumbable {
             let key = self.thumb_key(e);
             if let Some(t) = self.thumbs.get(key) {
