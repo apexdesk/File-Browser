@@ -94,14 +94,36 @@ pub fn palette_of(th: &crate::config::CustomTheme) -> Pal {
     }
 }
 
-/// Paleta vigente: la del tema propio activo si coincide con el modo, o la de serie.
+/// Paleta vigente: la del tema activo (propio o predefinido) si coincide con el modo, o la de serie.
 pub fn resolve(cfg: &crate::config::Config, dark: bool) -> Pal {
-    if let Some(th) = cfg.custom_themes.iter().find(|t| t.name == cfg.theme_custom) {
+    if let Some(th) = cfg.theme_named(&cfg.theme_custom) {
         if th.dark == dark {
-            return palette_of(th);
+            return palette_of(&th);
         }
     }
     palette(dark)
+}
+
+/// Temas predefinidos (de solo lectura; se pueden duplicar para editarlos). Los nombres son nombres propios y
+/// no se traducen, porque se guardan en los ajustes.
+pub fn presets() -> &'static [crate::config::CustomTheme] {
+    static P: std::sync::OnceLock<Vec<crate::config::CustomTheme>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        // fondo, panel, superficie, resaltado, borde, texto, texto secundario, acento, fondo del visor
+        let t = |name: &str, dark: bool, c: [[u8; 3]; 9]| crate::config::CustomTheme { name: name.to_string(), dark, colors: c };
+        vec![
+            t("Nord", true, [[46, 52, 64], [52, 60, 74], [59, 66, 82], [67, 76, 94], [76, 86, 106], [236, 239, 244], [154, 165, 185], [136, 192, 208], [236, 239, 244]]),
+            t("Dracula", true, [[40, 42, 54], [33, 34, 44], [52, 55, 70], [68, 71, 90], [78, 82, 104], [248, 248, 242], [160, 166, 196], [189, 147, 249], [248, 248, 242]]),
+            t("Gruvbox Dark", true, [[40, 40, 40], [50, 48, 47], [60, 56, 54], [80, 73, 69], [102, 92, 84], [235, 219, 178], [168, 153, 132], [250, 189, 47], [251, 241, 199]]),
+            t("Monokai", true, [[39, 40, 34], [49, 50, 43], [62, 61, 50], [80, 80, 66], [90, 90, 74], [248, 248, 242], [160, 160, 140], [166, 226, 46], [248, 248, 242]]),
+            t("Midnight", true, [[0, 0, 0], [10, 10, 14], [20, 21, 28], [34, 36, 48], [40, 42, 56], [230, 232, 240], [128, 134, 155], [100, 160, 255], [236, 239, 246]]),
+            t("Solarized Light", false, [[253, 246, 227], [238, 232, 213], [255, 251, 238], [228, 221, 198], [211, 203, 178], [55, 80, 88], [131, 148, 150], [38, 139, 210], [253, 246, 227]]),
+            t("Gruvbox Light", false, [[251, 241, 199], [242, 229, 188], [253, 247, 221], [235, 219, 178], [213, 196, 161], [60, 56, 54], [124, 111, 100], [175, 58, 3], [253, 247, 221]]),
+            t("Paper", false, [[250, 248, 244], [241, 238, 231], [255, 255, 252], [232, 228, 218], [220, 214, 202], [40, 38, 34], [118, 112, 100], [184, 92, 40], [255, 254, 250]]),
+            t("Rosé Pine Dawn", false, [[250, 244, 237], [242, 233, 225], [255, 250, 243], [233, 223, 214], [223, 218, 217], [87, 82, 121], [121, 117, 147], [180, 99, 122], [255, 250, 243]]),
+            t("GitHub Light", false, [[255, 255, 255], [246, 248, 250], [250, 251, 252], [234, 238, 242], [208, 215, 222], [31, 35, 40], [101, 109, 118], [9, 105, 218], [255, 255, 255]]),
+        ]
+    })
 }
 
 pub fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
@@ -111,9 +133,13 @@ pub fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
     v.extreme_bg_color = p.surface;
     v.faint_bg_color = p.panel;
     v.override_text_color = Some(p.text);
-    v.window_corner_radius = CornerRadius::same(14);
+    v.window_corner_radius = CornerRadius::same(16);
     v.menu_corner_radius = CornerRadius::same(10);
     v.window_stroke = Stroke::new(1.0, p.border);
+    // sombra amplia y suave: las ventanas «flotan» sobre el contenido
+    let a = if dark { 150 } else { 60 };
+    v.window_shadow = egui::epaint::Shadow { offset: [0, 12], blur: 36, spread: 0, color: Color32::from_black_alpha(a) };
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(a) };
     v.selection.bg_fill = p.sel;
     v.selection.stroke = Stroke::new(1.0, p.accent);
     for w in [
@@ -138,7 +164,8 @@ pub fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
     ctx.global_style_mut(|s| {
         s.animation_time = 0.0;
         s.spacing.item_spacing = vec2(8.0, 6.0);
-        s.spacing.button_padding = vec2(10.0, 5.0);
+        s.spacing.button_padding = vec2(12.0, 6.0);
+        s.spacing.window_margin = egui::Margin::same(16);
         s.spacing.menu_margin = egui::Margin::same(6);
         s.interaction.tooltip_delay = 0.4;
     });
@@ -570,3 +597,137 @@ pub fn draw_file(p: &Painter, rect: Rect, kind: Kind, ext: &str, pal: &Pal) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Diálogos modales: tarjeta con icono, texto y botones coherentes
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// acción destructiva
+    Danger,
+    Warn,
+    Info,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Btn {
+    /// acción principal (acento)
+    Primary,
+    /// acción destructiva (rojo)
+    Danger,
+    Plain,
+}
+
+fn tone_color(p: &Pal, t: Tone) -> Color32 {
+    match t {
+        Tone::Danger => Color32::from_rgb(226, 86, 86),
+        Tone::Warn => Color32::from_rgb(232, 168, 56),
+        Tone::Info => p.accent,
+    }
+}
+
+/// Botón de diálogo: relleno según su función, esquinas redondas y realce al pasar el ratón.
+pub fn dialog_button(ui: &mut egui::Ui, p: &Pal, kind: Btn, text: &str) -> egui::Response {
+    let font = egui::FontId::proportional(14.0);
+    let (fill, fg, border) = match kind {
+        Btn::Primary => (p.accent, Color32::WHITE, p.accent),
+        Btn::Danger => (Color32::from_rgb(214, 70, 70), Color32::WHITE, Color32::from_rgb(214, 70, 70)),
+        Btn::Plain => (p.surface, p.text, p.border),
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+    let size = vec2((galley.size().x + 36.0).max(84.0), 34.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut fill = fill;
+    if resp.hovered() {
+        fill = match kind {
+            Btn::Plain => p.hover,
+            _ => lighten(fill, 0.12),
+        };
+    }
+    if resp.is_pointer_button_down_on() {
+        fill = match kind {
+            Btn::Plain => p.border,
+            _ => darken(fill, 0.12),
+        };
+    }
+    ui.painter().rect_filled(rect, 10.0, fill);
+    if kind == Btn::Plain {
+        ui.painter().rect_stroke(rect, 10.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    }
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp
+}
+
+fn lighten(c: Color32, k: f32) -> Color32 {
+    let f = |x: u8| (x as f32 + (255.0 - x as f32) * k).round() as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
+fn darken(c: Color32, k: f32) -> Color32 {
+    let f = |x: u8| (x as f32 * (1.0 - k)).round() as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
+/// Tarjeta modal centrada: velo sobre el resto de la interfaz, icono de tono, título, contenido y botones
+/// alineados a la derecha (`actions` los añade de derecha a izquierda: el principal primero).
+pub fn modal_card(
+    ctx: &egui::Context,
+    p: &Pal,
+    tone: Tone,
+    title: &str,
+    width: f32,
+    body: impl FnOnce(&mut egui::Ui),
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    // velo: oscurece y bloquea lo de debajo
+    let screen = ctx.content_rect();
+    let scrim = egui::LayerId::new(egui::Order::Middle, egui::Id::new("modal_scrim_paint"));
+    ctx.layer_painter(scrim).rect_filled(screen, 0.0, Color32::from_black_alpha(110));
+    egui::Area::new(egui::Id::new("modal_scrim"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+        });
+    let frame = egui::Frame::new()
+        .fill(p.panel)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(18))
+        .shadow(ctx.global_style().visuals.window_shadow)
+        .inner_margin(egui::Margin::same(22));
+    egui::Window::new(title)
+        .title_bar(false)
+        .frame(frame)
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.horizontal_top(|ui| {
+                // insignia redonda con el glifo del tono
+                let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), egui::Sense::hover());
+                let c = tone_color(p, tone);
+                ui.painter().circle_filled(r.center(), 22.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 40));
+                let glyph = match tone {
+                    Tone::Danger | Tone::Warn => "!",
+                    Tone::Info => "i",
+                };
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(24.0), c);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_width(width - 64.0);
+                    ui.label(egui::RichText::new(title).size(18.0).strong());
+                    ui.add_space(4.0);
+                    body(ui);
+                });
+            });
+            ui.add_space(20.0);
+            ui.allocate_ui_with_layout(vec2(width, 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                actions(ui);
+            });
+        });
+}
