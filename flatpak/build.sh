@@ -18,7 +18,7 @@ cp "$HERE/../assets/icon.svg" $F/share/icons/hicolor/scalable/apps/$ID.svg
 cp "$HERE/$ID.desktop" $F/share/applications/
 sed "s/@VERSION@/$VER/; s/@DATE@/$(date -u +%F)/" "$HERE/$ID.metainfo.xml" > $F/share/metainfo/$ID.metainfo.xml
 flatpak build-finish build --command=filebrowser --share=ipc --socket=wayland --socket=fallback-x11 \
-  --device=dri --filesystem=host --own-name=org.freedesktop.FileManager1 --talk-name=org.freedesktop.Notifications \
+  --device=dri --socket=pulseaudio --filesystem=host --own-name=org.freedesktop.FileManager1 --talk-name=org.freedesktop.Notifications \
   '--talk-name=org.gtk.vfs.*' --filesystem=xdg-run/gvfs --filesystem=xdg-run/gvfsd
 flatpak build-export repo build
 flatpak build-bundle repo "$OUT" $ID

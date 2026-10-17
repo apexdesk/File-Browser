@@ -2365,7 +2365,7 @@ impl App {
         let (is_video, active) = self
             .preview
             .as_ref()
-            .map(|p| (p.kind == Kind::Video && crate::video::have_ffmpeg(), p.player_active()))
+            .map(|p| (p.can_play(), p.player_active()))
             .unwrap_or((false, false));
         if k(Modifiers::NONE, Key::Escape) {
             self.preview = None;
@@ -8420,6 +8420,15 @@ impl App {
             if let Some(&i) = self.order.get(k) {
                 self.select_only(i);
                 self.open_preview_at(i);
+            }
+        }
+        if el > 1400 && std::env::var_os("FB_PLAY").is_some() {
+            // prueba del reproductor: arranca la reproducción una sola vez
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if self.preview.is_some() && !ONCE.swap(true, Ordering::SeqCst) {
+                if let Some(p) = &mut self.preview {
+                    p.toggle_play(ctx);
+                }
             }
         }
         if el > 800 && self.op.is_none() && self.queue.is_empty() && !self.shot_prev && std::env::var_os("FB_TASKS").is_some() {

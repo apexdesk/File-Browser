@@ -48,6 +48,7 @@ pub struct Preview {
     pub body: Body,
     pub thumb: Option<egui::TextureHandle>,
     pub player: Option<crate::video::Player>,
+    pub audio: Option<crate::audio::AudioPlayer>,
     zoom: f32,
     pan: egui::Vec2,
     scroll: f32,
@@ -202,6 +203,7 @@ impl Preview {
             body: Body::Loading,
             thumb,
             player: None,
+            audio: None,
             last_pos: None,
             zoom: 1.0,
             pan: vec2(0.0, 0.0),
@@ -212,11 +214,25 @@ impl Preview {
     }
 
     pub fn player_active(&self) -> bool {
-        self.player.as_ref().map(|p| p.playing()).unwrap_or(false)
+        self.player.as_ref().map(|p| p.playing()).unwrap_or(false) || self.audio.as_ref().map(|a| a.playing()).unwrap_or(false)
+    }
+
+    /// ¿Este visor puede reproducir su archivo (vídeo con ffmpeg o audio integrado)?
+    pub fn can_play(&self) -> bool {
+        match self.kind {
+            Kind::Video => crate::video::have_ffmpeg(),
+            Kind::Audio => crate::audio::supported(),
+            _ => false,
+        }
     }
 
     /// Crea el reproductor si hace falta y alterna reproducción/pausa.
     pub fn toggle_play(&mut self, ctx: &egui::Context) {
+        if self.kind == Kind::Audio && crate::audio::supported() {
+            let path = self.path.clone();
+            self.audio.get_or_insert_with(|| crate::audio::AudioPlayer::new(ctx, &path)).toggle();
+            return;
+        }
         if self.kind != Kind::Video || !crate::video::have_ffmpeg() {
             return;
         }
@@ -229,9 +245,21 @@ impl Preview {
         if let Some(p) = &mut self.player {
             p.seek_by(d);
         }
+        if let Some(a) = &mut self.audio {
+            a.seek_by(d);
+        }
     }
 
     pub fn poll(&mut self, w: &mut Worker, ctx: &egui::Context) {
+        if self.kind == Kind::Audio && self.audio.is_none() && crate::audio::supported() {
+            self.audio = Some(crate::audio::AudioPlayer::new(ctx, &self.path));
+        }
+        if let Some(a) = &mut self.audio {
+            a.poll();
+            if a.playing() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
         if let Some(p) = &mut self.player {
             p.poll();
             if p.playing() {
@@ -366,7 +394,7 @@ impl Preview {
             Align2::CENTER_CENTER,
             if touch {
                 t("Atrás o toque fuera: cerrar   ·   Pellizca: zoom   ·   Doble toque: ajustar")
-            } else if self.kind == Kind::Video {
+            } else if self.can_play() {
                 t("Espacio: pausa / reanudar   ·   Left/Right: saltar 5 s   ·   Up/Down: anterior / siguiente   ·   O: abrir fuera   ·   Esc: cerrar")
             } else {
                 t("Espacio / Esc: cerrar   ·   Flechas: anterior / siguiente   ·   Enter: abrir   ·   Rueda: zoom   ·   Doble clic: ajustar")
@@ -536,6 +564,32 @@ impl Preview {
                     );
                 }
             }
+            Body::Info if self.kind == Kind::Audio => {
+                let c = pos2(content.center().x, content.center().y - 50.0);
+                let r = Rect::from_center_size(c, vec2(180.0, 180.0));
+                let cover = self.audio.as_ref().and_then(|a| a.tex.as_ref().map(|t| (t.id(), t.size_vec2())));
+                if let Some((id, sz)) = cover {
+                    let s = (180.0 / sz.x).min(180.0 / sz.y);
+                    let rr = Rect::from_center_size(c, sz * s);
+                    cp.add(egui::epaint::RectShape::filled(rr, CornerRadius::same(10), Color32::WHITE).with_texture(id, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))));
+                } else {
+                    let ext = self.name.rsplit_once('.').map(|x| x.1).unwrap_or("");
+                    theme::draw_file(&cp, r, self.kind, ext, pal);
+                }
+                let (title, artist, album) = match &self.audio {
+                    Some(a) => (a.title.clone(), a.artist.clone(), a.album.clone()),
+                    None => Default::default(),
+                };
+                let title = if title.is_empty() { self.name.clone() } else { title };
+                let mut y = c.y + 108.0;
+                cp.text(pos2(c.x, y), Align2::CENTER_CENTER, title, FontId::proportional(16.0), pal.text);
+                for s in [artist, album] {
+                    if !s.is_empty() {
+                        y += 22.0;
+                        cp.text(pos2(c.x, y), Align2::CENTER_CENTER, s, FontId::proportional(13.0), pal.subtle);
+                    }
+                }
+            }
             Body::Info | Body::Error(_) => {
                 let c = pos2(content.center().x, content.center().y - 30.0);
                 let r = Rect::from_center_size(c, vec2(130.0, 130.0));
@@ -549,7 +603,7 @@ impl Preview {
             }
         }
         }
-        if self.kind == Kind::Video {
+        if matches!(self.kind, Kind::Video | Kind::Audio) {
             self.video_controls(ctx, &p, content, pal, pointer, clicked);
         }
         action
@@ -564,25 +618,28 @@ impl Preview {
         pointer: Option<Pos2>,
         clicked: bool,
     ) {
-        if !crate::video::have_ffmpeg() {
-            p.text(
-                pos2(content.center().x, content.bottom() - 30.0),
-                Align2::CENTER_CENTER,
-                t("Para reproducir vídeo hace falta ffmpeg"),
-                FontId::proportional(12.5),
-                pal.subtle,
-            );
+        let audio = self.kind == Kind::Audio;
+        if !self.can_play() {
+            let msg = if audio { t("La reproducción de audio no está disponible en esta plataforma") } else { t("Para reproducir vídeo hace falta ffmpeg") };
+            p.text(pos2(content.center().x, content.bottom() - 30.0), Align2::CENTER_CENTER, msg, FontId::proportional(12.5), pal.subtle);
             return;
         }
-        let (playing, pos, dur, err) = match &self.player {
-            Some(pl) => (pl.playing(), pl.position(), pl.duration, pl.error.clone()),
-            None => (false, 0.0, 0.0, None),
+        let (playing, pos, dur, err) = if audio {
+            match &self.audio {
+                Some(a) => (a.playing(), a.position(), a.duration, a.error.clone()),
+                None => (false, 0.0, 0.0, None),
+            }
+        } else {
+            match &self.player {
+                Some(pl) => (pl.playing(), pl.position(), pl.duration, pl.error.clone()),
+                None => (false, 0.0, 0.0, None),
+            }
         };
         let hit = |r: Rect| pointer.map(|q| r.contains(q)).unwrap_or(false) && clicked;
         let mut do_toggle = false;
         let mut do_seek: Option<f64> = None;
         // botón grande central mientras no hay reproducción iniciada
-        if self.player.is_none() {
+        if self.player.is_none() && !audio {
             let c = content.center();
             let r = Rect::from_center_size(c, vec2(84.0, 84.0));
             let hot = pointer.map(|q| r.contains(q)).unwrap_or(false);
@@ -643,7 +700,7 @@ impl Preview {
             p.text(
                 pos2(content.center().x, bar.top() - 14.0),
                 Align2::CENTER_CENTER,
-                tf("{}: {}", &[&t("No se pudo reproducir el vídeo"), &e]),
+                tf("{}: {}", &[&if audio { t("No se pudo reproducir el audio") } else { t("No se pudo reproducir el vídeo") }, &e]),
                 FontId::proportional(12.5),
                 Color32::from_rgb(235, 100, 100),
             );
@@ -652,8 +709,12 @@ impl Preview {
             self.toggle_play(ctx);
         } else if let Some(s) = do_seek {
             let path = self.path.clone();
-            let pl = self.player.get_or_insert_with(|| crate::video::Player::new(ctx, &path));
-            pl.seek_to(s);
+            if audio {
+                self.audio.get_or_insert_with(|| crate::audio::AudioPlayer::new(ctx, &path)).seek_to(s);
+            } else {
+                let pl = self.player.get_or_insert_with(|| crate::video::Player::new(ctx, &path));
+                pl.seek_to(s);
+            }
         }
     }
 

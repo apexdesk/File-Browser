@@ -1,6 +1,7 @@
 //! Gestor de archivos ligero (escritorio y Android).
 pub mod app;
 pub mod archive;
+pub mod audio;
 pub mod commands;
 pub mod diskusage;
 pub mod dragout;
