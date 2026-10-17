@@ -25,6 +25,7 @@ jpeg-decoder = "0.3.2"
 md-5 = "0.11.0"
 portable-pty = "0.9.0"
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
 resvg = { version = "0.48.1", default-features = false }
 skrifa = "0.44"
 sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util", "compress", "aes256"] }

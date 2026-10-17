@@ -1267,6 +1267,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "portable-pty",
  "raw-window-handle",
+ "regex",
  "resvg",
  "ruzstd",
  "sevenz-rust2",
