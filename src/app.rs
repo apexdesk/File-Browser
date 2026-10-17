@@ -8731,7 +8731,7 @@ impl App {
                         if !d.pw2.is_empty() && d.pw != d.pw2 {
                             ui.label(egui::RichText::new(t("Las contraseñas no coinciden")).size(12.0).color(Color32::from_rgb(226, 86, 86)));
                         }
-                        ui.add(egui::Label::new(egui::RichText::new(t("Cifrado AES-256. Otros programas lo abren; File Browser todavía no extrae archivos con contraseña.")).size(12.0).color(pal.subtle)).wrap());
+                        ui.add(egui::Label::new(egui::RichText::new(t("Cifrado AES-256. Otros programas también lo abren.")).size(12.0).color(pal.subtle)).wrap());
                     }
                     ui.add_space(16.0);
                     let valid = !d.name.trim().is_empty() && (!d.protect || (!d.pw.is_empty() && d.pw == d.pw2));
@@ -9080,7 +9080,7 @@ impl App {
                         if let Dlg::Compress(d) = &mut self.dlg {
                             d.protect = true;
                             d.pw = "abc".into();
-                            d.pw2 = "abd".into();
+                            d.pw2 = "abc".into();
                         }
                     }
                 }
