@@ -27,14 +27,14 @@ portable-pty = "0.9.0"
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 resvg = { version = "0.48.1", default-features = false }
 skrifa = "0.44"
-sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util", "compress"] }
+sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["util", "compress", "aes256"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "aac", "isomp4", "alac", "pcm"] }
 tar = "0.4.46"
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 vt100 = "0.16.2"
-zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.1", default-features = false, features = ["deflate", "aes-crypto"] }
 
 [profile.release]
 opt-level = 3

@@ -10,10 +10,75 @@ use std::sync::{Arc, Mutex};
 // ZIP
 // ---------------------------------------------------------------------------
 
-pub fn zip_paths(srcs: &[PathBuf], out: &Path, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+/// Formato de salida al comprimir.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArchFmt {
+    Zip,
+    TarGz,
+    SevenZ,
+}
+
+impl ArchFmt {
+    pub fn ext(self) -> &'static str {
+        match self {
+            ArchFmt::Zip => "zip",
+            ArchFmt::TarGz => "tar.gz",
+            ArchFmt::SevenZ => "7z",
+        }
+    }
+
+    /// ¿Admite contraseña? (tar.gz no tiene cifrado)
+    pub fn can_encrypt(self) -> bool {
+        self != ArchFmt::TarGz
+    }
+}
+
+/// Opciones de compresión: nivel 0 (solo almacenar) a 9; la contraseña cifra con AES-256.
+#[derive(Clone)]
+pub struct CompressOpts {
+    pub fmt: ArchFmt,
+    pub level: u32,
+    pub password: Option<String>,
+}
+
+pub fn compress_paths(srcs: &[PathBuf], out: &Path, o: &CompressOpts, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+    match o.fmt {
+        ArchFmt::Zip => zip_paths(srcs, out, o, p, ctx),
+        ArchFmt::TarGz => targz_paths(srcs, out, o, p, ctx),
+        ArchFmt::SevenZ => sevenz_paths(srcs, out, o, p, ctx),
+    }
+}
+
+/// Lector que cuenta los bytes leídos (progreso) y corta si se cancela la operación.
+struct ProgRead<'a, R> {
+    inner: R,
+    p: &'a Progress,
+}
+
+impl<R: Read> Read for ProgRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.p.cancelled() {
+            return Err(io::Error::other("cancelado"));
+        }
+        let n = self.inner.read(buf)?;
+        self.p.done.fetch_add(n as u64, AO::Relaxed);
+        Ok(n)
+    }
+}
+
+fn zip_paths(srcs: &[PathBuf], out: &Path, o: &CompressOpts, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
     let f = File::create(out).map_err(|e| e.to_string())?;
     let mut zw = zip::ZipWriter::new(io::BufWriter::new(f));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut opts = zip::write::SimpleFileOptions::default();
+    opts = if o.level == 0 {
+        opts.compression_method(zip::CompressionMethod::Stored)
+    } else {
+        opts.compression_method(zip::CompressionMethod::Deflated).compression_level(Some(o.level as i64))
+    };
+    let opts = match &o.password {
+        Some(pw) => opts.with_aes_encryption(zip::AesMode::Aes256, pw),
+        None => opts,
+    };
     let mut buf = vec![0u8; 256 * 1024];
     for s in srcs {
         let Some(name) = s.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
@@ -23,11 +88,91 @@ pub fn zip_paths(srcs: &[PathBuf], out: &Path, p: &Progress, ctx: &egui::Context
     Ok(())
 }
 
+fn targz_paths(srcs: &[PathBuf], out: &Path, o: &CompressOpts, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+    let f = File::create(out).map_err(|e| e.to_string())?;
+    let gz = flate2::write::GzEncoder::new(io::BufWriter::new(f), flate2::Compression::new(o.level.min(9)));
+    let mut b = tar::Builder::new(gz);
+    for s in srcs {
+        let Some(name) = s.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        tar_tree(&mut b, s, &name, p, ctx)?;
+    }
+    let gz = b.into_inner().map_err(|e| e.to_string())?;
+    let mut w = gz.finish().map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn tar_tree<W: Write>(b: &mut tar::Builder<W>, path: &Path, name: &str, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+    if p.cancelled() {
+        return Err("cancelado".into());
+    }
+    let md = fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
+    if md.is_dir() {
+        b.append_dir(name, path).map_err(|e| format!("{name}: {e}"))?;
+        p.done.fetch_add(1, AO::Relaxed);
+        let rd = fs::read_dir(path).map_err(|e| format!("{name}: {e}"))?;
+        for e in rd.flatten() {
+            let child = format!("{name}/{}", e.file_name().to_string_lossy());
+            tar_tree(b, &e.path(), &child, p, ctx)?;
+        }
+    } else if md.is_file() {
+        let mut h = tar::Header::new_gnu();
+        h.set_metadata(&md);
+        let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
+        b.append_data(&mut h, name, ProgRead { inner: f, p }).map_err(|e| format!("{name}: {e}"))?;
+        p.done.fetch_add(1, AO::Relaxed);
+        ctx.request_repaint();
+    }
+    Ok(())
+}
+
+fn sevenz_paths(srcs: &[PathBuf], out: &Path, o: &CompressOpts, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+    use sevenz_rust2::{encoder_options::{AesEncoderOptions, Lzma2Options}, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
+    let f = File::create(out).map_err(|e| e.to_string())?;
+    let mut w = ArchiveWriter::new(io::BufWriter::new(f)).map_err(|e| e.to_string())?;
+    let main: EncoderConfiguration = if o.level == 0 { EncoderMethod::COPY.into() } else { Lzma2Options::from_level(o.level.min(9)).into() };
+    let mut methods = Vec::new();
+    if let Some(pw) = &o.password {
+        methods.push(AesEncoderOptions::new(Password::from(pw.as_str())).into());
+    }
+    methods.push(main);
+    w.set_content_methods(methods);
+    for s in srcs {
+        let Some(name) = s.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        sz_tree(&mut w, s, &name, p, ctx)?;
+    }
+    w.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn sz_tree<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, path: &Path, name: &str, p: &Progress, ctx: &egui::Context) -> Result<(), String> {
+    use sevenz_rust2::ArchiveEntry;
+    if p.cancelled() {
+        return Err("cancelado".into());
+    }
+    let md = fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
+    if md.is_dir() {
+        w.push_archive_entry(ArchiveEntry::new_directory(name), None::<File>).map_err(|e| format!("{name}: {e}"))?;
+        p.done.fetch_add(1, AO::Relaxed);
+        let rd = fs::read_dir(path).map_err(|e| format!("{name}: {e}"))?;
+        for e in rd.flatten() {
+            let child = format!("{name}/{}", e.file_name().to_string_lossy());
+            sz_tree(w, &e.path(), &child, p, ctx)?;
+        }
+    } else if md.is_file() {
+        let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
+        w.push_archive_entry(ArchiveEntry::from_path(path, name.to_string()), Some(ProgRead { inner: f, p })).map_err(|e| format!("{name}: {e}"))?;
+        p.done.fetch_add(1, AO::Relaxed);
+        ctx.request_repaint();
+    }
+    Ok(())
+}
+
 fn add_tree<W: Write + io::Seek>(
     zw: &mut zip::ZipWriter<W>,
     path: &Path,
     name: &str,
-    opts: zip::write::SimpleFileOptions,
+    opts: zip::write::FileOptions<'_, '_, ()>,
     p: &Progress,
     ctx: &egui::Context,
     buf: &mut [u8],
@@ -594,3 +739,72 @@ mod clip_impl {
 }
 
 pub use clip_impl::{get_files as clip_get_files, set_files as clip_set_files};
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    fn tree(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fb_cmp_{}_{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("src/sub")).unwrap();
+        fs::write(d.join("src/a.txt"), b"hola mundo ".repeat(500)).unwrap();
+        fs::write(d.join("src/sub/b.bin"), (0..=255u8).cycle().take(70_000).collect::<Vec<_>>()).unwrap();
+        d
+    }
+
+    fn same(a: &Path, b: &Path) {
+        assert_eq!(fs::read(a.join("a.txt")).unwrap(), fs::read(b.join("a.txt")).unwrap());
+        assert_eq!(fs::read(a.join("sub/b.bin")).unwrap(), fs::read(b.join("sub/b.bin")).unwrap());
+    }
+
+    #[test]
+    fn roundtrip_all_formats_and_levels() {
+        let d = tree("rt");
+        let ctx = egui::Context::default();
+        for fmt in [ArchFmt::Zip, ArchFmt::TarGz, ArchFmt::SevenZ] {
+            for level in [0u32, 1, 6, 9] {
+                let out = d.join(format!("o_{level}.{}", fmt.ext()));
+                let o = CompressOpts { fmt, level, password: None };
+                compress_paths(&[d.join("src")], &out, &o, &Progress::default(), &ctx).unwrap();
+                let dst = d.join(format!("x_{level}_{}", fmt.ext()));
+                crate::archive::extract_all(&out, &dst, &Progress::default(), &ctx).unwrap();
+                same(&d.join("src"), &dst.join("src"));
+            }
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn encrypted_zip_and_7z() {
+        let d = tree("enc");
+        let ctx = egui::Context::default();
+        let o = CompressOpts { fmt: ArchFmt::Zip, level: 6, password: Some("clave".into()) };
+        let zp = d.join("e.zip");
+        compress_paths(&[d.join("src")], &zp, &o, &Progress::default(), &ctx).unwrap();
+        let mut ar = zip::ZipArchive::new(File::open(&zp).unwrap()).unwrap();
+        assert!(ar.by_name("src/a.txt").is_err() || ar.by_name("src/a.txt").unwrap().read_to_end(&mut Vec::new()).is_err());
+        let mut v = Vec::new();
+        ar.by_name_decrypt("src/a.txt", b"clave").unwrap().read_to_end(&mut v).unwrap();
+        assert_eq!(v, fs::read(d.join("src/a.txt")).unwrap());
+
+        let o = CompressOpts { fmt: ArchFmt::SevenZ, level: 6, password: Some("clave".into()) };
+        let sp = d.join("e.7z");
+        compress_paths(&[d.join("src")], &sp, &o, &Progress::default(), &ctx).unwrap();
+        let dst = d.join("x7");
+        sevenz_rust2::decompress_file_with_password(&sp, &dst, "clave".into()).unwrap();
+        same(&d.join("src"), &dst.join("src"));
+        assert!(sevenz_rust2::decompress_file_with_password(&sp, d.join("bad"), "otra".into()).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancel_stops() {
+        let d = tree("cancel");
+        let p = Progress::default();
+        p.cancel.store(true, AO::Relaxed);
+        let o = CompressOpts { fmt: ArchFmt::TarGz, level: 6, password: None };
+        assert!(compress_paths(&[d.join("src")], &d.join("c.tar.gz"), &o, &p, &egui::Context::default()).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+}
