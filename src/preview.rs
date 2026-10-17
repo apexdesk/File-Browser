@@ -24,6 +24,7 @@ enum Raw {
     Folder(usize, Vec<String>),
     Archive(crate::archive::Listing),
     Binary,
+    Mesh(crate::mesh3d::Mesh),
     Err(String),
 }
 
@@ -34,6 +35,8 @@ pub enum Body {
     Folder { count: usize, names: Vec<String> },
     Archive { rows: Vec<(String, u64, bool)>, truncated: bool },
     Info,
+    /// modelo 3D (el estado vive en `Preview::mesh`)
+    Mesh,
     Error(String),
 }
 
@@ -49,6 +52,7 @@ pub struct Preview {
     pub thumb: Option<egui::TextureHandle>,
     pub player: Option<crate::video::Player>,
     pub audio: Option<crate::audio::AudioPlayer>,
+    mesh: Option<MeshView>,
     zoom: f32,
     pan: egui::Vec2,
     scroll: f32,
@@ -57,6 +61,18 @@ pub struct Preview {
     /// pestaña «Uso de disco» de las carpetas
     show_usage: bool,
     usage: Option<UsageView>,
+}
+
+/// Modelo 3D abierto: cámara y última imagen dibujada.
+struct MeshView {
+    mesh: Arc<crate::mesh3d::Mesh>,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    tex: Option<egui::TextureHandle>,
+    /// parámetros de la última imagen: (ancho, alto, guiñada, inclinación, zoom, oscuro, completa)
+    key: Option<(usize, usize, i32, i32, i32, bool, bool)>,
+    dragging: bool,
 }
 
 /// Gráfico de uso de disco de una carpeta: análisis en curso, árbol resultante y nivel mostrado.
@@ -119,6 +135,14 @@ fn fmt_secs(s: f64) -> String {
 }
 
 fn load(job: &Job) -> Raw {
+    if let Some(ext) = job.path.extension().and_then(|e| e.to_str()) {
+        if job.kind == Kind::Other && crate::mesh3d::is_mesh_ext(ext) && !crate::sftp::is_remote(&job.path) {
+            return match crate::mesh3d::load(&job.path) {
+                Ok(m) => Raw::Mesh(m),
+                Err(_) => Raw::Binary,
+            };
+        }
+    }
     // archivo de un servidor SFTP: se descarga sólo si es pequeño
     if !matches!(job.kind, Kind::Folder) && crate::sftp::is_remote(&job.path) {
         let small = std::fs::metadata(&job.path).map(|m| m.len() <= 32 << 20).unwrap_or(false);
@@ -204,6 +228,7 @@ impl Preview {
             thumb,
             player: None,
             audio: None,
+            mesh: None,
             last_pos: None,
             zoom: 1.0,
             pan: vec2(0.0, 0.0),
@@ -281,6 +306,10 @@ impl Preview {
                     let mut rows: Vec<(String, u64, bool)> = l.items.into_iter().map(|i| (i.name, i.size, i.dir)).collect();
                     rows.sort_by(|a, b| crate::fsys::natural_cmp(&a.0, &b.0));
                     Body::Archive { rows, truncated: l.truncated }
+                }
+                Raw::Mesh(m) => {
+                    self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false });
+                    Body::Mesh
                 }
                 Raw::Binary => Body::Info,
                 Raw::Err(e) => Body::Error(e),
@@ -394,6 +423,8 @@ impl Preview {
             Align2::CENTER_CENTER,
             if touch {
                 t("Atrás o toque fuera: cerrar   ·   Pellizca: zoom   ·   Doble toque: ajustar")
+            } else if matches!(self.body, Body::Mesh) {
+                t("Arrastrar: girar   ·   Rueda: zoom   ·   Doble clic: restablecer   ·   Flechas: anterior / siguiente   ·   Esc: cerrar")
             } else if self.can_play() {
                 t("Espacio: pausa / reanudar   ·   Left/Right: saltar 5 s   ·   Up/Down: anterior / siguiente   ·   O: abrir fuera   ·   Esc: cerrar")
             } else {
@@ -564,6 +595,7 @@ impl Preview {
                     );
                 }
             }
+            Body::Mesh => self.draw_mesh(ctx, &cp, content, pal, in_content),
             Body::Info if self.kind == Kind::Audio => {
                 let c = pos2(content.center().x, content.center().y - 50.0);
                 let r = Rect::from_center_size(c, vec2(180.0, 180.0));
@@ -715,6 +747,72 @@ impl Preview {
                 let pl = self.player.get_or_insert_with(|| crate::video::Player::new(ctx, &path));
                 pl.seek_to(s);
             }
+        }
+    }
+
+    /// Modelo 3D: arrastrar gira, la rueda acerca, doble clic restablece.
+    fn draw_mesh(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool) {
+        let dark = pal.bg.r() < 128;
+        let Some(mv) = &mut self.mesh else { return };
+        let (dy, drag, dbl, down) = ctx.input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.pointer.delta(),
+                i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                i.pointer.primary_down(),
+            )
+        });
+        let pinch = ctx.input(|i| i.zoom_delta());
+        let mut moving = false;
+        if hot {
+            if down && (drag.x != 0.0 || drag.y != 0.0) {
+                mv.yaw += drag.x * 0.01;
+                mv.pitch = (mv.pitch + drag.y * 0.01).clamp(-1.55, 1.55);
+                moving = true;
+            }
+            if dy != 0.0 {
+                mv.zoom = (mv.zoom * (dy * 0.0015).exp()).clamp(0.2, 20.0);
+            }
+            if pinch != 1.0 {
+                mv.zoom = (mv.zoom * pinch).clamp(0.2, 20.0);
+            }
+            if dbl {
+                mv.yaw = -0.6;
+                mv.pitch = 0.5;
+                mv.zoom = 1.0;
+            }
+        }
+        mv.dragging = moving || (hot && down && mv.dragging);
+        let rw = (area.width() as usize).clamp(64, 900);
+        let rh = ((area.height() * rw as f32 / area.width().max(1.0)) as usize).clamp(64, 900);
+        let full = !mv.dragging;
+        let key = (rw, rh, (mv.yaw * 1000.0) as i32, (mv.pitch * 1000.0) as i32, (mv.zoom * 1000.0) as i32, dark, full);
+        if mv.key != Some(key) {
+            let (bg, base) = if dark { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [150, 185, 255]) } else { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [70, 110, 220]) };
+            let rgba = crate::mesh3d::render(&mv.mesh, mv.yaw, mv.pitch, mv.zoom, rw, rh, bg, base, full);
+            let img = egui::ColorImage::from_rgba_unmultiplied([rw, rh], &rgba);
+            match &mut mv.tex {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => mv.tex = Some(ctx.load_texture("mesh", img, egui::TextureOptions::LINEAR)),
+            }
+            mv.key = Some(key);
+            if !full {
+                ctx.request_repaint(); // al soltar se redibuja a calidad completa
+            }
+        }
+        if let Some(t) = &mv.tex {
+            let shape = egui::epaint::RectShape::filled(area, CornerRadius::same(10), Color32::WHITE)
+                .with_texture(t.id(), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+            p.add(shape);
+        }
+        let m = &mv.mesh;
+        let info = tf(
+            "{} triángulos · {} × {} × {}",
+            &[&m.count(), &format!("{:.4}", m.size[0]).trim_end_matches('0').trim_end_matches('.'), &format!("{:.4}", m.size[1]).trim_end_matches('0').trim_end_matches('.'), &format!("{:.4}", m.size[2]).trim_end_matches('0').trim_end_matches('.')],
+        );
+        p.text(pos2(area.left() + 12.0, area.bottom() - 10.0), Align2::LEFT_BOTTOM, info, FontId::proportional(12.0), pal.subtle);
+        if mv.dragging || hot {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
