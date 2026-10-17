@@ -13,8 +13,11 @@ pub struct CustomTheme {
 
 pub struct Config {
     pub custom_themes: Vec<CustomTheme>,
-    /// Nombre del tema propio activo ('' = uno de los de serie).
+    /// Nombre del tema (propio o predefinido) activo ahora ('' = el claro/oscuro de serie); se deriva de las dos ranuras.
     pub theme_custom: String,
+    /// Tema elegido para el modo claro y para el oscuro ('' = el de serie). «Sistema» alterna entre ambos.
+    pub theme_light: String,
+    pub theme_dark: String,
     pub bookmarks: Vec<PathBuf>,
     pub grid: bool,
     pub zoom: f32,
@@ -65,6 +68,8 @@ impl Default for Config {
         Config {
             custom_themes: Vec::new(),
             theme_custom: String::new(),
+            theme_light: String::new(),
+            theme_dark: String::new(),
             bookmarks: Vec::new(),
             grid: true,
             zoom: 120.0,
@@ -146,6 +151,8 @@ impl Config {
                     c.theme_mode = v.parse().unwrap_or(0u8).min(2);
                 }
                 "theme_custom" => c.theme_custom = v.to_string(),
+                "theme_light" => c.theme_light = v.to_string(),
+                "theme_dark" => c.theme_dark = v.to_string(),
                 "ctheme" => {
                     // nombre|0/1|rrggbb,… (9 colores)
                     let mut it = v.splitn(3, '|');
@@ -216,7 +223,35 @@ impl Config {
                 _ => {}
             }
         }
+        // versiones anteriores guardaban un único tema propio que sustituía al modo: pasa a su ranura
+        if !c.theme_custom.is_empty() && c.theme_light.is_empty() && c.theme_dark.is_empty() {
+            if let Some(th) = c.theme_named(&c.theme_custom) {
+                if th.dark {
+                    c.theme_dark = th.name;
+                } else {
+                    c.theme_light = th.name;
+                }
+            }
+        }
+        c.sync_active();
         c
+    }
+
+    /// Tema por nombre: primero los propios, luego los predefinidos.
+    pub fn theme_named(&self, name: &str) -> Option<CustomTheme> {
+        if name.is_empty() {
+            return None;
+        }
+        self.custom_themes.iter().find(|t| t.name == name).cloned().or_else(|| crate::theme::presets().iter().find(|t| t.name == name).cloned())
+    }
+
+    /// Hace que `theme_custom` sea el tema de la ranura del modo vigente (`dark`), si existe y su base coincide.
+    pub fn sync_active(&mut self) {
+        let name = if self.dark { &self.theme_dark } else { &self.theme_light };
+        self.theme_custom = match self.theme_named(name) {
+            Some(t) if t.dark == self.dark => t.name,
+            _ => String::new(),
+        };
     }
 
     pub fn save(&self) {
@@ -233,7 +268,8 @@ impl Config {
         s.push_str(&format!("hidden={}\n", self.show_hidden as u8));
         s.push_str(&format!("dark={}\n", self.dark as u8));
         s.push_str(&format!("theme={}\n", self.theme_mode));
-        s.push_str(&format!("theme_custom={}\n", self.theme_custom));
+        s.push_str(&format!("theme_light={}\n", self.theme_light));
+        s.push_str(&format!("theme_dark={}\n", self.theme_dark));
         for th in &self.custom_themes {
             let hex: Vec<String> = th.colors.iter().map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
             s.push_str(&format!("ctheme={}|{}|{}\n", th.name, th.dark as u8, hex.join(",")));
@@ -285,5 +321,36 @@ impl Config {
         s.push_str(&format!("shell={}\n", self.shell));
         s.push_str(&format!("win={}x{}\n", self.win.0, self.win.1));
         let _ = std::fs::write(f, s);
+    }
+}
+
+#[cfg(test)]
+mod theme_slot_tests {
+    use super::*;
+
+    #[test]
+    fn slots_follow_mode_and_base() {
+        let mut c = Config::default();
+        c.theme_dark = "Nord".into();
+        c.theme_light = "Nord".into(); // base oscura en la ranura clara: no vale
+        c.dark = true;
+        c.sync_active();
+        assert_eq!(c.theme_custom, "Nord");
+        c.dark = false;
+        c.sync_active();
+        assert_eq!(c.theme_custom, "");
+        c.theme_light = "Paper".into();
+        c.sync_active();
+        assert_eq!(c.theme_custom, "Paper");
+        assert!(crate::theme::presets().iter().all(|t| t.colors.len() == 9));
+    }
+
+    #[test]
+    fn old_single_custom_theme_migrates_to_its_slot() {
+        let mut c = Config::default();
+        c.custom_themes.push(CustomTheme { name: "Mio".into(), dark: true, colors: [[1, 2, 3]; 9] });
+        c.theme_custom = "Mio".into();
+        let th = c.theme_named(&c.theme_custom).unwrap();
+        assert!(th.dark);
     }
 }

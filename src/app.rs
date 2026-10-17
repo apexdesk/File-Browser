@@ -410,8 +410,10 @@ pub struct App {
     col_cache: HashMap<PathBuf, (Instant, Arc<Vec<(String, bool)>>)>,
     /// Se está pintando la columna activa de la vista de columnas (sin cabecera ni columnas extra).
     col_active: bool,
-    /// Pestaña abierta en Opciones: 0 = general, 1 = columnas.
+    /// Pestaña abierta en Opciones: 0 = general, 1 = columnas, 2 = temas.
     opts_tab: u8,
+    /// Tema propio abierto en el editor de la pestaña Temas.
+    edit_theme: String,
     perm_t: f64,
     /// Márgenes seguros (izq, arriba, der, abajo) en puntos: cámara, barras del sistema.
     insets: [f32; 4],
@@ -993,10 +995,7 @@ impl App {
                 cfg.dark = d;
             }
         }
-        if let Some(th) = cfg.custom_themes.iter().find(|t| t.name == cfg.theme_custom) {
-            cfg.dark = th.dark;
-            cfg.theme_mode = if th.dark { 2 } else { 1 };
-        }
+        cfg.sync_active();
         let pal = theme::resolve(&cfg, cfg.dark);
         theme::apply_style(&ctx, &pal, cfg.dark);
         let (load_tx, load_rx) = channel();
@@ -1090,6 +1089,7 @@ impl App {
             col_cache: HashMap::new(),
             col_active: false,
             opts_tab: 0,
+            edit_theme: String::new(),
             perm_t: -10.0,
             insets: [0.0; 4],
             insets_t: -10.0,
@@ -4371,23 +4371,33 @@ impl App {
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(list) = self.confirm_delete.clone() else { return };
         let mut close = false;
-        egui::Window::new(t("Eliminar definitivamente"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(tf("Se eliminarán {} elemento(s) de forma permanente. No se puede deshacer.", &[&list.len()]));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(t("Eliminar")).clicked() {
-                        self.start_op(Op::Delete(list.clone()), OpMeta::Other);
-                        close = true;
-                    }
-                    if ui.button(t("Cancelar")).clicked() {
-                        close = true;
-                    }
-                });
-            });
+        let pal = self.pal;
+        let mut go = false;
+        theme::modal_card(
+            ctx,
+            &pal,
+            theme::Tone::Danger,
+            t("Eliminar definitivamente"),
+            400.0,
+            |ui| {
+                ui.label(egui::RichText::new(tf("Se eliminarán {} elemento(s) de forma permanente. No se puede deshacer.", &[&list.len()])).color(pal.subtle));
+            },
+            |ui| {
+                if theme::dialog_button(ui, &pal, theme::Btn::Danger, t("Eliminar")).clicked() {
+                    go = true;
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                    close = true;
+                }
+            },
+        );
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            close = true;
+        }
+        if go {
+            self.start_op(Op::Delete(list.clone()), OpMeta::Other);
+            close = true;
+        }
         if close {
             self.confirm_delete = None;
         }
@@ -6671,6 +6681,7 @@ impl App {
 
     fn apply_dark(&mut self, dark: bool) {
         self.cfg.dark = dark;
+        self.cfg.sync_active();
         // el cambio es gradual: `tick_theme` va mezclando la paleta actual con la nueva
         self.theme_anim = Some((self.pal, theme::resolve(&self.cfg, dark), dark, Instant::now()));
         self.ctx.request_repaint();
@@ -6691,21 +6702,257 @@ impl App {
         }
     }
 
-    /// Activa un tema propio (o los de serie con `None`) y repinta con él.
-    fn set_custom_theme(&mut self, name: Option<String>) {
-        match name {
-            Some(n) => {
-                let Some(th) = self.cfg.custom_themes.iter().find(|t| t.name == n) else { return };
-                let dark = th.dark;
-                self.cfg.theme_custom = n;
+    /// Pestaña «Temas» de Opciones: lista de temas (los de serie siempre están), cada uno claro u oscuro;
+    /// al elegir uno pasa a ser el de su modo.
+    fn themes_tab(&mut self, ui: &mut egui::Ui) -> bool {
+        let pal = self.pal;
+        let mut changed = false;
+        // (nombre, ¿oscuro?, origen 0 serie / 1 predefinido / 2 propio, colores)
+        let mut rows: Vec<(String, bool, u8, [[u8; 3]; 9])> = Vec::new();
+        rows.push((t("Claro").to_string(), false, 0, theme::palette(false).colors()));
+        rows.push((t("Oscuro").to_string(), true, 0, theme::palette(true).colors()));
+        for th in crate::theme::presets() {
+            rows.push((th.name.clone(), th.dark, 1, th.colors));
+        }
+        for th in &self.cfg.custom_themes {
+            rows.push((th.name.clone(), th.dark, 2, th.colors));
+        }
+        let mut mode: Option<u8> = None;
+        let mut pick: Option<(bool, String)> = None;
+        let mut dup: Option<usize> = None;
+        let mut del: Option<String> = None;
+        let mut edit: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.label(t("Modo"));
+            for (m, l) in [(0u8, t("Sistema")), (1, t("Claro")), (2, t("Oscuro"))] {
+                if ui.radio(self.cfg.theme_mode == m, l).clicked() {
+                    mode = Some(m);
+                }
+            }
+        });
+        ui.label(egui::RichText::new(t("Elige un tema claro y uno oscuro; «Sistema» alterna entre ellos. Los de serie no se pierden nunca.")).size(12.0).color(pal.subtle));
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (title, origin) in [(None, 0u8), (Some(t("Predefinidos")), 1), (Some(t("Mis temas")), 2)] {
+                let group: Vec<usize> = (0..rows.len()).filter(|&i| if origin == 0 { rows[i].2 == 0 } else { rows[i].2 == origin }).collect();
+                if group.is_empty() {
+                    if origin == 2 {
+                        ui.label(egui::RichText::new(t("Mis temas")).size(12.0).color(pal.subtle));
+                        ui.label(egui::RichText::new(t("Aún no hay temas propios: crea uno con «Nuevo tema».")).size(12.0).color(pal.subtle));
+                    }
+                    continue;
+                }
+                if let Some(h) = title {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(h).size(12.0).color(pal.subtle));
+                }
+                for i in group {
+                    let (name, dark, orig, colors) = rows[i].clone();
+                    let slot = if dark { &self.cfg.theme_dark } else { &self.cfg.theme_light };
+                    let key = if orig == 0 { String::new() } else { name.clone() };
+                    let used = match self.cfg.theme_named(slot).filter(|t| t.dark == dark) {
+                        Some(cur) => orig != 0 && cur.name == name,
+                        None => orig == 0,
+                    };
+                    ui.horizontal(|ui| {
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 150.0, 30.0), egui::Sense::click());
+                        let hov = resp.hovered();
+                        if used || hov {
+                            ui.painter().rect_filled(r, 8.0, if used { pal.sel } else { pal.hover });
+                        }
+                        // muestra de la paleta
+                        let mut x = r.min.x + 8.0;
+                        for k in [0usize, 1, 2, 5, 7] {
+                            let c = colors[k];
+                            let sw = Rect::from_min_size(pos2(x, r.center().y - 7.0), vec2(14.0, 14.0));
+                            ui.painter().rect_filled(sw, 4.0, Color32::from_rgb(c[0], c[1], c[2]));
+                            ui.painter().rect_stroke(sw, 4.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                            x += 16.0;
+                        }
+                        let nr = ui.painter().text(pos2(x + 8.0, r.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(14.0), pal.text);
+                        let tag = if dark { t("Oscuro") } else { t("Claro") };
+                        let tag_w = if used { 70.0 } else { 52.0 };
+                        if nr.max.x + tag_w < r.max.x - 8.0 { ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, if used { format!("✓ {tag}") } else { tag.to_string() }, egui::FontId::proportional(12.0), if used { pal.accent } else { pal.subtle }); }
+                        if resp.clicked() {
+                            pick = Some((dark, key.clone()));
+                            if orig == 2 {
+                                edit = Some(name.clone());
+                            }
+                        }
+                        if ui.small_button(t("Duplicar")).clicked() {
+                            dup = Some(i);
+                        }
+                        if orig == 2 && ui.small_button(t("Eliminar tema")).clicked() {
+                            del = Some(name.clone());
+                        }
+                    });
+                }
+            }
+        });
+        ui.add_space(6.0);
+        // nuevo tema: base claro u oscuro, parte de la paleta que se ve ahora
+        let new_dark_id = ui.id().with("new_theme_dark");
+        let mut new_dark = ui.data(|d| d.get_temp::<bool>(new_dark_id)).unwrap_or(self.cfg.dark);
+        let mut create: Option<bool> = None;
+        ui.horizontal(|ui| {
+            if ui.button(t("Nuevo tema")).clicked() {
+                create = Some(new_dark);
+            }
+            ui.radio_value(&mut new_dark, false, t("Claro"));
+            ui.radio_value(&mut new_dark, true, t("Oscuro"));
+        });
+        ui.data_mut(|d| d.insert_temp(new_dark_id, new_dark));
+
+        // editor del tema propio seleccionado
+        if let Some(i) = self.cfg.custom_themes.iter().position(|t| t.name == self.edit_theme) {
+            ui.separator();
+            let mut edited = false;
+            let mut rename: Option<String> = None;
+            let mut new_base: Option<bool> = None;
+            {
+                let th = &mut self.cfg.custom_themes[i];
+                ui.horizontal(|ui| {
+                    ui.label(t("Nombre"));
+                    let mut n = th.name.clone();
+                    if ui.add(egui::TextEdit::singleline(&mut n).desired_width(160.0)).changed() {
+                        rename = Some(n);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t("Base del tema"));
+                    let mut d = th.dark;
+                    ui.radio_value(&mut d, false, t("Claro"));
+                    ui.radio_value(&mut d, true, t("Oscuro"));
+                    if d != th.dark {
+                        new_base = Some(d);
+                    }
+                });
+                let labels = [t("Fondo"), t("Panel lateral"), t("Superficie"), t("Resaltado"), t("Borde"), t("Texto"), t("Texto secundario"), t("Acento"), t("Fondo del visor")];
+                egui::Grid::new("theme_colors").num_columns(4).show(ui, |ui| {
+                    for (k, l) in labels.iter().enumerate() {
+                        ui.label(*l);
+                        edited |= ui.color_edit_button_srgb(&mut th.colors[k]).changed();
+                        if k % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            }
+            if let Some(n) = rename {
+                let n: String = n.chars().filter(|c| !matches!(c, '|' | '\n' | '\r')).take(40).collect();
+                let taken = self.cfg.custom_themes.iter().any(|t| t.name == n) || crate::theme::presets().iter().any(|t| t.name == n);
+                if !n.is_empty() && !taken {
+                    let old = std::mem::replace(&mut self.cfg.custom_themes[i].name, n.clone());
+                    if self.cfg.theme_light == old {
+                        self.cfg.theme_light = n.clone();
+                    }
+                    if self.cfg.theme_dark == old {
+                        self.cfg.theme_dark = n.clone();
+                    }
+                    self.edit_theme = n;
+                    self.cfg.sync_active();
+                    changed = true;
+                }
+            }
+            if let Some(d) = new_base {
+                // cambia de modo: deja la ranura anterior y pasa a la nueva
+                let name = self.cfg.custom_themes[i].name.clone();
+                self.cfg.custom_themes[i].dark = d;
+                if self.cfg.theme_light == name {
+                    self.cfg.theme_light.clear();
+                }
+                if self.cfg.theme_dark == name {
+                    self.cfg.theme_dark.clear();
+                }
+                pick = Some((d, name));
+            }
+            if edited {
+                self.refresh_custom_theme();
+                changed = true;
+            }
+        }
+
+        if let Some(m) = mode {
+            self.set_theme_mode(m);
+        }
+        if let Some((dark, key)) = pick {
+            // si hay un modo fijo, se pasa a él para que el tema elegido se vea; con «Sistema» solo se asigna
+            if self.cfg.theme_mode != 0 && self.cfg.theme_mode != if dark { 2 } else { 1 } {
                 self.cfg.theme_mode = if dark { 2 } else { 1 };
-                self.apply_dark(dark);
             }
-            None => {
-                let dark = self.cfg.dark;
-                self.set_dark(dark);
-                return;
+            if dark {
+                self.cfg.theme_dark = key;
+            } else {
+                self.cfg.theme_light = key;
             }
+            let show = if self.cfg.theme_mode == 0 { self.cfg.dark } else { dark };
+            self.apply_dark(show);
+            changed = true;
+        }
+        let create = create.or(dup.map(|i| rows[i].1));
+        if let Some(side) = create {
+            if self.cfg.custom_themes.len() < 32 {
+                let (colors, stem) = match dup {
+                    Some(i) => (rows[i].3, rows[i].0.clone()),
+                    None => (theme::resolve(&self.cfg, side).colors(), t("Tema").to_string()),
+                };
+                let mut k = 1;
+                let name = loop {
+                    let n = if dup.is_some() { format!("{stem} {}", k + 1) } else { format!("{stem} {}", self.cfg.custom_themes.len() + k) };
+                    let taken = self.cfg.custom_themes.iter().any(|t| t.name == n) || crate::theme::presets().iter().any(|t| t.name == n);
+                    if !taken {
+                        break n;
+                    }
+                    k += 1;
+                };
+                self.cfg.custom_themes.push(crate::config::CustomTheme { name: name.clone(), dark: side, colors });
+                self.edit_theme = name.clone();
+                if self.cfg.theme_mode != 0 && self.cfg.theme_mode != if side { 2 } else { 1 } {
+                    self.cfg.theme_mode = if side { 2 } else { 1 };
+                }
+                if side {
+                    self.cfg.theme_dark = name;
+                } else {
+                    self.cfg.theme_light = name;
+                }
+                let show = if self.cfg.theme_mode == 0 { self.cfg.dark } else { side };
+                self.apply_dark(show);
+                changed = true;
+            }
+        }
+        if let Some(name) = del {
+            if let Some(i) = self.cfg.custom_themes.iter().position(|t| t.name == name) {
+                self.cfg.custom_themes.remove(i);
+                // las ranuras que lo usaban vuelven al tema de serie
+                if self.cfg.theme_light == name {
+                    self.cfg.theme_light.clear();
+                }
+                if self.cfg.theme_dark == name {
+                    self.cfg.theme_dark.clear();
+                }
+                if self.edit_theme == name {
+                    self.edit_theme.clear();
+                }
+                let d = self.cfg.dark;
+                self.apply_dark(d);
+                changed = true;
+            }
+        }
+        if let Some(n) = edit {
+            self.edit_theme = n;
+        }
+        changed
+    }
+
+    /// Elige el tema de la ranura clara u oscura ('' = el de serie) y, si es la del modo vigente, lo aplica.
+    fn pick_theme(&mut self, dark_slot: bool, name: String) {
+        if dark_slot {
+            self.cfg.theme_dark = name;
+        } else {
+            self.cfg.theme_light = name;
+        }
+        if self.cfg.dark == dark_slot {
+            self.apply_dark(dark_slot);
         }
         self.cfg.save();
     }
@@ -6721,7 +6968,6 @@ impl App {
 
     /// Tema explícito (claro u oscuro).
     fn set_dark(&mut self, dark: bool) {
-        self.cfg.theme_custom.clear();
         self.cfg.theme_mode = if dark { 2 } else { 1 };
         self.apply_dark(dark);
         self.cfg.save();
@@ -6729,7 +6975,6 @@ impl App {
 
     /// 0 = según el sistema, 1 = claro, 2 = oscuro.
     fn set_theme_mode(&mut self, mode: u8) {
-        self.cfg.theme_custom.clear();
         self.cfg.theme_mode = mode;
         let dark = match mode {
             1 => false,
@@ -7172,22 +7417,28 @@ impl App {
             PurgeReq::Rows(v) => tf("Se eliminarán {} elemento(s) de forma permanente. No se puede deshacer.", &[&v.len()]),
         };
         let mut decision: Option<bool> = None;
-        egui::Window::new(t("Eliminar definitivamente"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(text);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(t("Eliminar")).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button(t("Cancelar")).clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
+        let pal = self.pal;
+        theme::modal_card(
+            ctx,
+            &pal,
+            theme::Tone::Danger,
+            t("Eliminar definitivamente"),
+            400.0,
+            |ui| {
+                ui.label(egui::RichText::new(text).color(pal.subtle));
+            },
+            |ui| {
+                if theme::dialog_button(ui, &pal, theme::Btn::Danger, t("Eliminar")).clicked() {
+                    decision = Some(true);
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                    decision = Some(false);
+                }
+            },
+        );
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            decision = Some(false);
+        }
         match decision {
             Some(true) => match self.confirm_purge.take() {
                 Some(PurgeReq::All) => self.trash_run(false, None),
@@ -7202,36 +7453,38 @@ impl App {
     fn conflict_dialog(&mut self, ctx: &egui::Context) {
         let Some(c) = self.conflict.take() else { return };
         let mut choice: Option<Option<Policy>> = None; // Some(None) = cancelar
-        egui::Window::new(t("El destino ya existe"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.set_min_width(360.0);
-                ui.label(tf("{} elemento(s) ya existen en el destino:", &[&c.names.len()]));
+        let pal = self.pal;
+        theme::modal_card(
+            ctx,
+            &pal,
+            theme::Tone::Warn,
+            t("El destino ya existe"),
+            470.0,
+            |ui| {
+                ui.label(egui::RichText::new(tf("{} elemento(s) ya existen en el destino:", &[&c.names.len()])).color(pal.subtle));
                 ui.add_space(4.0);
                 for n in c.names.iter().take(6) {
-                    ui.label(egui::RichText::new(format!("  •  {n}")).color(self.pal.subtle));
+                    ui.label(format!("•  {n}"));
                 }
                 if c.names.len() > 6 {
-                    ui.label(egui::RichText::new(tf("  … (+{} más)", &[&(c.names.len() - 6)])).color(self.pal.subtle));
+                    ui.label(egui::RichText::new(tf("… (+{} más)", &[&(c.names.len() - 6)])).color(pal.subtle));
                 }
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button(t("Reemplazar")).clicked() {
-                        choice = Some(Some(Policy::Replace));
-                    }
-                    if ui.button(t("Mantener ambos")).clicked() {
-                        choice = Some(Some(Policy::Rename));
-                    }
-                    if ui.button(t("Omitir")).clicked() {
-                        choice = Some(Some(Policy::Skip));
-                    }
-                    if ui.button(t("Cancelar")).clicked() {
-                        choice = Some(None);
-                    }
-                });
-            });
+            },
+            |ui| {
+                if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Reemplazar")).clicked() {
+                    choice = Some(Some(Policy::Replace));
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Mantener ambos")).clicked() {
+                    choice = Some(Some(Policy::Rename));
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Omitir")).clicked() {
+                    choice = Some(Some(Policy::Skip));
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                    choice = Some(None);
+                }
+            },
+        );
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             choice = Some(None);
         }
@@ -7513,22 +7766,24 @@ impl App {
         if self.quit_ask {
             let n = self.queue.len() + self.op.is_some() as usize;
             let mut decision: Option<bool> = None;
-            egui::Window::new(t("Hay tareas en curso"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(tf("Hay {} tarea(s) sin terminar. Si cierras ahora se interrumpirán.", &[&n.to_string()]));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(t("Cerrar de todos modos")).clicked() {
-                            decision = Some(true);
-                        }
-                        if ui.button(t("Seguir trabajando")).clicked() {
-                            decision = Some(false);
-                        }
-                    });
-                });
+            theme::modal_card(
+                ctx,
+                &pal,
+                theme::Tone::Warn,
+                t("Hay tareas en curso"),
+                420.0,
+                |ui| {
+                    ui.label(egui::RichText::new(tf("Hay {} tarea(s) sin terminar. Si cierras ahora se interrumpirán.", &[&n.to_string()])).color(pal.subtle));
+                },
+                |ui| {
+                    if theme::dialog_button(ui, &pal, theme::Btn::Danger, t("Cerrar de todos modos")).clicked() {
+                        decision = Some(true);
+                    }
+                    if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Seguir trabajando")).clicked() {
+                        decision = Some(false);
+                    }
+                },
+            );
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 decision = Some(false);
             }
@@ -7984,9 +8239,6 @@ impl App {
             Dlg::Options => {
                 let mut open = true;
                 let mut changed = false;
-                let mut theme_change = None;
-                let mut pick_theme: Option<String> = None;
-                let mut new_theme = false;
                 let mut res_sort = false;
                 let mut install_sys = false;
                 egui::Window::new(t("Opciones"))
@@ -7997,13 +8249,17 @@ impl App {
                     .show(ctx, |ui| {
                         ui.set_min_width(360.0);
                         ui.horizontal(|ui| {
-                            for (i, l) in [t("General"), t("Columnas")].into_iter().enumerate() {
+                            for (i, l) in [t("General"), t("Columnas"), t("Temas")].into_iter().enumerate() {
                                 if ui.selectable_label(self.opts_tab == i as u8, l).clicked() {
                                     self.opts_tab = i as u8;
                                 }
                             }
                         });
                         ui.separator();
+                        if self.opts_tab == 2 {
+                            changed |= self.themes_tab(ui);
+                            return;
+                        }
                         if self.opts_tab == 1 {
                             ui.label(egui::RichText::new(t("Elige qué columnas ver en la vista de lista y su orden. Si la ventana es estrecha, se ocultan las menos importantes.")).color(pal.subtle));
                             ui.add_space(6.0);
@@ -8048,101 +8304,6 @@ impl App {
                         changed |= ui.checkbox(&mut self.cfg.preview_window, t("Abrir el visor en una ventana aparte")).changed();
                         changed |= ui.checkbox(&mut self.cfg.native_deco, t("Usar la barra de título del sistema (requiere reiniciar)")).changed();
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(t("Tema de color"));
-                            let cur_name = if self.cfg.custom_themes.iter().any(|t| t.name == self.cfg.theme_custom) {
-                                self.cfg.theme_custom.clone()
-                            } else if self.cfg.dark {
-                                t("Oscuro").to_string()
-                            } else {
-                                t("Claro").to_string()
-                            };
-                            egui::ComboBox::from_id_salt("theme_combo").selected_text(cur_name).show_ui(ui, |ui| {
-                                let builtin = !self.cfg.custom_themes.iter().any(|t| t.name == self.cfg.theme_custom);
-                                if ui.selectable_label(builtin && !self.cfg.dark, t("Claro")).clicked() {
-                                    theme_change = Some(false);
-                                }
-                                if ui.selectable_label(builtin && self.cfg.dark, t("Oscuro")).clicked() {
-                                    theme_change = Some(true);
-                                }
-                                for th in &self.cfg.custom_themes {
-                                    if ui.selectable_label(!builtin && th.name == self.cfg.theme_custom, &th.name).clicked() {
-                                        pick_theme = Some(th.name.clone());
-                                    }
-                                }
-                            });
-                            if ui.button(t("Nuevo tema")).clicked() {
-                                new_theme = true;
-                            }
-                        });
-                        if let Some(i) = self.cfg.custom_themes.iter().position(|t| t.name == self.cfg.theme_custom) {
-                            let mut edited = false;
-                            let mut del = false;
-                            let mut rename: Option<String> = None;
-                            {
-                                let th = &mut self.cfg.custom_themes[i];
-                                ui.horizontal(|ui| {
-                                    ui.label(t("Nombre"));
-                                    let mut n = th.name.clone();
-                                    if ui.add(egui::TextEdit::singleline(&mut n).desired_width(160.0)).changed() {
-                                        rename = Some(n);
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label(t("Base del tema"));
-                                    let mut d = th.dark;
-                                    ui.radio_value(&mut d, false, t("Claro"));
-                                    ui.radio_value(&mut d, true, t("Oscuro"));
-                                    if d != th.dark {
-                                        th.dark = d;
-                                        edited = true;
-                                    }
-                                });
-                                let labels = [
-                                    t("Fondo"),
-                                    t("Panel lateral"),
-                                    t("Superficie"),
-                                    t("Resaltado"),
-                                    t("Borde"),
-                                    t("Texto"),
-                                    t("Texto secundario"),
-                                    t("Acento"),
-                                    t("Fondo del visor"),
-                                ];
-                                egui::Grid::new("theme_colors").num_columns(4).show(ui, |ui| {
-                                    for (k, l) in labels.iter().enumerate() {
-                                        ui.label(*l);
-                                        edited |= ui.color_edit_button_srgb(&mut th.colors[k]).changed();
-                                        if k % 2 == 1 {
-                                            ui.end_row();
-                                        }
-                                    }
-                                });
-                            }
-                            if let Some(n) = rename {
-                                let n: String = n.chars().filter(|c| !matches!(c, '|' | '\n' | '\r')).take(40).collect();
-                                if !n.is_empty() && !self.cfg.custom_themes.iter().any(|t| t.name == n) {
-                                    self.cfg.custom_themes[i].name = n.clone();
-                                    self.cfg.theme_custom = n;
-                                    changed = true;
-                                }
-                            }
-                            if ui.button(t("Eliminar tema")).clicked() {
-                                del = true;
-                            }
-                            if edited {
-                                let (d, ) = (self.cfg.custom_themes[i].dark,);
-                                self.cfg.dark = d;
-                                self.cfg.theme_mode = if d { 2 } else { 1 };
-                                self.refresh_custom_theme();
-                                changed = true;
-                            }
-                            if del {
-                                self.cfg.custom_themes.remove(i);
-                                let d = self.cfg.dark;
-                                theme_change = Some(d);
-                            }
-                        }
                         if system::can_install() {
                             ui.add_space(6.0);
                             if ui.button(t("Usar como gestor de archivos del sistema")).clicked() {
@@ -8186,27 +8347,6 @@ impl App {
                             .add(egui::TextEdit::singleline(&mut self.cfg.shell).hint_text(crate::terminal::default_shell()).desired_width(320.0))
                             .changed();
                     });
-                if let Some(d) = theme_change {
-                    self.set_dark(d);
-                }
-                if let Some(n) = pick_theme {
-                    self.set_custom_theme(Some(n));
-                }
-                if new_theme {
-                    let mut k = self.cfg.custom_themes.len() + 1;
-                    let name = loop {
-                        let n = format!("{} {}", t("Tema"), k);
-                        if !self.cfg.custom_themes.iter().any(|t| t.name == n) {
-                            break n;
-                        }
-                        k += 1;
-                    };
-                    if self.cfg.custom_themes.len() < 32 {
-                        let colors = self.pal.colors();
-                        self.cfg.custom_themes.push(crate::config::CustomTheme { name: name.clone(), dark: self.cfg.dark, colors });
-                        self.set_custom_theme(Some(name));
-                    }
-                }
                 if res_sort {
                     self.spawn_sort();
                 }
@@ -8532,6 +8672,11 @@ impl App {
                     self.opts_tab = 1;
                     self.dlg = Dlg::Options;
                 }
+                "temas" => {
+                    self.opts_tab = 2;
+                    self.dlg = Dlg::Options;
+                }
+                "del" => self.confirm_delete = Some(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]),
                 "props" => self.open_props(),
                 "keys" => self.dlg = Dlg::Keys,
                 "net" => self.connect_uri("smb://nas/media".into()),
