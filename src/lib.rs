@@ -68,7 +68,16 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
         vb = vb.with_position([x, y]);
     }
     // búfer de profundidad: lo necesita el visor 3D por GPU
-    eframe::NativeOptions { viewport: vb, depth_buffer: 24, ..Default::default() }
+    let mut o = eframe::NativeOptions { viewport: vb, depth_buffer: 24, ..Default::default() };
+    // En Wayland, eglSwapBuffers con vsync espera al aviso del compositor, que no llega mientras la
+    // ventana principal está tapada o en otro escritorio: el bucle entero se queda parado ahí y el
+    // visor (una ventana aparte, dibujada dentro del fotograma de la principal) deja de actualizarse
+    // aunque el audio siga sonando. Sin vsync el intercambio no bloquea; Wayland no produce
+    // «tearing», así que no se pierde nada.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        o.glow_options.vsync = false;
+    }
+    o
 }
 
 /// Instante de arranque del proceso (para la traza de rendimiento de FB_SHOT).

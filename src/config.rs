@@ -242,16 +242,22 @@ impl Config {
         if name.is_empty() {
             return None;
         }
+        // los temas de serie en la ranura contraria: «@Claro» / «@Oscuro»
+        if let Some(b) = name.strip_prefix('@') {
+            let dark = match b {
+                "Claro" => false,
+                "Oscuro" => true,
+                _ => return None,
+            };
+            return Some(CustomTheme { name: name.to_string(), dark, colors: crate::theme::palette(dark).colors() });
+        }
         self.custom_themes.iter().find(|t| t.name == name).cloned().or_else(|| crate::theme::presets().iter().find(|t| t.name == name).cloned())
     }
 
     /// Hace que `theme_custom` sea el tema de la ranura del modo vigente (`dark`), si existe y su base coincide.
     pub fn sync_active(&mut self) {
         let name = if self.dark { &self.theme_dark } else { &self.theme_light };
-        self.theme_custom = match self.theme_named(name) {
-            Some(t) if t.dark == self.dark => t.name,
-            _ => String::new(),
-        };
+        self.theme_custom = self.theme_named(name).map(|t| t.name).unwrap_or_default();
     }
 
     pub fn save(&self) {
@@ -332,13 +338,16 @@ mod theme_slot_tests {
     fn slots_follow_mode_and_base() {
         let mut c = Config::default();
         c.theme_dark = "Nord".into();
-        c.theme_light = "Nord".into(); // base oscura en la ranura clara: no vale
+        c.theme_light = "".into(); // vacío: el de serie
         c.dark = true;
         c.sync_active();
         assert_eq!(c.theme_custom, "Nord");
         c.dark = false;
         c.sync_active();
         assert_eq!(c.theme_custom, "");
+        c.theme_light = "@Oscuro".into(); // cualquier tema vale en cualquier ranura
+        c.sync_active();
+        assert_eq!(c.theme_custom, "@Oscuro");
         c.theme_light = "Paper".into();
         c.sync_active();
         assert_eq!(c.theme_custom, "Paper");
