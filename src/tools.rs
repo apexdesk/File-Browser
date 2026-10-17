@@ -168,7 +168,7 @@ pub fn all_roots() -> Vec<PathBuf> {
     }
 }
 
-fn pseudo_fs(p: &Path) -> bool {
+pub fn pseudo_fs(p: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(p.to_str(), Some("/proc" | "/sys" | "/dev" | "/run" | "/snap"))

@@ -3,6 +3,7 @@ use crate::trash;
 use crate::config::Config;
 use crate::i18n::{t, tf};
 use crate::extras;
+use crate::index;
 use crate::fsys::{self, Entry, Kind, LoadMsg, Op, Policy, Progress, SortKey, SortSpec};
 use crate::commands::{self, Cmd};
 use crate::preview::{self, Preview};
@@ -1035,6 +1036,9 @@ impl App {
         let ctx_for_inbox = ctx.clone();
         #[cfg(target_os = "macos")]
         let ctx_for_mac = ctx.clone();
+        if cfg.index_enabled {
+            index::start(tools::all_roots(), cc.egui_ctx.clone());
+        }
         let mut app = App {
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
@@ -1495,8 +1499,15 @@ impl App {
                 if q.is_empty() {
                     self.loading = false;
                 } else {
-                    let roots = if all { tools::all_roots() } else { vec![path] };
-                    self.search_st = Some(tools::spawn_search(roots, q, self.cfg.show_hidden, self.ctx.clone()));
+                    let indexed = if self.cfg.index_enabled {
+                        index::spawn_search(if all { None } else { Some(path.clone()) }, q.clone(), self.cfg.show_hidden, self.ctx.clone())
+                    } else {
+                        None
+                    };
+                    self.search_st = Some(indexed.unwrap_or_else(|| {
+                        let roots = if all { tools::all_roots() } else { vec![path] };
+                        tools::spawn_search(roots, q, self.cfg.show_hidden, self.ctx.clone())
+                    }));
                 }
             }
         }
@@ -7972,6 +7983,27 @@ impl App {
                             changed = true;
                         }
                         changed |= ui.checkbox(&mut self.cfg.restore_tabs, t("Restaurar las pestañas al iniciar")).changed();
+                        if ui.checkbox(&mut self.cfg.index_enabled, t("Búsqueda indexada (instantánea)")).changed() {
+                            changed = true;
+                            if self.cfg.index_enabled {
+                                index::start(tools::all_roots(), ctx.clone());
+                            } else {
+                                index::disable();
+                            }
+                        }
+                        if self.cfg.index_enabled {
+                            ui.horizontal(|ui| {
+                                let txt = match index::status() {
+                                    index::Status::Off => String::new(),
+                                    index::Status::Building(n) => tf("Indexando… {} elementos", &[&n]),
+                                    index::Status::Ready(n, secs) => tf("{} elementos · actualizado hace {} min", &[&n, &(secs / 60)]),
+                                };
+                                ui.label(egui::RichText::new(txt).size(12.0).color(pal.subtle));
+                                if ui.small_button(t("Reindexar")).clicked() {
+                                    index::rebuild(tools::all_roots(), ctx.clone());
+                                }
+                            });
+                        }
                         changed |= ui.checkbox(&mut self.cfg.preview_window, t("Abrir el visor en una ventana aparte")).changed();
                         changed |= ui.checkbox(&mut self.cfg.native_deco, t("Usar la barra de título del sistema (requiere reiniciar)")).changed();
                         ui.add_space(6.0);
@@ -8626,6 +8658,12 @@ impl eframe::App for App {
             self.swap_pane();
         }
         self.tick_theme();
+        if self.cfg.index_enabled {
+            index::tick(tools::all_roots(), &ctx);
+            if matches!(index::status(), index::Status::Building(_)) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
         self.drain_inbox();
         if self.cfg.theme_mode == 0 {
             if let Some(dark) = self.system_dark() {

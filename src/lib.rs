@@ -2,6 +2,7 @@
 pub mod app;
 pub mod archive;
 pub mod audio;
+pub mod index;
 pub mod commands;
 pub mod diskusage;
 pub mod dragout;

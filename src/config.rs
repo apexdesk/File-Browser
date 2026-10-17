@@ -36,6 +36,7 @@ pub struct Config {
     pub show_menu_btn: bool,
     pub lang: String,
     pub restore_tabs: bool,
+    pub index_enabled: bool,
     pub preview_window: bool,
     /// Columnas de la vista de lista (aparte del nombre), de izquierda a derecha: date, size, kind.
     pub columns: Vec<String>,
@@ -84,6 +85,7 @@ impl Default for Config {
             show_menu_btn: true,
             lang: "auto".into(),
             restore_tabs: true,
+            index_enabled: false,
             preview_window: true,
             columns: vec!["date".into(), "size".into(), "kind".into()],
             col_w: Vec::new(),
@@ -174,6 +176,7 @@ impl Config {
                 "menu_btn" => c.show_menu_btn = v != "0",
                 "lang" => c.lang = v.to_string(),
                 "restore_tabs" => c.restore_tabs = v != "0",
+                "index_enabled" => c.index_enabled = v == "1",
                 "preview_window" => c.preview_window = v != "0",
                 "single_click" => c.single_click = Some(v == "1"),
                 "columns" => {
@@ -248,6 +251,7 @@ impl Config {
         s.push_str(&format!("menu_btn={}\n", self.show_menu_btn as u8));
         s.push_str(&format!("lang={}\n", self.lang));
         s.push_str(&format!("restore_tabs={}\n", self.restore_tabs as u8));
+        s.push_str(&format!("index_enabled={}\n", self.index_enabled as u8));
         s.push_str(&format!("preview_window={}\n", self.preview_window as u8));
         if let Some(v) = self.single_click {
             s.push_str(&format!("single_click={}\n", v as u8));
