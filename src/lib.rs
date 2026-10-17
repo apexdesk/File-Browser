@@ -15,6 +15,7 @@ pub mod config;
 pub mod extras;
 pub mod fsys;
 pub mod i18n;
+pub mod mesh3d;
 pub mod netmount;
 pub mod i18n_table;
 pub mod preview;
