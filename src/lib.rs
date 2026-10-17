@@ -26,6 +26,7 @@ mod dragout_macos;
 pub mod config;
 pub mod extras;
 pub mod fsys;
+pub mod gpu3d;
 pub mod i18n;
 pub mod mesh3d;
 pub mod netmount;
@@ -63,7 +64,8 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
     }) {
         vb = vb.with_position([x, y]);
     }
-    eframe::NativeOptions { viewport: vb, ..Default::default() }
+    // búfer de profundidad: lo necesita el visor 3D por GPU
+    eframe::NativeOptions { viewport: vb, depth_buffer: 24, ..Default::default() }
 }
 
 /// Instante de arranque del proceso (para la traza de rendimiento de FB_SHOT).

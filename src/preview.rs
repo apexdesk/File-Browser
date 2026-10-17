@@ -121,6 +121,8 @@ struct MeshView {
     dragging: bool,
     /// imagen en preparación en otro hilo (el visor no se bloquea al dibujar)
     job: Option<(MeshKey, std::sync::mpsc::Receiver<Vec<u8>>)>,
+    /// dibujo por GPU (si falla se usa el software)
+    gpu: crate::gpu3d::Shared,
 }
 
 type MeshKey = (usize, usize, i32, i32, i32, bool, bool);
@@ -515,7 +517,7 @@ impl Preview {
                     Body::Archive { rows, truncated: l.truncated }
                 }
                 Raw::Mesh(m) => {
-                    self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false, job: None });
+                    self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false, job: None, gpu: crate::gpu3d::shared() });
                     Body::Mesh
                 }
                 Raw::Doc => {
@@ -1147,6 +1149,23 @@ impl Preview {
             }
         }
         mv.dragging = moving || (hot && down && mv.dragging);
+        if !crate::gpu3d::failed(&mv.gpu) {
+            // GPU: fondo y luego la malla en un callback de OpenGL
+            p.rect_filled(area, CornerRadius::same(10), pal.bg);
+            let base = if dark { [150.0 / 255.0, 185.0 / 255.0, 1.0] } else { [70.0 / 255.0, 110.0 / 255.0, 220.0 / 255.0] };
+            let cam = crate::gpu3d::Cam { yaw: mv.yaw, pitch: mv.pitch, zoom: mv.zoom, base };
+            p.add(crate::gpu3d::callback(area, mv.mesh.clone(), mv.gpu.clone(), cam));
+            if crate::gpu3d::pending(&mv.gpu) {
+                ctx.request_repaint(); // si la GPU falla en la primera pasada se pasa al software
+            }
+            let m = &mv.mesh;
+            let info = tf(
+                "{} triángulos · {} × {} × {}",
+                &[&m.count(), &format!("{:.4}", m.size[0]).trim_end_matches('0').trim_end_matches('.'), &format!("{:.4}", m.size[1]).trim_end_matches('0').trim_end_matches('.'), &format!("{:.4}", m.size[2]).trim_end_matches('0').trim_end_matches('.')],
+            );
+            p.text(pos2(area.left() + 12.0, area.bottom() - 10.0), Align2::LEFT_BOTTOM, info, FontId::proportional(12.0), pal.subtle);
+            return;
+        }
         // al arrastrar se dibuja a media resolución y con menos triángulos
         let full = !mv.dragging;
         let div = if full { 1.0 } else { 2.0 };
