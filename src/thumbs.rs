@@ -205,6 +205,7 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
             }
         }
         "svg" => return decode_svg(path, max),
+        e if crate::docview::is_doc_ext(e) => return crate::docview::thumb(path, max),
         e if is_video_ext(e) => return ffmpeg_frame(path, max, true),
         "png" | "gif" | "webp" | "bmp" => {}
         _ => return ffmpeg_frame(path, max, false).or_else(|| magick_frame(path, max)),

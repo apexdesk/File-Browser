@@ -25,6 +25,8 @@ enum Raw {
     Archive(crate::archive::Listing),
     Binary,
     Mesh(crate::mesh3d::Mesh),
+    /// documento de oficina o PDF (el estado vive en `Preview::doc`)
+    Doc,
     Err(String),
 }
 
@@ -37,6 +39,8 @@ pub enum Body {
     Info,
     /// modelo 3D (el estado vive en `Preview::mesh`)
     Mesh,
+    /// documento paginado (el estado vive en `Preview::doc`)
+    Doc,
     Error(String),
 }
 
@@ -53,6 +57,7 @@ pub struct Preview {
     pub player: Option<crate::video::Player>,
     pub audio: Option<crate::audio::AudioPlayer>,
     mesh: Option<MeshView>,
+    doc: Option<crate::docview::DocView>,
     zoom: f32,
     pan: egui::Vec2,
     scroll: f32,
@@ -135,6 +140,9 @@ fn fmt_secs(s: f64) -> String {
 }
 
 fn load(job: &Job) -> Raw {
+    if job.kind != Kind::Folder && crate::docview::is_doc_path(&job.path) && !crate::sftp::is_remote(&job.path) {
+        return Raw::Doc;
+    }
     if let Some(ext) = job.path.extension().and_then(|e| e.to_str()) {
         if job.kind == Kind::Other && crate::mesh3d::is_mesh_ext(ext) && !crate::sftp::is_remote(&job.path) {
             return match crate::mesh3d::load(&job.path) {
@@ -229,6 +237,7 @@ impl Preview {
             player: None,
             audio: None,
             mesh: None,
+            doc: None,
             last_pos: None,
             zoom: 1.0,
             pan: vec2(0.0, 0.0),
@@ -291,6 +300,9 @@ impl Preview {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
+        if let Some(d) = &mut self.doc {
+            d.poll(ctx);
+        }
         while let Ok((generation, raw)) = w.rx.try_recv() {
             if generation != self.generation {
                 continue;
@@ -310,6 +322,10 @@ impl Preview {
                 Raw::Mesh(m) => {
                     self.mesh = Some(MeshView { mesh: Arc::new(m), yaw: -0.6, pitch: 0.5, zoom: 1.0, tex: None, key: None, dragging: false });
                     Body::Mesh
+                }
+                Raw::Doc => {
+                    self.doc = Some(crate::docview::DocView::new(ctx, &self.path));
+                    Body::Doc
                 }
                 Raw::Binary => Body::Info,
                 Raw::Err(e) => Body::Error(e),
@@ -423,6 +439,8 @@ impl Preview {
             Align2::CENTER_CENTER,
             if touch {
                 t("Atrás o toque fuera: cerrar   ·   Pellizca: zoom   ·   Doble toque: ajustar")
+            } else if matches!(self.body, Body::Doc) {
+                t("Re Pág / Av Pág: página   ·   Rueda: cambiar de página   ·   Ctrl+rueda: zoom   ·   Flechas: anterior / siguiente archivo   ·   Esc: cerrar")
             } else if matches!(self.body, Body::Mesh) {
                 t("Arrastrar: girar   ·   Rueda: zoom   ·   Doble clic: restablecer   ·   Flechas: anterior / siguiente   ·   Esc: cerrar")
             } else if self.can_play() {
@@ -596,6 +614,7 @@ impl Preview {
                 }
             }
             Body::Mesh => self.draw_mesh(ctx, &cp, content, pal, in_content),
+            Body::Doc => self.draw_doc(ctx, &cp, content, pal, in_content, clicked.then_some(pointer).flatten()),
             Body::Info if self.kind == Kind::Audio => {
                 let c = pos2(content.center().x, content.center().y - 50.0);
                 let r = Rect::from_center_size(c, vec2(180.0, 180.0));
@@ -816,6 +835,78 @@ impl Preview {
         }
     }
 
+    /// Documento paginado: página ajustada al área, con zoom, y barra de páginas abajo.
+    fn draw_doc(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, click: Option<Pos2>) {
+        let ppp = ctx.pixels_per_point();
+        let (dy, ctrl, pg, home, end) = ctx.input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.modifiers.command,
+                i.key_pressed(egui::Key::PageDown) as isize - i.key_pressed(egui::Key::PageUp) as isize,
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+            )
+        });
+        let Some(doc) = &mut self.doc else { return };
+        doc.poll(ctx);
+        let mut step = pg;
+        if hot && !ctrl && dy != 0.0 {
+            self.scroll += dy;
+            if self.scroll.abs() >= 60.0 {
+                step -= (self.scroll / 60.0).trunc() as isize;
+                self.scroll = 0.0;
+            }
+        }
+        if step != 0 {
+            doc.step(step);
+            self.zoom = 1.0;
+            self.pan = vec2(0.0, 0.0);
+        }
+        if home {
+            doc.goto(0);
+        }
+        if end {
+            doc.goto(usize::MAX);
+        }
+        // dibuja con la resolución necesaria para el zoom actual
+        doc.want(area.width() * ppp * self.zoom.max(1.0));
+        let tex = doc.texture().map(|t| (t.id(), t.size_vec2()));
+        let (count, page, error, busy) = (doc.count, doc.page, doc.error.clone(), doc.busy());
+        let mut nav = 0isize;
+        if let Some((id, sz)) = tex {
+            self.draw_zoomable(ctx, p, area, id, sz, hot);
+        }
+        if let Some(e) = error {
+            p.text(area.center(), Align2::CENTER_CENTER, e, FontId::proportional(15.0), pal.subtle);
+        } else if tex.is_none() {
+            p.text(area.center(), Align2::CENTER_CENTER, t("Cargando documento…"), FontId::proportional(14.0), pal.subtle);
+        }
+        if count > 1 {
+            let label = format!("{} / {}", page + 1, count);
+            let w = 150.0;
+            let bar = Rect::from_center_size(pos2(area.center().x, area.bottom() - 22.0), vec2(w, 30.0));
+            p.rect_filled(bar, CornerRadius::same(15), Color32::from_black_alpha(150));
+            p.text(bar.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), Color32::WHITE);
+            for (dx, glyph, d) in [(-w / 2.0 + 18.0, "‹", -1isize), (w / 2.0 - 18.0, "›", 1isize)] {
+                let r = Rect::from_center_size(pos2(bar.center().x + dx, bar.center().y), vec2(30.0, 30.0));
+                if click.map(|q| r.contains(q)).unwrap_or(false) {
+                    nav = d;
+                }
+                p.text(r.center() + vec2(0.0, -1.5), Align2::CENTER_CENTER, glyph, FontId::proportional(22.0), Color32::WHITE);
+            }
+        }
+        if nav != 0 {
+            if let Some(doc) = &mut self.doc {
+                doc.step(nav);
+            }
+            self.zoom = 1.0;
+            self.pan = vec2(0.0, 0.0);
+        }
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    }
+
     fn draw_zoomable(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, tex: egui::TextureId, sz: egui::Vec2, hot: bool) {
         if hot {
             let pinch = ctx.input(|i| i.zoom_delta());
@@ -829,7 +920,8 @@ impl Preview {
                     i.pointer.button_double_clicked(egui::PointerButton::Primary),
                 )
             });
-            if dy != 0.0 {
+            // en documentos la rueda cambia de página; el zoom va con Ctrl+rueda o pellizco
+            if dy != 0.0 && self.doc.is_none() {
                 self.zoom = (self.zoom * (dy * 0.0015).exp()).clamp(0.25, 24.0);
             }
             self.pan += drag;

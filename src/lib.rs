@@ -5,6 +5,7 @@ pub mod audio;
 pub mod index;
 pub mod commands;
 pub mod diskusage;
+pub mod docview;
 pub mod dragout;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 mod dragout_linux;
