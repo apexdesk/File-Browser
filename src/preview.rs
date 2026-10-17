@@ -506,7 +506,7 @@ impl Preview {
             }
             self.body = match raw {
                 Raw::Image(d) => {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([d.w, d.h], &d.rgba);
+                    let img = crate::thumbs::color_image(ctx, d.w, d.h, &d.rgba);
                     Body::Image(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR))
                 }
                 Raw::Text(lines, truncated) => Body::Text { lines, truncated },

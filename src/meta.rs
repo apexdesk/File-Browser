@@ -190,7 +190,7 @@ fn children(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
         } else if size == 0 {
             size = b.len() - i;
         }
-        if size < head || i + size > b.len() {
+        if size < head || size > b.len() - i {
             break;
         }
         out.push((ty, &b[i + head..i + size]));
@@ -273,7 +273,7 @@ fn mp4(path: &Path, v: &mut Vid) -> bool {
     let Some(moov) = moov else { return false };
     let top = children(&moov);
     if let Some(m) = find(&top, b"mvhd") {
-        let (ts, d) = if m[0] == 1 && m.len() >= 32 { (be32(&m[20..]) as f64, be64(&m[24..]) as f64) } else if m.len() >= 20 { (be32(&m[12..]) as f64, be32(&m[16..]) as f64) } else { (0.0, 0.0) };
+        let (ts, d) = if m.first() == Some(&1) && m.len() >= 32 { (be32(&m[20..]) as f64, be64(&m[24..]) as f64) } else if m.len() >= 20 { (be32(&m[12..]) as f64, be32(&m[16..]) as f64) } else { (0.0, 0.0) };
         if ts > 0.0 {
             v.dur = d / ts;
         }
@@ -301,13 +301,13 @@ fn mp4(path: &Path, v: &mut Vid) -> bool {
                     }
                 }
                 if let Some(t) = find(&tc, b"tkhd") {
-                    let off = if t[0] == 1 { 88 } else { 76 };
+                    let off = if t.first() == Some(&1) { 88 } else { 76 };
                     if t.len() >= off + 8 && be32(&t[off..]) >> 16 > 0 {
                         v.w = be32(&t[off..]) >> 16;
                         v.h = be32(&t[off + 4..]) >> 16;
                     }
                 }
-                let ts = find(&mc, b"mdhd").map(|m| if m[0] == 1 && m.len() >= 32 { (be32(&m[20..]) as f64, be64(&m[24..]) as f64) } else if m.len() >= 20 { (be32(&m[12..]) as f64, be32(&m[16..]) as f64) } else { (0.0, 0.0) });
+                let ts = find(&mc, b"mdhd").map(|m| if m.first() == Some(&1) && m.len() >= 32 { (be32(&m[20..]) as f64, be64(&m[24..]) as f64) } else if m.len() >= 20 { (be32(&m[12..]) as f64, be32(&m[16..]) as f64) } else { (0.0, 0.0) });
                 let count = find(&sc, b"stsz").filter(|s| s.len() >= 12).map(|s| be32(&s[8..]) as f64);
                 if let (Some((ts, d)), Some(n)) = (ts, count) {
                     if ts > 0.0 && d > 0.0 {

@@ -149,6 +149,8 @@ pub const TABLE: &[[&str; 10]] = &[
     ["Permisos", "Permissions", "Autorisations", "Berechtigungen", "Permissões", "Permessi", "Права доступа", "权限", "アクセス権", "권한"],
     ["Nuevo archivo", "New file", "Nouveau fichier", "Neue Datei", "Novo ficheiro", "Nuovo file", "Новый файл", "新建文件", "新しいファイル", "새 파일"],
     ["Crear", "Create", "Créer", "Erstellen", "Criar", "Crea", "Создать", "创建", "作成", "만들기"],
+    ["Renombrar en lote sólo funciona dentro de una carpeta normal", "Batch rename only works inside a regular folder", "Le renommage par lot ne fonctionne que dans un dossier normal", "Stapelumbenennung funktioniert nur in einem normalen Ordner", "Renomear em lote só funciona numa pasta normal", "La rinomina in blocco funziona solo in una cartella normale", "Пакетное переименование работает только в обычной папке", "批量重命名仅适用于普通文件夹", "一括リネームは通常のフォルダー内でのみ使えます", "일괄 이름 바꾸기는 일반 폴더에서만 작동합니다"],
+    ["ya existe", "already exists", "existe déjà", "existiert bereits", "já existe", "esiste già", "уже существует", "已存在", "既に存在します", "이미 있음"],
     ["Nombre no válido", "Invalid name", "Nom non valide", "Ungültiger Name", "Nome inválido", "Nome non valido", "Недопустимое имя", "名称无效", "無効な名前", "잘못된 이름"],
     ["No se pudo crear el archivo: {e}", "Could not create file: {e}", "Impossible de créer le fichier : {e}", "Datei konnte nicht erstellt werden: {e}", "Não foi possível criar o ficheiro: {e}", "Impossibile creare il file: {e}", "Не удалось создать файл: {e}", "无法创建文件：{e}", "ファイルを作成できませんでした: {e}", "파일을 만들 수 없음: {e}"],
     ["Renombrar en lote", "Batch rename", "Renommer en lot", "Stapelumbenennung", "Mudar nomes em lote", "Rinomina in blocco", "Пакетное переименование", "批量重命名", "一括名前変更", "일괄 이름 바꾸기"],

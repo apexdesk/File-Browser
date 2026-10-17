@@ -11,6 +11,7 @@ const MAX_COLS: usize = 120;
 
 struct Db {
     f: File,
+    visits: u32,
     page: usize,
     usable: usize,
     pages: u64,
@@ -78,7 +79,7 @@ impl Db {
         }
         let usable = page - h[20] as usize;
         let len = f.metadata().ok()?.len();
-        Some(Db { f, page, usable, pages: len / page as u64, enc: u32::from_be_bytes([h[56], h[57], h[58], h[59]]) })
+        Some(Db { f, visits: 0, page, usable, pages: len / page as u64, enc: u32::from_be_bytes([h[56], h[57], h[58], h[59]]) })
     }
 
     fn page(&mut self, n: u64) -> Option<Vec<u8>> {
@@ -160,20 +161,25 @@ impl Db {
 
     /// Recorre un árbol B de tabla en orden de clave y entrega (rowid, valores).
     fn walk(&mut self, root: u64, limit: usize, out: &mut Vec<(i64, Vec<Val>)>, depth: u32) -> Option<()> {
-        if depth > 12 || out.len() >= limit {
+        if depth == 0 {
+            self.visits = 0;
+        }
+        // un archivo con páginas que se apuntan entre sí no puede hacernos dar vueltas sin fin
+        self.visits += 1;
+        if depth > 12 || out.len() >= limit || self.visits > 20_000 {
             return Some(());
         }
         let page = self.page(root)?;
         let hdr = if root == 1 { 100 } else { 0 };
-        let kind = page[hdr];
-        let n = u16::from_be_bytes([page[hdr + 3], page[hdr + 4]]) as usize;
+        let kind = *page.get(hdr)?;
+        let n = u16::from_be_bytes([*page.get(hdr + 3)?, *page.get(hdr + 4)?]) as usize;
         match kind {
             0x0d => {
                 for i in 0..n {
                     if out.len() >= limit {
                         break;
                     }
-                    let cp = u16::from_be_bytes([page[hdr + 8 + 2 * i], page[hdr + 9 + 2 * i]]) as usize;
+                    let cp = u16::from_be_bytes([*page.get(hdr + 8 + 2 * i)?, *page.get(hdr + 9 + 2 * i)?]) as usize;
                     let (size, a) = varint(page.get(cp..)?)?;
                     let (rowid, b) = varint(page.get(cp + a..)?)?;
                     if size as usize > 64 << 20 {
@@ -187,7 +193,7 @@ impl Db {
             }
             0x05 => {
                 for i in 0..n {
-                    let cp = u16::from_be_bytes([page[hdr + 12 + 2 * i], page[hdr + 13 + 2 * i]]) as usize;
+                    let cp = u16::from_be_bytes([*page.get(hdr + 12 + 2 * i)?, *page.get(hdr + 13 + 2 * i)?]) as usize;
                     let child = be(page.get(cp..cp + 4)?);
                     self.walk(child, limit, out, depth + 1)?;
                     if out.len() >= limit {
