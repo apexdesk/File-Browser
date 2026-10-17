@@ -3028,7 +3028,7 @@ fn menu_row(ui: &mut egui::Ui, pal: &Pal, text: &str, on: bool, asc: Option<bool
     if let (true, Some(asc)) = (on, asc) {
         // triángulo de dirección de orden, como en la cabecera de la lista
         let c = pos2(rect.right() - 14.0, rect.center().y);
-        let d = if asc { -1.0 } else { 1.0 };
+        let d = if asc { 1.0 } else { -1.0 };
         p.add(egui::Shape::convex_polygon(
             vec![c + vec2(-4.0, 2.5 * d), c + vec2(4.0, 2.5 * d), c + vec2(0.0, -2.5 * d)],
             col,
@@ -4419,7 +4419,7 @@ impl App {
             let mut r = p.text(pos2(*x, rect.center().y), *al, *label, FontId::proportional(12.5), col);
             if active {
                 let c = pos2(r.right() + 10.0, rect.center().y);
-                let d = if self.cfg.asc { -1.0 } else { 1.0 };
+                let d = if self.cfg.asc { 1.0 } else { -1.0 };
                 p.add(egui::Shape::convex_polygon(
                     vec![c + vec2(-4.0, 2.5 * d), c + vec2(4.0, 2.5 * d), c + vec2(0.0, -2.5 * d)],
                     col,
@@ -8759,6 +8759,7 @@ impl eframe::App for App {
             }
             if path == self.cwd {
                 if self.vmode == VMode::Dir && !self.loading && self.op.is_none() && self.rename.is_none() && self.preview.is_none() && m != self.dir_mtime {
+                    index::mark_dirty();
                     self.refresh();
                 }
             } else if self.other.as_deref().map(|o| o.cwd == path && o.vmode == VMode::Dir && !o.loading && m != o.dir_mtime).unwrap_or(false)

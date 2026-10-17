@@ -164,6 +164,21 @@ static BUILDING: AtomicBool = AtomicBool::new(false);
 static PROGRESS: AtomicUsize = AtomicUsize::new(0);
 static LOADING: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Milisegundos Unix del último cambio detectado en el disco (0 = ninguno pendiente).
+static DIRTY: AtomicU64 = AtomicU64::new(0);
+/// Cambios más recientes que esto se esperan antes de re-indexar (agrupa ráfagas).
+const SETTLE_MS: u64 = 3000;
+/// Separación mínima entre dos recorridos provocados por cambios.
+const MIN_GAP_SECS: u64 = 30;
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Avisa de que algo cambió en el disco: el índice se refrescará en breve.
+pub fn mark_dirty() {
+    DIRTY.store(now_ms().max(1), AO::Relaxed);
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Status {
@@ -203,6 +218,7 @@ pub fn ready() -> bool {
 /// Libera el índice de memoria y borra el fichero guardado.
 pub fn disable() {
     GENERATION.fetch_add(1, AO::SeqCst);
+    watch::stop();
     if let Ok(mut g) = CURRENT.write() {
         *g = None;
     }
@@ -221,9 +237,11 @@ pub fn start(roots: Vec<PathBuf>, ctx: egui::Context) {
         if let Some(idx) = Index::load(&cache_file()) {
             if idx.roots() == roots && GENERATION.load(AO::SeqCst) == gener {
                 PROGRESS.store(idx.count(), AO::Relaxed);
+                let idx = Arc::new(idx);
                 if let Ok(mut g) = CURRENT.write() {
-                    *g = Some(Arc::new(idx));
+                    *g = Some(idx.clone());
                 }
+                watch::restart(idx);
             }
         }
         LOADING.store(false, AO::SeqCst);
@@ -240,8 +258,13 @@ pub fn tick(roots: Vec<PathBuf>, ctx: &egui::Context) {
         return;
     }
     if let Some(i) = current() {
-        if now().saturating_sub(i.built) > STALE_SECS {
+        let age = now().saturating_sub(i.built);
+        let d = DIRTY.load(AO::Relaxed);
+        let changed = d != 0 && now_ms().saturating_sub(d) >= SETTLE_MS && age >= MIN_GAP_SECS;
+        if age > STALE_SECS || changed {
             rebuild(roots, ctx.clone());
+        } else if d != 0 {
+            ctx.request_repaint_after(Duration::from_millis(SETTLE_MS));
         }
     }
 }
@@ -262,6 +285,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
     }
     let gener = GENERATION.load(AO::SeqCst);
     PROGRESS.store(0, AO::Relaxed);
+    let started = now_ms();
     std::thread::spawn(move || {
         let mut idx = Index::default();
         let mut stack = Vec::new();
@@ -290,9 +314,15 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
             idx.parent.shrink_to_fit();
             idx.dir.shrink_to_fit();
             idx.save(&cache_file());
+            let idx = Arc::new(idx);
             if let Ok(mut g) = CURRENT.write() {
-                *g = Some(Arc::new(idx));
+                *g = Some(idx.clone());
             }
+            // los cambios anteriores al recorrido ya están reflejados
+            if DIRTY.load(AO::Relaxed) < started {
+                DIRTY.store(0, AO::Relaxed);
+            }
+            watch::restart(idx);
         }
         BUILDING.store(false, AO::SeqCst);
         ctx.request_repaint();
@@ -353,6 +383,108 @@ fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: 
             ctx.request_repaint();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vigilancia de cambios (inotify en Linux)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod watch {
+    use super::*;
+
+    static WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+
+    pub fn stop() {
+        WATCH_GEN.fetch_add(1, AO::SeqCst);
+    }
+
+    /// Carpetas que no merece vigilar: producen ráfagas constantes de cambios sin interés para buscar.
+    fn noisy(name: &str) -> bool {
+        matches!(name, ".git" | "node_modules" | "target" | ".cache" | ".cargo" | ".rustup")
+    }
+
+    pub fn restart(idx: Arc<Index>) {
+        let gen_id = WATCH_GEN.fetch_add(1, AO::SeqCst) + 1;
+        std::thread::spawn(move || run(idx, gen_id));
+    }
+
+    fn run(idx: Arc<Index>, gen_id: u64) {
+        let limit = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(8192);
+        // dejamos la mitad del cupo del usuario para el resto de programas
+        let budget = (limit / 2).min(100_000);
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return;
+        }
+        // las carpetas más cercanas a la raíz primero: son las que más cambian de interés
+        let n = idx.count();
+        let mut depth = vec![u8::MAX; n];
+        let mut dirs: Vec<(u8, u32)> = Vec::new();
+        for i in 0..n {
+            if !idx.dir[i] {
+                continue;
+            }
+            let (mut d, mut cur, mut skip) = (0u32, i, false);
+            while idx.parent[cur] != NO_PARENT {
+                if noisy(idx.name(cur)) {
+                    skip = true;
+                    break;
+                }
+                d += 1;
+                cur = idx.parent[cur] as usize;
+            }
+            if !skip {
+                depth[i] = d.min(254) as u8;
+                dirs.push((depth[i], i as u32));
+            }
+        }
+        dirs.sort_unstable();
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+        let mut added = 0usize;
+        for (_, id) in dirs {
+            if WATCH_GEN.load(AO::SeqCst) != gen_id {
+                unsafe { libc::close(fd) };
+                return;
+            }
+            if added >= budget {
+                break;
+            }
+            let p = idx.path_of(id as usize);
+            if crate::tools::pseudo_fs(&p) {
+                continue;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { continue };
+            if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) } >= 0 {
+                added += 1;
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC) {
+                break;
+            }
+        }
+        let mut buf = vec![0u8; 16 * 1024];
+        while WATCH_GEN.load(AO::SeqCst) == gen_id {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let r = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if r > 0 {
+                let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if got > 0 {
+                    mark_dirty();
+                }
+            }
+        }
+        unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod watch {
+    use super::*;
+    pub fn stop() {}
+    pub fn restart(_idx: Arc<Index>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -472,5 +604,26 @@ mod tests {
         }
         eprintln!("búsqueda: {} resultados en {:?}", s.results.lock().unwrap().len(), t.elapsed());
         let _ = std::fs::remove_file(cache_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_marks_dirty() {
+        let d = std::env::temp_dir().join(format!("fbwatch{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let mut ix = Index::default();
+        let r = ix.push(&d.to_string_lossy(), NO_PARENT, true);
+        ix.push("sub", r, true);
+        DIRTY.store(0, AO::Relaxed);
+        watch::restart(Arc::new(ix));
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(d.join("sub/nuevo.txt"), "x").unwrap();
+        let t = std::time::Instant::now();
+        while DIRTY.load(AO::Relaxed) == 0 && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        watch::stop();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(DIRTY.load(AO::Relaxed) != 0);
     }
 }
