@@ -2027,7 +2027,7 @@ impl App {
             self.open_archive(p);
         } else if is_program(&p) {
             self.run_program(&p);
-        } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text) {
+        } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text | Kind::Doc | Kind::Audio | Kind::Video) {
             self.note_recent(&p);
             self.open_preview_at(i);
         } else {
