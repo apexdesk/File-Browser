@@ -96,12 +96,10 @@ pub fn palette_of(th: &crate::config::CustomTheme) -> Pal {
 
 /// Paleta vigente: la del tema activo (propio o predefinido) si coincide con el modo, o la de serie.
 pub fn resolve(cfg: &crate::config::Config, dark: bool) -> Pal {
-    if let Some(th) = cfg.theme_named(&cfg.theme_custom) {
-        if th.dark == dark {
-            return palette_of(&th);
-        }
+    match cfg.theme_named(&cfg.theme_custom) {
+        Some(th) => palette_of(&th),
+        None => palette(dark),
     }
-    palette(dark)
 }
 
 /// Temas predefinidos (de solo lectura; se pueden duplicar para editarlos). Los nombres son nombres propios y
@@ -730,4 +728,110 @@ pub fn modal_card(
                 actions(ui);
             });
         });
+}
+
+// ---------------------------------------------------------------------------
+// Ventanas con tarjeta (Opciones…), pestañas en píldora e iconos de botón
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    Close,
+    Copy,
+    Trash,
+}
+
+/// Botón cuadrado de solo icono (dibujado con trazos, sin depender de la fuente).
+pub fn icon_button(ui: &mut egui::Ui, p: &Pal, icon: Icon, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 8.0, p.hover);
+    }
+    let col = if icon == Icon::Trash && resp.hovered() { Color32::from_rgb(226, 86, 86) } else if resp.hovered() { p.text } else { p.subtle };
+    let st = Stroke::new(1.6, col);
+    let c = rect.center();
+    let pt = ui.painter();
+    match icon {
+        Icon::Close => {
+            pt.line_segment([c + vec2(-5.0, -5.0), c + vec2(5.0, 5.0)], st);
+            pt.line_segment([c + vec2(-5.0, 5.0), c + vec2(5.0, -5.0)], st);
+        }
+        Icon::Copy => {
+            pt.rect_stroke(Rect::from_min_size(c + vec2(-2.0, -7.0), vec2(9.0, 9.0)), 2.0, st, egui::StrokeKind::Middle);
+            pt.rect_stroke(Rect::from_min_size(c + vec2(-7.0, -2.0), vec2(9.0, 9.0)), 2.0, st, egui::StrokeKind::Middle);
+        }
+        Icon::Trash => {
+            pt.line_segment([c + vec2(-6.0, -4.0), c + vec2(6.0, -4.0)], st);
+            pt.line_segment([c + vec2(-2.0, -6.5), c + vec2(2.0, -6.5)], st);
+            pt.rect_stroke(Rect::from_min_max(c + vec2(-4.5, -4.0), c + vec2(4.5, 7.0)), 2.0, st, egui::StrokeKind::Middle);
+        }
+    }
+    resp
+}
+
+/// Pestañas en píldora; devuelve true si cambió la selección.
+pub fn tab_bar(ui: &mut egui::Ui, p: &Pal, sel: &mut u8, labels: &[&str]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, l) in labels.iter().enumerate() {
+            let font = egui::FontId::proportional(14.0);
+            let active = *sel == i as u8;
+            let col = if active { p.accent } else { p.subtle };
+            let g = ui.painter().layout_no_wrap(l.to_string(), font, col);
+            let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 28.0, 30.0), egui::Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if active {
+                ui.painter().rect_filled(rect, 15.0, p.sel);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, 15.0, p.hover);
+            }
+            ui.painter().galley(rect.center() - g.size() / 2.0, g, col);
+            if resp.clicked() && !active {
+                *sel = i as u8;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Encabezado de sección: texto pequeño y atenuado.
+pub fn section(ui: &mut egui::Ui, p: &Pal, text: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(text.to_uppercase()).size(11.0).strong().color(p.subtle));
+    ui.add_space(2.0);
+}
+
+/// Ventana centrada con tarjeta redondeada y cabecera (título + cerrar). `open` pasa a false al cerrarla.
+pub fn card_window(ctx: &egui::Context, p: &Pal, title: &str, width: f32, open: &mut bool, body: impl FnOnce(&mut egui::Ui)) {
+    let frame = egui::Frame::new()
+        .fill(p.panel)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(16))
+        .shadow(ctx.global_style().visuals.window_shadow)
+        .inner_margin(egui::Margin::same(20));
+    egui::Window::new(title)
+        .title_bar(false)
+        .frame(frame)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).size(18.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, p, Icon::Close, crate::i18n::t("Cerrar")).clicked() {
+                        *open = false;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            body(ui);
+        });
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && ctx.memory(|m| m.focused().is_none()) {
+        *open = false;
+    }
 }

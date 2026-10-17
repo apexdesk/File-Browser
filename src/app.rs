@@ -6704,144 +6704,155 @@ impl App {
         }
     }
 
-    /// Pestaña «Temas» de Opciones: lista de temas (los de serie siempre están), cada uno claro u oscuro;
-    /// al elegir uno pasa a ser el de su modo.
-    fn themes_tab(&mut self, ui: &mut egui::Ui) -> bool {
+    /// Pestaña «Temas» de Opciones: una lista con los dos de serie arriba, los predefinidos y los propios.
+    /// Cada tema tiene dos casillas: si hace de tema claro y/o de tema oscuro. Los de serie nunca se pierden
+    /// ni se editan; solo los propios tienen colores editables (los demás se duplican).
+    fn themes_tab(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
         let pal = self.pal;
         let mut changed = false;
-        // (nombre, ¿oscuro?, origen 0 serie / 1 predefinido / 2 propio, colores)
-        let mut rows: Vec<(String, bool, u8, [[u8; 3]; 9])> = Vec::new();
-        rows.push((t("Claro").to_string(), false, 0, theme::palette(false).colors()));
-        rows.push((t("Oscuro").to_string(), true, 0, theme::palette(true).colors()));
-        for th in crate::theme::presets() {
-            rows.push((th.name.clone(), th.dark, 1, th.colors));
-        }
+        // (nombre, origen 0 serie / 1 predefinido / 2 propio, colores, clave en ranura clara, clave en ranura oscura)
+        let mut rows: Vec<(String, u8, [[u8; 3]; 9], String, String)> = Vec::new();
+        rows.push((t("Claro").to_string(), 0, theme::palette(false).colors(), String::new(), "@Claro".into()));
+        rows.push((t("Oscuro").to_string(), 0, theme::palette(true).colors(), "@Oscuro".into(), String::new()));
+        // los propios van justo tras los de serie, para que un tema nuevo se vea sin desplazar la lista
         for th in &self.cfg.custom_themes {
-            rows.push((th.name.clone(), th.dark, 2, th.colors));
+            rows.push((th.name.clone(), 2, th.colors, th.name.clone(), th.name.clone()));
+        }
+        for th in crate::theme::presets() {
+            rows.push((th.name.clone(), 1, th.colors, th.name.clone(), th.name.clone()));
         }
         let mut mode: Option<u8> = None;
         let mut pick: Option<(bool, String)> = None;
         let mut dup: Option<usize> = None;
         let mut del: Option<String> = None;
         let mut edit: Option<String> = None;
+        let mut create = false;
+
         ui.horizontal(|ui| {
-            ui.label(t("Modo"));
+            ui.label(egui::RichText::new(t("Modo")).color(pal.subtle));
             for (m, l) in [(0u8, t("Sistema")), (1, t("Claro")), (2, t("Oscuro"))] {
                 if ui.radio(self.cfg.theme_mode == m, l).clicked() {
                     mode = Some(m);
                 }
             }
         });
-        ui.label(egui::RichText::new(t("Elige un tema claro y uno oscuro; «Sistema» alterna entre ellos. Los de serie no se pierden nunca.")).size(12.0).color(pal.subtle));
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
-            for (title, origin) in [(None, 0u8), (Some(t("Predefinidos")), 1), (Some(t("Mis temas")), 2)] {
-                let group: Vec<usize> = (0..rows.len()).filter(|&i| if origin == 0 { rows[i].2 == 0 } else { rows[i].2 == origin }).collect();
-                if group.is_empty() {
-                    if origin == 2 {
-                        ui.label(egui::RichText::new(t("Mis temas")).size(12.0).color(pal.subtle));
-                        ui.label(egui::RichText::new(t("Aún no hay temas propios: crea uno con «Nuevo tema».")).size(12.0).color(pal.subtle));
-                    }
-                    continue;
-                }
-                if let Some(h) = title {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(h).size(12.0).color(pal.subtle));
-                }
-                for i in group {
-                    let (name, dark, orig, colors) = rows[i].clone();
-                    let slot = if dark { &self.cfg.theme_dark } else { &self.cfg.theme_light };
-                    let key = if orig == 0 { String::new() } else { name.clone() };
-                    let used = match self.cfg.theme_named(slot).filter(|t| t.dark == dark) {
-                        Some(cur) => orig != 0 && cur.name == name,
-                        None => orig == 0,
-                    };
-                    ui.horizontal(|ui| {
-                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 150.0, 30.0), egui::Sense::click());
-                        let hov = resp.hovered();
-                        if used || hov {
-                            ui.painter().rect_filled(r, 8.0, if used { pal.sel } else { pal.hover });
-                        }
-                        // muestra de la paleta
-                        let mut x = r.min.x + 8.0;
-                        for k in [0usize, 1, 2, 5, 7] {
-                            let c = colors[k];
-                            let sw = Rect::from_min_size(pos2(x, r.center().y - 7.0), vec2(14.0, 14.0));
-                            ui.painter().rect_filled(sw, 4.0, Color32::from_rgb(c[0], c[1], c[2]));
-                            ui.painter().rect_stroke(sw, 4.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
-                            x += 16.0;
-                        }
-                        let nr = ui.painter().text(pos2(x + 8.0, r.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(14.0), pal.text);
-                        let tag = if dark { t("Oscuro") } else { t("Claro") };
-                        let tag_w = if used { 70.0 } else { 52.0 };
-                        if nr.max.x + tag_w < r.max.x - 8.0 { ui.painter().text(pos2(r.max.x - 8.0, r.center().y), Align2::RIGHT_CENTER, if used { format!("✓ {tag}") } else { tag.to_string() }, egui::FontId::proportional(12.0), if used { pal.accent } else { pal.subtle }); }
-                        if resp.clicked() {
-                            pick = Some((dark, key.clone()));
-                            if orig == 2 {
-                                edit = Some(name.clone());
-                            }
-                        }
-                        if ui.small_button(t("Duplicar")).clicked() {
-                            dup = Some(i);
-                        }
-                        if orig == 2 && ui.small_button(t("Eliminar tema")).clicked() {
-                            del = Some(name.clone());
-                        }
-                    });
-                }
-            }
-        });
-        ui.add_space(6.0);
-        // nuevo tema: base claro u oscuro, parte de la paleta que se ve ahora
-        let new_dark_id = ui.id().with("new_theme_dark");
-        let mut new_dark = ui.data(|d| d.get_temp::<bool>(new_dark_id)).unwrap_or(self.cfg.dark);
-        let mut create: Option<bool> = None;
+        ui.add_space(2.0);
+        ui.add(egui::Label::new(egui::RichText::new(t("Elige un tema claro y uno oscuro; «Sistema» alterna entre ellos. Los de serie no se pierden nunca.")).size(12.0).color(pal.subtle)).wrap());
+        ui.add_space(8.0);
+
+        // columnas: nombre | claro | oscuro | duplicar | eliminar
+        let (cw, iw) = (56.0, 30.0);
+        let list_w = width - 14.0;
+        let name_w = list_w - 2.0 * cw - 2.0 * iw;
         ui.horizontal(|ui| {
-            if ui.button(t("Nuevo tema")).clicked() {
-                create = Some(new_dark);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(name_w);
+            for l in [t("Claro"), t("Oscuro")] {
+                let (r, _) = ui.allocate_exact_size(vec2(cw, 16.0), egui::Sense::hover());
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, l, egui::FontId::proportional(11.5), pal.subtle);
             }
-            ui.radio_value(&mut new_dark, false, t("Claro"));
-            ui.radio_value(&mut new_dark, true, t("Oscuro"));
         });
-        ui.data_mut(|d| d.insert_temp(new_dark_id, new_dark));
+        let cur_slot_light = self.cfg.theme_light.clone();
+        let cur_slot_dark = self.cfg.theme_dark.clone();
+        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.set_width(list_w);
+            for i in 0..rows.len() {
+                let (name, orig, colors, kl, kd) = rows[i].clone();
+                if i > 0 && rows[i - 1].1 != orig {
+                    ui.add_space(2.0);
+                    ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0, pal.border));
+                    ui.add_space(4.0);
+                }
+                let editing = orig == 2 && self.edit_theme == name;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    let (r, resp) = ui.allocate_exact_size(vec2(name_w, 34.0), egui::Sense::click());
+                    if editing {
+                        ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.max.x + cw * 2.0 + iw * 2.0, r.max.y)), 8.0, pal.sel);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.max.x + cw * 2.0 + iw * 2.0, r.max.y)), 8.0, pal.hover);
+                    }
+                    let mut x = r.min.x + 10.0;
+                    for k in [0usize, 1, 2, 5, 7] {
+                        let c = colors[k];
+                        let sw = Rect::from_min_size(pos2(x, r.center().y - 7.0), vec2(14.0, 14.0));
+                        ui.painter().rect_filled(sw, 4.0, Color32::from_rgb(c[0], c[1], c[2]));
+                        ui.painter().rect_stroke(sw, 4.0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                        x += 16.0;
+                    }
+                    ui.painter().text(pos2(x + 10.0, r.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(14.0), pal.text);
+                    if orig == 2 && resp.clicked() {
+                        edit = Some(name.clone());
+                    }
+                    for (dark, key, cur) in [(false, &kl, &cur_slot_light), (true, &kd, &cur_slot_dark)] {
+                        let on = cur == key;
+                        let (cr, cresp) = ui.allocate_exact_size(vec2(cw, 34.0), egui::Sense::click());
+                        let cresp = cresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if dark { t("Usar en modo oscuro") } else { t("Usar en modo claro") });
+                        let b = Rect::from_center_size(cr.center(), vec2(18.0, 18.0));
+                        if on {
+                            ui.painter().rect_filled(b, 5.0, pal.accent);
+                            let st = Stroke::new(2.0, Color32::WHITE);
+                            let c = b.center();
+                            ui.painter().line_segment([c + vec2(-4.0, 0.5), c + vec2(-1.0, 3.5)], st);
+                            ui.painter().line_segment([c + vec2(-1.0, 3.5), c + vec2(4.5, -3.0)], st);
+                        } else {
+                            ui.painter().rect_stroke(b, 5.0, Stroke::new(1.5, if cresp.hovered() { pal.accent } else { pal.border }), egui::StrokeKind::Inside);
+                        }
+                        if cresp.clicked() && !on {
+                            pick = Some((dark, key.clone()));
+                        }
+                    }
+                    let (dr, _) = ui.allocate_exact_size(vec2(iw, 34.0), egui::Sense::hover());
+                    if theme::icon_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_center_size(dr.center(), vec2(28.0, 28.0)))), &pal, theme::Icon::Copy, t("Duplicar")).clicked() {
+                        dup = Some(i);
+                    }
+                    let (er, _) = ui.allocate_exact_size(vec2(iw, 34.0), egui::Sense::hover());
+                    if orig == 2
+                        && theme::icon_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_center_size(er.center(), vec2(28.0, 28.0)))), &pal, theme::Icon::Trash, t("Eliminar tema")).clicked()
+                    {
+                        del = Some(name.clone());
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Nuevo tema")).clicked() {
+                create = true;
+            }
+        });
 
         // editor del tema propio seleccionado
         if let Some(i) = self.cfg.custom_themes.iter().position(|t| t.name == self.edit_theme) {
-            ui.separator();
+            ui.add_space(10.0);
             let mut edited = false;
             let mut rename: Option<String> = None;
-            let mut new_base: Option<bool> = None;
-            {
+            egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                ui.set_width(width - 26.0);
                 let th = &mut self.cfg.custom_themes[i];
                 ui.horizontal(|ui| {
                     ui.label(t("Nombre"));
                     let mut n = th.name.clone();
-                    if ui.add(egui::TextEdit::singleline(&mut n).desired_width(160.0)).changed() {
+                    if ui.add(egui::TextEdit::singleline(&mut n).desired_width(220.0)).changed() {
                         rename = Some(n);
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.label(t("Base del tema"));
-                    let mut d = th.dark;
-                    ui.radio_value(&mut d, false, t("Claro"));
-                    ui.radio_value(&mut d, true, t("Oscuro"));
-                    if d != th.dark {
-                        new_base = Some(d);
-                    }
-                });
+                ui.add_space(6.0);
                 let labels = [t("Fondo"), t("Panel lateral"), t("Superficie"), t("Resaltado"), t("Borde"), t("Texto"), t("Texto secundario"), t("Acento"), t("Fondo del visor")];
-                egui::Grid::new("theme_colors").num_columns(4).show(ui, |ui| {
+                egui::Grid::new("theme_colors").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
                     for (k, l) in labels.iter().enumerate() {
-                        ui.label(*l);
-                        edited |= ui.color_edit_button_srgb(&mut th.colors[k]).changed();
-                        if k % 2 == 1 {
+                        ui.horizontal(|ui| {
+                            edited |= ui.color_edit_button_srgb(&mut th.colors[k]).changed();
+                            ui.label(*l);
+                        });
+                        if k % 3 == 2 {
                             ui.end_row();
                         }
                     }
                 });
-            }
+            });
             if let Some(n) = rename {
-                let n: String = n.chars().filter(|c| !matches!(c, '|' | '\n' | '\r')).take(40).collect();
+                let n: String = n.chars().filter(|c| !matches!(c, '|' | '\n' | '\r' | '@')).take(40).collect();
                 let taken = self.cfg.custom_themes.iter().any(|t| t.name == n) || crate::theme::presets().iter().any(|t| t.name == n);
                 if !n.is_empty() && !taken {
                     let old = std::mem::replace(&mut self.cfg.custom_themes[i].name, n.clone());
@@ -6856,29 +6867,20 @@ impl App {
                     changed = true;
                 }
             }
-            if let Some(d) = new_base {
-                // cambia de modo: deja la ranura anterior y pasa a la nueva
-                let name = self.cfg.custom_themes[i].name.clone();
-                self.cfg.custom_themes[i].dark = d;
-                if self.cfg.theme_light == name {
-                    self.cfg.theme_light.clear();
-                }
-                if self.cfg.theme_dark == name {
-                    self.cfg.theme_dark.clear();
-                }
-                pick = Some((d, name));
-            }
             if edited {
                 self.refresh_custom_theme();
                 changed = true;
             }
+        } else {
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(egui::RichText::new(t("Los temas de serie y predefinidos no se pueden modificar: duplícalos para editar sus colores.")).size(12.0).color(pal.subtle)).wrap());
         }
 
         if let Some(m) = mode {
             self.set_theme_mode(m);
         }
         if let Some((dark, key)) = pick {
-            // si hay un modo fijo, se pasa a él para que el tema elegido se vea; con «Sistema» solo se asigna
+            // con un modo fijo se pasa al de la casilla para que el tema elegido se vea; con «Sistema» solo se asigna
             if self.cfg.theme_mode != 0 && self.cfg.theme_mode != if dark { 2 } else { 1 } {
                 self.cfg.theme_mode = if dark { 2 } else { 1 };
             }
@@ -6891,16 +6893,16 @@ impl App {
             self.apply_dark(show);
             changed = true;
         }
-        let create = create.or(dup.map(|i| rows[i].1));
-        if let Some(side) = create {
+        let create_from: Option<(Option<usize>, bool)> = if let Some(i) = dup { Some((Some(i), self.cfg.dark)) } else if create { Some((None, self.cfg.dark)) } else { None };
+        if let Some((src, side)) = create_from {
             if self.cfg.custom_themes.len() < 32 {
-                let (colors, stem) = match dup {
-                    Some(i) => (rows[i].3, rows[i].0.clone()),
-                    None => (theme::resolve(&self.cfg, side).colors(), t("Tema").to_string()),
+                let (colors, stem) = match src {
+                    Some(i) => (rows[i].2, rows[i].0.clone()),
+                    None => (self.pal.colors(), t("Tema").to_string()),
                 };
                 let mut k = 1;
                 let name = loop {
-                    let n = if dup.is_some() { format!("{stem} {}", k + 1) } else { format!("{stem} {}", self.cfg.custom_themes.len() + k) };
+                    let n = if src.is_some() { format!("{stem} {}", k + 1) } else { format!("{stem} {}", self.cfg.custom_themes.len() + k) };
                     let taken = self.cfg.custom_themes.iter().any(|t| t.name == n) || crate::theme::presets().iter().any(|t| t.name == n);
                     if !taken {
                         break n;
@@ -6909,16 +6911,13 @@ impl App {
                 };
                 self.cfg.custom_themes.push(crate::config::CustomTheme { name: name.clone(), dark: side, colors });
                 self.edit_theme = name.clone();
-                if self.cfg.theme_mode != 0 && self.cfg.theme_mode != if side { 2 } else { 1 } {
-                    self.cfg.theme_mode = if side { 2 } else { 1 };
-                }
                 if side {
                     self.cfg.theme_dark = name;
                 } else {
                     self.cfg.theme_light = name;
                 }
-                let show = if self.cfg.theme_mode == 0 { self.cfg.dark } else { side };
-                self.apply_dark(show);
+                let d = self.cfg.dark;
+                self.apply_dark(d);
                 changed = true;
             }
         }
@@ -8243,31 +8242,23 @@ impl App {
                 let mut changed = false;
                 let mut res_sort = false;
                 let mut install_sys = false;
-                egui::Window::new(t("Opciones"))
-                    .open(&mut open)
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(360.0);
-                        ui.horizontal(|ui| {
-                            for (i, l) in [t("General"), t("Columnas"), t("Temas")].into_iter().enumerate() {
-                                if ui.selectable_label(self.opts_tab == i as u8, l).clicked() {
-                                    self.opts_tab = i as u8;
-                                }
-                            }
-                        });
-                        ui.separator();
+                let width = 540.0;
+                theme::card_window(ctx, &pal, t("Opciones"), width, &mut open, |ui| {
+                        let mut tab = self.opts_tab;
+                        theme::tab_bar(ui, &pal, &mut tab, &[t("General"), t("Columnas"), t("Temas")]);
+                        self.opts_tab = tab;
+                        ui.add_space(8.0);
                         if self.opts_tab == 2 {
-                            changed |= self.themes_tab(ui);
+                            changed |= self.themes_tab(ui, width);
                             return;
                         }
                         if self.opts_tab == 1 {
-                            ui.label(egui::RichText::new(t("Elige qué columnas ver en la vista de lista y su orden. Si la ventana es estrecha, se ocultan las menos importantes.")).color(pal.subtle));
+                            ui.add(egui::Label::new(egui::RichText::new(t("Elige qué columnas ver en la vista de lista y su orden. Si la ventana es estrecha, se ocultan las menos importantes.")).color(pal.subtle)).wrap());
                             ui.add_space(6.0);
                             changed |= self.columns_editor(ui);
                             return;
                         }
+                        theme::section(ui, &pal, t("Vista"));
                         changed |= ui.checkbox(&mut self.cfg.sys_icons, t("Usar iconos del sistema")).changed();
                         changed |= ui.checkbox(&mut self.cfg.thumbs_on, t("Mostrar miniaturas de imágenes y vídeos")).changed();
                         let hid = ui.checkbox(&mut self.cfg.show_hidden, t("Mostrar archivos ocultos")).changed();
@@ -8275,7 +8266,11 @@ impl App {
                         res_sort |= hid;
                         changed |= ui.checkbox(&mut self.cfg.show_sidebar, t("Mostrar barra lateral")).changed();
                         changed |= ui.checkbox(&mut self.cfg.clip_panel, t("Mostrar panel del portapapeles")).changed();
-                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(t("Tamaño de iconos"));
+                            changed |= ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false)).changed();
+                        });
+                        theme::section(ui, &pal, t("Comportamiento"));
                         let mut single = self.cfg.single_click.unwrap_or(cfg!(target_os = "android"));
                         if ui.checkbox(&mut single, t("Abrir con un solo clic o toque")).changed() {
                             self.cfg.single_click = Some(single);
@@ -8305,9 +8300,8 @@ impl App {
                         }
                         changed |= ui.checkbox(&mut self.cfg.preview_window, t("Abrir el visor en una ventana aparte")).changed();
                         changed |= ui.checkbox(&mut self.cfg.native_deco, t("Usar la barra de título del sistema (requiere reiniciar)")).changed();
-                        ui.add_space(6.0);
+                        theme::section(ui, &pal, t("Sistema"));
                         if system::can_install() {
-                            ui.add_space(6.0);
                             if ui.button(t("Usar como gestor de archivos del sistema")).clicked() {
                                 install_sys = true;
                             }
@@ -8338,11 +8332,6 @@ impl App {
                             crate::i18n::install_fonts(ctx, li);
                             changed = true;
                         }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(t("Tamaño de iconos"));
-                            changed |= ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false)).changed();
-                        });
                         ui.add_space(6.0);
                         ui.label(t("Intérprete del terminal (vacío = el predeterminado)"));
                         changed |= ui
@@ -8677,6 +8666,12 @@ impl App {
                 "temas" => {
                     self.opts_tab = 2;
                     self.dlg = Dlg::Options;
+                }
+                "temas_new" => {
+                    self.opts_tab = 2;
+                    self.dlg = Dlg::Options;
+                    self.cfg.custom_themes.push(crate::config::CustomTheme { name: "Mio".into(), dark: true, colors: theme::palette(true).colors() });
+                    self.edit_theme = "Mio".into();
                 }
                 "del" => self.confirm_delete = Some(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]),
                 "props" => self.open_props(),
