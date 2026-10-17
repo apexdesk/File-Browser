@@ -169,7 +169,11 @@ static DIRTY: AtomicU64 = AtomicU64::new(0);
 /// Cambios más recientes que esto se esperan antes de re-indexar (agrupa ráfagas).
 const SETTLE_MS: u64 = 3000;
 /// Separación mínima entre dos recorridos provocados por cambios.
+#[cfg(target_os = "linux")]
 const MIN_GAP_SECS: u64 = 30;
+/// En Windows y macOS el sistema genera mucho ruido propio: recorridos más espaciados.
+#[cfg(not(target_os = "linux"))]
+const MIN_GAP_SECS: u64 = 120;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -480,7 +484,152 @@ mod watch {
     }
 }
 
+/// Rutas del sistema o de herramientas que cambian sin parar y no interesan para buscar.
 #[cfg(not(target_os = "linux"))]
+fn noisy_path(p: &str) -> bool {
+    let p = p.replace('\\', "/");
+    const BAD: &[&str] = &[
+        "/.git/", "/node_modules/", "/target/", "/AppData/", "/$Recycle.Bin/", "/Windows/", "/ProgramData/",
+        "/System Volume Information/", "/Library/", "/private/", "/System/", "/.Trash/", "/.Spotlight-V100/", "/.fseventsd/",
+        "/.DocumentRevisions-V100/", "/.cache/",
+    ];
+    let q = format!("{p}/");
+    BAD.iter().any(|b| q.contains(b))
+}
+
+/// Windows: `ReadDirectoryChangesW` sobre cada unidad, con subárbol, en un hilo por unidad.
+#[cfg(windows)]
+mod watch {
+    use super::*;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::CancelIoEx;
+
+    static HANDLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+    pub fn stop() {
+        let hs: Vec<isize> = std::mem::take(&mut *HANDLES.lock().unwrap());
+        for h in hs {
+            // despierta al hilo bloqueado en ReadDirectoryChangesW: sale y cierra el manejador
+            unsafe {
+                let _ = CancelIoEx(HANDLE(h as *mut _), None);
+            }
+        }
+    }
+
+    /// Las unidades no cambian entre recorridos: si ya se vigilan, no se hace nada.
+    pub fn restart(idx: Arc<Index>) {
+        if !HANDLES.lock().unwrap().is_empty() {
+            return;
+        }
+        for root in idx.roots() {
+            let wide: Vec<u16> = root.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            let h = unsafe {
+                CreateFileW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    FILE_LIST_DIRECTORY.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            };
+            let Ok(h) = h else { continue };
+            let raw = h.0 as isize;
+            HANDLES.lock().unwrap().push(raw);
+            let base = root.to_string_lossy().into_owned();
+            std::thread::spawn(move || {
+                let h = HANDLE(raw as *mut _);
+                let mut buf = vec![0u32; 16 * 1024]; // alineado a 4 bytes
+                loop {
+                    let mut got = 0u32;
+                    let r = unsafe {
+                        ReadDirectoryChangesW(
+                            h,
+                            buf.as_mut_ptr() as *mut _,
+                            (buf.len() * 4) as u32,
+                            true,
+                            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                            Some(&mut got),
+                            None,
+                            None,
+                        )
+                    };
+                    if r.is_err() {
+                        break;
+                    }
+                    if got == 0 {
+                        // desbordó el búfer: hubo cambios, no sabemos cuáles
+                        mark_dirty();
+                        continue;
+                    }
+                    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, got as usize) };
+                    let mut off = 0usize;
+                    while off + 12 <= bytes.len() {
+                        let next = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                        let len = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
+                        if off + 12 + len <= bytes.len() {
+                            let w: Vec<u16> = bytes[off + 12..off + 12 + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                            let rel = String::from_utf16_lossy(&w);
+                            if !noisy_path(&format!("{base}{rel}")) {
+                                mark_dirty();
+                            }
+                        }
+                        if next == 0 {
+                            break;
+                        }
+                        off += next;
+                    }
+                }
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+            });
+        }
+    }
+}
+
+/// macOS: FSEvents sobre la raíz (eventos a nivel de fichero), en un hilo que vive mientras no cambie la generación.
+#[cfg(target_os = "macos")]
+mod watch {
+    use super::*;
+
+    static WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+
+    pub fn stop() {
+        WATCH_GEN.fetch_add(1, AO::SeqCst);
+    }
+
+    pub fn restart(idx: Arc<Index>) {
+        let gen_id = WATCH_GEN.fetch_add(1, AO::SeqCst) + 1;
+        let roots: Vec<String> = idx.roots().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut fs = fsevent_sys::FsEvent::new(roots);
+            if fs.observe_async(tx).is_err() {
+                return;
+            }
+            while WATCH_GEN.load(AO::SeqCst) == gen_id {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(ev) => {
+                        if !noisy_path(&ev.path) {
+                            mark_dirty();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(_) => break,
+                }
+            }
+            fs.shutdown_observe();
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod watch {
     use super::*;
     pub fn stop() {}
