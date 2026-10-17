@@ -609,7 +609,7 @@ mod watch {
         let roots: Vec<String> = idx.roots().iter().map(|p| p.to_string_lossy().into_owned()).collect();
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            let mut fs = fsevent_sys::FsEvent::new(roots);
+            let mut fs = fsevent::FsEvent::new(roots);
             if fs.observe_async(tx).is_err() {
                 return;
             }
