@@ -48,7 +48,15 @@ pub struct Rich {
 
 /// Texto en línea de Markdown: **negrita**, *cursiva*, `código`, ~~tachado~~, [enlaces](url) e imágenes.
 pub fn inline(s: &str) -> Vec<Span> {
+    inline_d(s, 0)
+}
+
+/// Líneas larguísimas o enlaces anidados sin fin: se muestran como texto plano (evita coste cuadrático y recursión sin límite).
+fn inline_d(s: &str, depth: u32) -> Vec<Span> {
     let c: Vec<char> = s.chars().collect();
+    if c.len() > 8000 || depth > 6 {
+        return vec![Span { text: s.to_string(), ..Default::default() }];
+    }
     let mut out: Vec<Span> = Vec::new();
     let (mut bold, mut ital, mut strike, link) = (false, false, false, false);
     let mut buf = String::new();
@@ -139,7 +147,7 @@ pub fn inline(s: &str) -> Vec<Span> {
                         if is_img {
                             out.push(Span { text: format!("[{}]", if label.is_empty() { "imagen" } else { &label }), italic: true, ..Default::default() });
                         } else {
-                            for mut sp in inline(&label) {
+                            for mut sp in inline_d(&label, depth + 1) {
                                 sp.link = true;
                                 out.push(sp);
                             }

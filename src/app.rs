@@ -2035,17 +2035,24 @@ impl App {
         let old_full = e.name.to_string();
         let old = base_name(&old_full).to_string();
         let new = new.trim().to_string();
-        if new.is_empty() || new == old || new.contains(['/', '\\']) {
+        if new.is_empty() || new == old || new == "." || new == ".." || new.contains(['/', '\\']) {
             return;
         }
         let from = self.cwd.join(&old_full);
         let to = from.with_file_name(&new);
+        let case_only = new.to_lowercase() == old.to_lowercase();
         let sel = format!("{}{}", &old_full[..old_full.len() - old.len()], new);
         self.say(t("Renombrando…").into(), false);
         self.spawn_io(
             {
                 let (f, t2) = (from.clone(), to.clone());
-                move || std::fs::rename(&f, &t2)
+                move || {
+                    // `rename` sobrescribe el destino en silencio: no se pisa un elemento que ya existe
+                    if !case_only && std::fs::symlink_metadata(&t2).is_ok() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("Ya existe un elemento con ese nombre")));
+                    }
+                    std::fs::rename(&f, &t2)
+                }
             },
             move |a, r| match r {
                 Ok(()) => {
@@ -5534,13 +5541,16 @@ impl App {
                 if ui.button(t("Abrir")).clicked() {
                     self.open_index(c);
                     ui.close();
+                    // abrir una carpeta recarga la lista: `c` ya no vale
+                    return;
                 }
                 if ui.button(t("Vista previa   (Espacio)")).clicked() {
                     self.toggle_preview();
                     ui.close();
                 }
                 if self.vmode != VMode::Dir {
-                    let p = self.cwd.join(&*self.entries[c as usize].name);
+                    let Some(en) = self.entries.get(c as usize) else { return };
+                    let p = self.cwd.join(&*en.name);
                     if ui.button(t("Mostrar en su carpeta")).clicked() {
                         self.reveal(&p);
                         ui.close();
@@ -5548,7 +5558,7 @@ impl App {
                         return;
                     }
                 }
-                let e = &self.entries[c as usize];
+                let Some(e) = self.entries.get(c as usize) else { return };
                 if e.is_dir() {
                     let p = self.cwd.join(&*e.name);
                     if ui.button(t("Abrir en una pestaña nueva")).clicked() {
@@ -5573,7 +5583,7 @@ impl App {
                         ui.close();
                     }
                 }
-                let e = &self.entries[c as usize];
+                let Some(e) = self.entries.get(c as usize) else { return };
                 if e.is_dir() {
                     let p = self.cwd.join(&*e.name);
                     let has = self.cfg.bookmarks.contains(&p);

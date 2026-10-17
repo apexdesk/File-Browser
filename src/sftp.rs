@@ -268,7 +268,9 @@ impl Client {
                             let name = r.string()?;
                             r.string()?; // longname
                             let attrs = r.attrs()?;
-                            if name != "." && name != ".." {
+                            // un servidor hostil podría devolver rutas («../x») para escribir fuera de la carpeta destino
+                            let bad = name.is_empty() || name.contains(['/', '\0']) || (cfg!(windows) && name.contains('\\'));
+                            if name != "." && name != ".." && !bad {
                                 out.push(RemoteEnt { name, attrs });
                             }
                         }
