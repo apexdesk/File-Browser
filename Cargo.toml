@@ -2,6 +2,7 @@
 name = "filebrowser"
 version = "0.8.3"
 edition = "2024"
+license = "PolyForm-Strict-1.0.0"
 
 [lib]
 name = "filebrowser"
