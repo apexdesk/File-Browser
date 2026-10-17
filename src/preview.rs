@@ -702,6 +702,52 @@ impl Preview {
         action
     }
 
+    /// Dibuja la vista previa acoplada (panel lateral) dentro de `r`, sin velo ni cierre.
+    pub fn show_panel(&mut self, ctx: &egui::Context, p: &egui::Painter, r: Rect, pal: &Pal, active: bool) {
+        let p = &p.with_clip_rect(r);
+        let head = Rect::from_min_size(r.min, vec2(r.width(), 52.0));
+        let icon_r = Rect::from_center_size(pos2(head.left() + 28.0, head.center().y), vec2(30.0, 30.0));
+        if self.kind == Kind::Folder {
+            theme::draw_folder(p, icon_r);
+        } else {
+            let ext = self.name.rsplit_once('.').map(|x| x.1).unwrap_or("");
+            theme::draw_file(p, icon_r, self.kind, ext, pal);
+        }
+        let tx = head.left() + 52.0;
+        let maxw = head.width() - 52.0 - 46.0;
+        let mut title: String = self.name.clone();
+        let g = p.layout_no_wrap(title.clone(), FontId::proportional(15.0), pal.text);
+        if g.size().x > maxw {
+            let keep = ((maxw / g.size().x) * title.chars().count() as f32) as usize;
+            title = title.chars().take(keep.saturating_sub(2)).collect::<String>() + "…";
+        }
+        p.text(pos2(tx, head.center().y - 8.0), Align2::LEFT_CENTER, title, FontId::proportional(15.0), pal.text);
+        let sub = if self.kind == Kind::Folder { self.kind.label().to_string() } else { format!("{}  ·  {}", self.kind.label(), human_size(self.size)) };
+        p.text(pos2(tx, head.center().y + 10.0), Align2::LEFT_CENTER, sub, FontId::proportional(11.5), pal.subtle);
+        let live = if active { ctx.input(|i| i.pointer.hover_pos()) } else { None };
+        let clicked = active && ctx.input(|i| i.pointer.primary_clicked());
+        let pointer = live.filter(|q| r.contains(*q));
+        if self.kind != Kind::Folder && !crate::sftp::is_remote(&self.path) {
+            let ib = Rect::from_center_size(pos2(head.right() - 26.0, head.center().y), vec2(30.0, 30.0));
+            let over = pointer.map(|q| ib.contains(q)).unwrap_or(false);
+            if over || self.show_meta {
+                p.rect_filled(ib, CornerRadius::same(9), if self.show_meta { pal.sel } else { pal.hover });
+            }
+            let ic = if self.show_meta { pal.accent } else { pal.text };
+            p.circle_stroke(ib.center(), 8.0, Stroke::new(1.4, ic));
+            p.text(ib.center(), Align2::CENTER_CENTER, "i", FontId::proportional(12.0), ic);
+            if over && clicked {
+                self.toggle_meta(ctx);
+            }
+        }
+        p.line_segment([pos2(r.left() + 12.0, head.bottom()), pos2(r.right() - 12.0, head.bottom())], Stroke::new(1.0, pal.border));
+        let content = Rect::from_min_max(pos2(r.left() + 10.0, head.bottom() + 8.0), pos2(r.right() - 10.0, r.bottom() - 10.0));
+        self.draw_body(ctx, p, content, pal, pointer, clicked);
+        if self.show_meta {
+            self.draw_meta(ctx, p, content, pal);
+        }
+    }
+
     /// Cierra el archivo abierto dentro del comprimido; `false` si no había ninguno.
     pub fn close_inner(&mut self) -> bool {
         self.entry_err = None;

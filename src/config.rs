@@ -41,6 +41,7 @@ pub struct Config {
     pub restore_tabs: bool,
     pub index_enabled: bool,
     pub preview_window: bool,
+    pub preview_panel: bool,
     /// Columnas de la vista de lista (aparte del nombre), de izquierda a derecha: date, size, kind.
     pub columns: Vec<String>,
     /// Anchuras personalizadas de columnas de la lista: (id, ancho).
@@ -92,6 +93,7 @@ impl Default for Config {
             restore_tabs: true,
             index_enabled: true,
             preview_window: true,
+            preview_panel: false,
             columns: vec!["date".into(), "size".into(), "kind".into()],
             col_w: Vec::new(),
             clip_panel: true,
@@ -185,6 +187,7 @@ impl Config {
                 "restore_tabs" => c.restore_tabs = v != "0",
                 "index_enabled" => c.index_enabled = v == "1",
                 "preview_window" => c.preview_window = v != "0",
+                "preview_panel" => c.preview_panel = v == "1",
                 "single_click" => c.single_click = Some(v == "1"),
                 "columns" => {
                     let known = ["size", "date", "kind", "ext", "perms", "owner", "group", "items", "created", "accessed", "mode", "link"];
@@ -295,6 +298,7 @@ impl Config {
         s.push_str(&format!("restore_tabs={}\n", self.restore_tabs as u8));
         s.push_str(&format!("index_enabled={}\n", self.index_enabled as u8));
         s.push_str(&format!("preview_window={}\n", self.preview_window as u8));
+        s.push_str(&format!("preview_panel={}\n", self.preview_panel as u8));
         if let Some(v) = self.single_click {
             s.push_str(&format!("single_click={}\n", v as u8));
         }

@@ -559,6 +559,9 @@ pub struct App {
 
     preview: Option<Preview>,
     pworker: preview::Worker,
+    /// Panel de vista previa acoplado a la derecha (y su propio trabajador de carga).
+    side: Option<Preview>,
+    sworker: preview::Worker,
     hover_name: Option<String>,
     last_title: String,
     start: Option<Instant>,
@@ -890,6 +893,21 @@ fn list_network() -> Vec<NetPlace> {
                 }
             }
         }
+        // cada servidor SMB con recursos montados sigue disponible para conectar otros
+        let mut servers: Vec<String> = Vec::new();
+        for p in &mounted {
+            let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if let Some(props) = n.strip_prefix("smb-share:") {
+                if let Some(h) = props.split(',').find_map(|kv| kv.strip_prefix("server=")) {
+                    if !servers.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+                        servers.push(h.to_string());
+                    }
+                }
+            }
+        }
+        for h in &servers {
+            v.push(NetPlace { name: pct_decode(h).to_uppercase(), path: None, uri: Some(format!("smb://{h}/")) });
+        }
         // sitios conocidos: marcadores GTK con direcciones de red
         if let Some(h) = dirs::home_dir() {
             if let Ok(txt) = std::fs::read_to_string(h.join(".config/gtk-3.0/bookmarks")) {
@@ -900,9 +918,14 @@ fn list_network() -> Vec<NetPlace> {
                         continue;
                     }
                     let host = uri.split_once("://").and_then(|(_, r)| r.split('/').next()).and_then(|a| a.rsplit('@').next()).map(|h| pct_decode(h.split(':').next().unwrap_or(h)).to_lowercase()).unwrap_or_default();
-                    let path = uri_to_gvfs(uri).or_else(|| if !host.is_empty() && gio_text.contains(&host) { gio_local_path(uri) } else { None });
+                    let server_only = scheme == "smb" && uri.split_once("://").map(|(_, r)| r.trim_end_matches('/').split('/').nth(1).is_none()).unwrap_or(false);
+                    // un servidor sin recurso sigue ofreciéndose aunque tenga recursos montados: sirve para añadir más
+                    let path = if server_only { None } else { uri_to_gvfs(uri).or_else(|| if !host.is_empty() && gio_text.contains(&host) { gio_local_path(uri) } else { None }) };
                     if path.as_ref().map(|p| mounted.contains(p)).unwrap_or(false) {
                         continue; // ya listado como montado
+                    }
+                    if server_only && servers.iter().any(|x| x.eq_ignore_ascii_case(&host)) {
+                        v.retain(|p| p.path.is_some() || p.uri.as_deref().map(|u| !u.to_lowercase().contains(&format!("//{host}/"))).unwrap_or(true));
                     }
                     let name = label.map(|s| s.to_string()).unwrap_or_else(|| uri.to_string());
                     v.push(NetPlace { name, path, uri: Some(uri.to_string()) });
@@ -1079,6 +1102,8 @@ impl App {
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
             pworker: preview::Worker::new(&ctx),
+            side: None,
+            sworker: preview::Worker::new(&ctx),
             ctx,
             pal,
             cfg,
@@ -2378,6 +2403,62 @@ impl App {
         ));
     }
 
+    /// Panel derecho con la vista previa de la selección actual (siempre visible mientras esté activo).
+    fn side_panel(&mut self, ui: &mut egui::Ui, pal: &Pal, bgfill: Color32, phone: bool) {
+        let want = self.cfg.preview_panel && !phone && self.vmode != VMode::Trash && ui.ctx().content_rect().width() >= 700.0;
+        if !want {
+            self.side = None;
+            return;
+        }
+        let target = self.cursor.filter(|&c| self.is_sel(c)).or_else(|| {
+            let mut first = None;
+            self.for_each_selected(|i| {
+                first.get_or_insert(i);
+            });
+            first
+        });
+        let cur = target.and_then(|i| self.entries.get(i as usize)).map(|e| self.cwd.join(&*e.name));
+        let same = match (&self.side, &cur) {
+            (Some(p), Some(c)) => &p.path == c,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.side = None;
+            if let (Some(i), Some(_)) = (target, &cur) {
+                let e = &self.entries[i as usize];
+                let path = self.cwd.join(&*e.name);
+                let pos = self.pos_of(i).map(|p| p + 1).unwrap_or(0);
+                let label = format!("{} de {}", pos, self.order.len());
+                let key = self.thumb_key(e);
+                let thumb = if crate::thumbs::thumbable(e.kind, e.ext()) { self.thumbs.get(key).cloned() } else { None };
+                self.side = Some(Preview::open(&mut self.sworker, path, e.name.to_string(), e.kind, e.size, e.mtime, label, thumb));
+            }
+        }
+        let modal = self.preview.is_some() || !matches!(self.dlg, Dlg::None);
+        egui::Panel::right("preview_panel")
+            .frame(egui::Frame::new().fill(bgfill).inner_margin(egui::Margin { left: 4, right: 10, top: 0, bottom: 4 }))
+            .default_size(360.0)
+            .size_range(220.0..=760.0)
+            .resizable(true)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                let r = ui.available_rect_before_wrap();
+                let p = ui.painter();
+                p.rect_filled(r, CornerRadius::same(14), pal.panel);
+                p.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, pal.border.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                match &mut self.side {
+                    Some(pv) => {
+                        pv.show_panel(ui.ctx(), p, r, pal, !modal);
+                    }
+                    None => {
+                        p.text(r.center(), Align2::CENTER_CENTER, t("Vista previa"), FontId::proportional(14.0), pal.subtle);
+                    }
+                }
+                ui.allocate_rect(r, egui::Sense::hover());
+            });
+    }
+
     fn toggle_preview(&mut self) {
         if self.vmode == VMode::Trash {
             return;
@@ -2629,6 +2710,10 @@ impl App {
                 self.cfg.show_hidden = !self.cfg.show_hidden;
                 self.cfg.save();
                 self.spawn_sort();
+            }
+            C::PreviewPanel => {
+                self.cfg.preview_panel = !self.cfg.preview_panel;
+                self.cfg.save();
             }
             C::ToggleSidebar => {
                 self.cfg.show_sidebar = !self.cfg.show_sidebar;
@@ -3886,8 +3971,11 @@ impl App {
             std::thread::spawn(move || {
                 let res = (|| -> Result<Option<PathBuf>, String> {
                     // ya montado (por otra aplicación o sesión anterior): sin volver a autenticar
-                    if let Some(p) = uri_to_gvfs(&uri).or_else(|| gio_local_path(&uri)) {
-                        return Ok(Some(p));
+                    let server_only = uri.starts_with("smb://") && uri.trim_end_matches('/').split('/').nth(3).is_none();
+                    if !server_only {
+                        if let Some(p) = uri_to_gvfs(&uri).or_else(|| gio_local_path(&uri)) {
+                            return Ok(Some(p));
+                        }
                     }
                     // «ya montada» (el mensaje sale en el idioma del sistema): si gio puede listarla, vale.
                     // Un servidor ya montado en modo exploración no tiene ruta local: se montan sus recursos.
@@ -3902,8 +3990,10 @@ impl App {
                             return Err(m);
                         }
                     }
-                    if let Some(p) = uri_to_gvfs(&uri) {
-                        return Ok(Some(p));
+                    if !server_only {
+                        if let Some(p) = uri_to_gvfs(&uri) {
+                            return Ok(Some(p));
+                        }
                     }
                     // servidor sin recurso: gvfs no lo expone como carpeta; se ofrecen sus recursos
                     // compartidos para elegir uno (sólo se monta ése)
@@ -6458,6 +6548,10 @@ impl App {
                 }
                 if mi_check(ui, t("Paneles apilados (uno encima de otro)"), "", self.cfg.split_stack) {
                     self.cfg.split_stack = !self.cfg.split_stack;
+                    self.cfg.save();
+                }
+                if mi_check(ui, t("Panel de vista previa"), "F3", self.cfg.preview_panel) {
+                    self.cfg.preview_panel = !self.cfg.preview_panel;
                     self.cfg.save();
                 }
                 if mi_check(ui, t("Barra lateral"), "Ctrl+B", self.cfg.show_sidebar) {
@@ -9022,6 +9116,9 @@ impl eframe::App for App {
         if let Some(pv) = &mut self.preview {
             pv.poll(&mut self.pworker, &ctx);
         }
+        if let Some(pv) = &mut self.side {
+            pv.poll(&mut self.sworker, &ctx);
+        }
 
         // título de ventana
         let title = format!(
@@ -9218,6 +9315,8 @@ impl eframe::App for App {
                 .show_separator_line(false)
                 .show(ui, |ui| self.sidebar(ui));
         }
+
+        self.side_panel(ui, &pal, bgfill, phone);
 
         let card = if self.cfg.dark { pal.panel } else { pal.surface };
         egui::CentralPanel::default()
