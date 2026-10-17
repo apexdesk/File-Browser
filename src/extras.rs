@@ -418,7 +418,7 @@ mod mac_trash {
             _ => (n, ""),
         };
         let b = stem.as_bytes();
-        if b.len() > 9 {
+        if b.len() > 9 && stem.is_char_boundary(b.len() - 9) {
             let t = &stem[b.len() - 9..];
             let ok = t.as_bytes().iter().enumerate().all(|(i, c)| match i {
                 0 => *c == b' ',

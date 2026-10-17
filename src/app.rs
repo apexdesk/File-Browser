@@ -668,7 +668,7 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            if let Ok(v) = u8::from_str_radix(if b[i + 1..i + 3].iter().all(u8::is_ascii_hexdigit) { std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz") } else { "zz" }, 16) {
                 out.push(v);
                 i += 3;
                 continue;
@@ -895,7 +895,7 @@ fn list_network() -> Vec<NetPlace> {
                 let mut it = l.split_whitespace();
                 let (Some(dev), Some(mp), Some(fs)) = (it.next(), it.next(), it.next()) else { continue };
                 if matches!(fs, "cifs" | "smb3" | "smbfs" | "nfs" | "nfs4" | "fuse.sshfs" | "davfs" | "fuse.davfs" | "ceph" | "afs") {
-                    let mp = mp.replace("\040", " ");
+                    let mp = mp.replace("\\040", " ");
                     v.push(NetPlace { name: dev.trim_start_matches('/').to_string(), path: Some(PathBuf::from(mp)), uri: None });
                 }
             }
@@ -1915,8 +1915,11 @@ impl App {
         if !additive {
             self.clear_sel();
         }
+        if self.order.is_empty() {
+            return;
+        }
         let (lo, hi) = (a.min(b), a.max(b));
-        for p in lo..=hi.min(self.order.len().saturating_sub(1)) {
+        for p in lo..=hi.min(self.order.len() - 1) {
             let i = self.order[p];
             self.set_bit(i, true);
         }
@@ -2174,6 +2177,9 @@ impl App {
         } else if crate::sftp::is_remote(p) {
             self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
             true
+        } else if self.arch_of(p).is_some() {
+            self.say(t("Esta ubicación es de sólo lectura").into(), true);
+            true
         } else {
             false
         }
@@ -2181,11 +2187,14 @@ impl App {
 
     fn start_op(&mut self, op: Op, meta: OpMeta) {
         let remote = |v: &Vec<PathBuf>| v.iter().any(|p| crate::sftp::is_remote(p));
+        let inarch = |p: &Path| self.arch_of(p).is_some();
         let touches = match &op {
-            Op::Copy { srcs, dst, mv, .. } => virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
-            Op::Trash(v) | Op::Delete(v) => remote(v),
-            Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs),
-            Op::Unzip { src, dst, .. } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
+            Op::Copy { srcs, dst, mv, .. } => {
+                virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || inarch(dst) || (*mv && (remote(srcs) || srcs.iter().any(|p| inarch(p))))
+            }
+            Op::Trash(v) | Op::Delete(v) => remote(v) || v.iter().any(|p| inarch(p)),
+            Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs) || inarch(out),
+            Op::Unzip { src, dst, .. } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src) || inarch(dst),
         };
         if touches {
             self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
@@ -7427,6 +7436,10 @@ impl App {
         if names.len() < 2 {
             return;
         }
+        if names.iter().any(|n| n.contains(['/', '\\'])) || virt_mode(&self.cwd).is_some() {
+            self.say(t("Renombrar en lote sólo funciona dentro de una carpeta normal").into(), true);
+            return;
+        }
         let mut mtimes = Vec::new();
         self.for_each_selected(|i| {
             if let Some(e) = self.entries.get(i as usize) {
@@ -8355,7 +8368,7 @@ impl App {
                 // por fila: ¿tiene problema? (vacío, repetido, con barra o ya existente)
                 let mut bad: Vec<bool> = Vec::with_capacity(new.len());
                 for (o, n) in d.names.iter().zip(&new) {
-                    let b = n.is_empty() || n.contains(['/', '\\']) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && self.cwd.join(n).exists());
+                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && self.cwd.join(n).exists());
                     bad.push(b);
                 }
                 let conflict = bad.iter().any(|b| *b) || bad_re;
@@ -8435,19 +8448,47 @@ impl App {
                         d.names.iter().cloned().zip(new.iter().cloned()).filter(|(o, n)| o != n).collect();
                     let mut err = None;
                     // fase 1: nombres temporales (permite intercambios y cadenas)
-                    let mut tmp = Vec::new();
+                    let pid = std::process::id();
+                    let tmpn = |i: usize| format!(".fbtmp-{pid}-{i}");
+                    let mut staged = 0;
                     for (i, (o, _)) in pairs.iter().enumerate() {
-                        let t = format!(".fbtmp-{}-{i}", std::process::id());
-                        if let Err(e) = std::fs::rename(self.cwd.join(o), self.cwd.join(&t)) {
+                        if let Err(e) = std::fs::rename(self.cwd.join(o), self.cwd.join(tmpn(i))) {
                             err = Some(format!("{o}: {e}"));
                             break;
                         }
-                        tmp.push(t);
+                        staged = i + 1;
                     }
-                    for (i, t) in tmp.iter().enumerate() {
-                        let target = if err.is_none() { &pairs[i].1 } else { &pairs[i].0 };
-                        if let Err(e) = std::fs::rename(self.cwd.join(t), self.cwd.join(target)) {
-                            err = Some(format!("{target}: {e}"));
+                    // fase 2: nombres finales; si algo falla se devuelve cada uno a su nombre original
+                    let mut done = Vec::new();
+                    if err.is_none() {
+                        for i in 0..staged {
+                            let dst = self.cwd.join(&pairs[i].1);
+                            // nunca sobrescribir algo que haya aparecido entre la vista previa y ahora
+                            let r = if dst.symlink_metadata().is_ok() {
+                                Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("ya existe")))
+                            } else {
+                                std::fs::rename(self.cwd.join(tmpn(i)), &dst)
+                            };
+                            match r {
+                                Ok(()) => done.push(i),
+                                Err(e) => {
+                                    err = Some(format!("{}: {e}", pairs[i].1));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if err.is_some() {
+                        for &i in &done {
+                            let _ = std::fs::rename(self.cwd.join(&pairs[i].1), self.cwd.join(tmpn(i)));
+                        }
+                        for i in 0..staged {
+                            let back = self.cwd.join(&pairs[i].0);
+                            let tmp = self.cwd.join(tmpn(i));
+                            if std::fs::rename(&tmp, &back).is_err() && back.symlink_metadata().is_err() {
+                                // último recurso: dejarlo con un nombre reconocible, nunca «.fbtmp»
+                                let _ = std::fs::rename(&tmp, self.cwd.join(format!("{} (recuperado)", pairs[i].0)));
+                            }
                         }
                     }
                     match err {
@@ -9666,4 +9707,16 @@ pub fn clean_archive_cache() {
             }
         }
     }
+}
+
+/// Nombre que no se puede usar para un archivo en ningún sistema (vacío, `.`/`..`, separadores,
+/// caracteres prohibidos en Windows, punto o espacio final, más de 255 bytes).
+fn bad_name(n: &str) -> bool {
+    n.is_empty()
+        || n == "."
+        || n == ".."
+        || n.len() > 255
+        || n.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*', '\0'])
+        || n.chars().any(|c| c.is_control())
+        || n.ends_with(['.', ' '])
 }

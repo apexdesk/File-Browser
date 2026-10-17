@@ -300,7 +300,7 @@ impl DocView {
                     if id == self.next_id {
                         self.pending = None;
                     }
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba);
+                    let ci = crate::thumbs::color_image(ctx, img.w, img.h, &img.rgba);
                     match &mut self.tex {
                         Some((t, p, w)) => {
                             t.set(ci, egui::TextureOptions::LINEAR);

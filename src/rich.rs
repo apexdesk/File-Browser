@@ -945,7 +945,7 @@ impl RichView {
                 Item::Image { idx, size } => {
                     if self.tex[*idx].is_none() {
                         let d = &self.rich.images[*idx];
-                        let img = egui::ColorImage::from_rgba_unmultiplied([d.w, d.h], &d.rgba);
+                        let img = crate::thumbs::color_image(ctx, d.w, d.h, &d.rgba);
                         self.tex[*idx] = Some(ctx.load_texture("richimg", img, egui::TextureOptions::LINEAR));
                     }
                     if let Some(t) = &self.tex[*idx] {

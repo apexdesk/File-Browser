@@ -601,10 +601,22 @@ pub fn connect(conn: Conn, path: &str) -> Result<PathBuf, String> {
     let mut cur = root.clone();
     sess.sync(&cur)?;
     for part in start.split('/').filter(|s| !s.is_empty()) {
-        cur = cur.join(local_name(part));
-        if !sess.nodes.lock().unwrap().contains_key(&cur) {
-            sess.nodes.lock().unwrap().insert(cur.clone(), Node { remote: format!("{}/{}", sess.remote_of(cur.parent().unwrap()).unwrap_or_default().trim_end_matches('/'), part), size: 0, mtime: 0, dir: true, fetched: true });
+        // un «..» (del servidor o de la ruta escrita) sacaría el espejo de su carpeta y
+        // la sincronización podría truncar o borrar archivos locales
+        if part == ".." {
+            return Err("ruta no válida".into());
         }
+        if part == "." {
+            continue;
+        }
+        cur = cur.join(local_name(part));
+        // el remoto se calcula antes de tomar el candado: remote_of lo toma también
+        let remote = format!("{}/{}", sess.remote_of(cur.parent().unwrap()).unwrap_or_default().trim_end_matches('/'), part);
+        let mut nodes = sess.nodes.lock().unwrap();
+        if !nodes.contains_key(&cur) {
+            nodes.insert(cur.clone(), Node { remote, size: 0, mtime: 0, dir: true, fetched: true });
+        }
+        drop(nodes);
         let _ = std::fs::create_dir_all(&cur);
     }
     sess.sync(&cur)?;

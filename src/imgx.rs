@@ -211,7 +211,7 @@ fn blend_thumb(path: &Path) -> Option<Decoded> {
             let mut b = vec![0u8; size];
             r.read_exact(&mut b).ok()?;
             let (w, h) = (u32at(&b[0..4]), u32at(&b[4..8]));
-            if w == 0 || h == 0 || 8 + w * h * 4 > b.len() {
+            if w == 0 || h == 0 || w.checked_mul(h).and_then(|p| p.checked_mul(4)).and_then(|p| p.checked_add(8)).map(|p| p > b.len()).unwrap_or(true) {
                 return None;
             }
             let src = &b[8..8 + w * h * 4];

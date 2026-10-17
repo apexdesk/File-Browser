@@ -339,7 +339,7 @@ impl Thumbs {
             self.shared.st.lock().unwrap().inflight.remove(&key);
             match out {
                 Some(d) => {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([d.w, d.h], &d.rgba);
+                    let img = color_image(ctx, d.w, d.h, &d.rgba);
                     let tex = ctx.load_texture("t", img, egui::TextureOptions::LINEAR);
                     self.cache.insert(key, (tex, self.frame));
                 }
@@ -388,5 +388,21 @@ impl Thumbs {
         if !st.queue.is_empty() || had > 0 {
             self.shared.cv.notify_all();
         }
+    }
+}
+
+/// Imagen para subir como textura: si un lado supera el máximo de la GPU (egui lo comprueba con un
+/// `assert` y cerraría la aplicación) se reduce proporcionalmente.
+pub fn color_image(ctx: &egui::Context, w: usize, h: usize, rgba: &[u8]) -> egui::ColorImage {
+    let max = ctx.input(|i| i.max_texture_side).max(512);
+    if w <= max && h <= max || w == 0 || h == 0 {
+        return egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+    }
+    match image::RgbaImage::from_raw(w as u32, h as u32, rgba.to_vec()) {
+        Some(img) => {
+            let small = image::DynamicImage::ImageRgba8(img).thumbnail(max as u32, max as u32).into_rgba8();
+            egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw())
+        }
+        None => egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]),
     }
 }

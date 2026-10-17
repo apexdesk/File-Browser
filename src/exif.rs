@@ -226,7 +226,7 @@ pub fn summary(path: &Path) -> Vec<(String, String)> {
     if !date.is_empty() {
         // 2024:05:01 12:30:00 → 2024-05-01 12:30:00
         let mut d = date.clone();
-        if d.len() >= 10 {
+        if d.len() >= 10 && d.is_char_boundary(4) && d.is_char_boundary(5) && d.is_char_boundary(7) && d.is_char_boundary(8) && d.is_char_boundary(10) {
             d = format!("{}-{}-{}{}", &d[0..4], &d[5..7], &d[8..10], &d[10..]);
         }
         out.push((t("Fecha de la toma").into(), d));
