@@ -37,7 +37,7 @@ enum VMode {
     /// Carpeta y todas sus subcarpetas en una sola lista.
     Deep,
     /// Resultados de una búsqueda por nombre (en la carpeta o en todo el equipo).
-    Search { query: String, all: bool },
+    Search { query: String, all: bool, content: bool },
     /// Archivos abiertos hace poco (ubicación «Recientes»).
     Recent,
     /// Contenido de la papelera del sistema (ubicación «Papelera»).
@@ -138,6 +138,11 @@ struct BatchDlg {
     number: bool,
     start: u32,
     case: u8,
+    /// Plantilla del nombre (vacía = se parte del nombre original): {nombre} {n} {n:3} {fecha} {padre}.
+    template: String,
+    regex: bool,
+    mtimes: Vec<i64>,
+    parent: String,
 }
 
 /// Acción reversible registrada para deshacer/rehacer.
@@ -1571,10 +1576,13 @@ impl App {
                     ctx.request_repaint();
                 });
             }
-            VMode::Search { query, all } => {
+            VMode::Search { query, all, content } => {
                 let q = query.trim().to_string();
                 if q.is_empty() {
                     self.loading = false;
+                } else if content {
+                    let roots = if all { tools::all_roots() } else { vec![path] };
+                    self.search_st = Some(crate::contentsearch::spawn(roots, q, self.cfg.show_hidden, self.ctx.clone()));
                 } else {
                     let indexed = if self.cfg.index_enabled {
                         index::spawn_search(if all { None } else { Some(path.clone()) }, q.clone(), self.cfg.show_hidden, self.ctx.clone())
@@ -4683,16 +4691,17 @@ impl App {
     fn mode_strip(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal;
         match self.vmode.clone() {
-            VMode::Search { query, all } => {
+            VMode::Search { query, all, content } => {
                 let mut run = false;
                 let mut new_all = all;
+                let mut new_content = content;
                 let mut close = false;
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let w = (ui.available_width() - 400.0).clamp(120.0, 420.0);
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.sbuf)
-                            .hint_text(t("Nombre contiene…"))
+                            .hint_text(if content { t("Texto contenido…") } else { t("Nombre contiene…") })
                             .desired_width(w)
                             .margin(egui::Margin::symmetric(8, 6)),
                     );
@@ -4712,6 +4721,10 @@ impl App {
                     }
                     if ui.selectable_label(all, t("Todo el equipo")).clicked() && !all {
                         new_all = true;
+                        run = true;
+                    }
+                    if ui.selectable_label(content, t("En el contenido")).on_hover_text(t("Busca el texto dentro de archivos de texto, PDF y documentos de oficina")).clicked() {
+                        new_content = !content;
                         run = true;
                     }
                     if ui.button(t("Cerrar búsqueda")).clicked() {
@@ -4738,7 +4751,7 @@ impl App {
                 } else if run {
                     let p = self.cwd.clone();
                     self.preview = None;
-                    self.load_mode(p, false, VMode::Search { query: self.sbuf.clone(), all: new_all });
+                    self.load_mode(p, false, VMode::Search { query: self.sbuf.clone(), all: new_all, content: new_content });
                 }
             }
             VMode::Recent => {
@@ -5889,16 +5902,66 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-fn batch_name(old: &str, d: &BatchDlg, i: usize) -> String {
+/// Expande {nombre}, {n}, {n:ANCHO}, {fecha} y {padre} de la plantilla.
+fn expand_template(tpl: &str, stem: &str, n: usize, date: &str, parent: &str) -> String {
+    let mut out = String::new();
+    let mut rest = tpl;
+    while let Some(a) = rest.find('{') {
+        out.push_str(&rest[..a]);
+        let Some(b) = rest[a..].find('}') else {
+            rest = &rest[a..];
+            break;
+        };
+        let key = &rest[a + 1..a + b];
+        match key {
+            "nombre" => out.push_str(stem),
+            "fecha" => out.push_str(date),
+            "padre" => out.push_str(parent),
+            "n" => out.push_str(&n.to_string()),
+            k if k.starts_with("n:") => match k[2..].parse::<usize>() {
+                Ok(w) if w <= 12 => out.push_str(&format!("{n:0w$}")),
+                _ => out.push_str(&rest[a..a + b + 1]),
+            },
+            _ => out.push_str(&rest[a..a + b + 1]),
+        }
+        rest = &rest[a + b + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn batch_name(old: &str, d: &BatchDlg, i: usize, re: Option<&regex::Regex>) -> String {
     let (stem, ext) = split_ext(old);
-    let mut s = if d.find.is_empty() { stem.to_string() } else { stem.replace(&d.find, &d.repl) };
+    let mut s = if d.template.trim().is_empty() {
+        stem.to_string()
+    } else {
+        let date = d.mtimes.get(i).map(|&m| crate::fsys::fmt_time(m)).unwrap_or_default();
+        expand_template(&d.template, stem, d.start as usize + i, date.get(..10).unwrap_or(""), &d.parent)
+    };
+    if !d.find.is_empty() {
+        s = match (d.regex, re) {
+            (true, Some(r)) => r.replace_all(&s, d.repl.as_str()).into_owned(),
+            (true, None) => s,
+            _ => s.replace(&d.find, &d.repl),
+        };
+    }
     match d.case {
         1 => s = s.to_lowercase(),
         2 => s = s.to_uppercase(),
+        3 => {
+            s = s
+                .split(' ')
+                .map(|w| {
+                    let mut c = w.chars();
+                    c.next().map(|f| f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()).unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         _ => {}
     }
     s = format!("{}{}{}", d.prefix, s, d.suffix);
-    if d.number {
+    if d.number && d.template.trim().is_empty() {
         s = format!("{} {:03}", s, d.start as usize + i);
     }
     if ext.is_empty() { s } else { format!("{s}.{ext}") }
@@ -6247,7 +6310,7 @@ impl App {
         let name = |p: &PathBuf| self.dir_label(p);
         let mode = if i == self.cur_tab { &self.vmode } else { &self.tabs[i].vmode };
         match mode {
-            VMode::Search { query, all } => {
+            VMode::Search { query, all, .. } => {
                 let scope = if *all { t("todo el equipo").to_string() } else if i == self.cur_tab { name(&self.cwd) } else { name(&self.tabs[i].cwd) };
                 return if query.trim().is_empty() { format!("{} · {}", t("Buscar"), scope) } else { format!("«{}» · {}", query.trim(), scope) };
             }
@@ -7364,13 +7427,24 @@ impl App {
         if names.len() < 2 {
             return;
         }
+        let mut mtimes = Vec::new();
+        self.for_each_selected(|i| {
+            if let Some(e) = self.entries.get(i as usize) {
+                mtimes.push(e.mtime);
+            }
+        });
+        let parent = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.dlg = Dlg::Batch(BatchDlg {
+            template: String::new(),
+            regex: false,
+            mtimes,
+            parent,
             names,
             find: String::new(),
             repl: String::new(),
             prefix: String::new(),
             suffix: String::new(),
-            number: true,
+            number: false,
             start: 1,
             case: 0,
         });
@@ -7647,7 +7721,7 @@ impl App {
         self.new_tab(root.clone());
         self.sbuf = query.clone();
         self.search_focus = true;
-        self.load_mode(root, false, VMode::Search { query, all });
+        self.load_mode(root, false, VMode::Search { query, all, content: false });
     }
 
     fn search_all_from_filter(&mut self) {
@@ -8273,71 +8347,86 @@ impl App {
                 keep = act == 0;
             }
             Dlg::Batch(d) => {
-                let new: Vec<String> = d.names.iter().enumerate().map(|(i, n)| batch_name(n, d, i)).collect();
-                let mut seen: HashSet<&str> = HashSet::new();
+                let re = if d.regex && !d.find.is_empty() { regex::Regex::new(&d.find).ok() } else { None };
+                let bad_re = d.regex && !d.find.is_empty() && re.is_none();
+                let new: Vec<String> = d.names.iter().enumerate().map(|(i, n)| batch_name(n, d, i, re.as_ref())).collect();
                 let olds: HashSet<&str> = d.names.iter().map(|s| s.as_str()).collect();
-                let mut conflict = false;
+                let mut seen: HashSet<&str> = HashSet::new();
+                // por fila: ¿tiene problema? (vacío, repetido, con barra o ya existente)
+                let mut bad: Vec<bool> = Vec::with_capacity(new.len());
                 for (o, n) in d.names.iter().zip(&new) {
-                    if n.is_empty() || n.contains(['/', '\\']) || !seen.insert(n.as_str()) {
-                        conflict = true;
-                    } else if n != o && !olds.contains(n.as_str()) && self.cwd.join(n).exists() {
-                        conflict = true;
-                    }
+                    let b = n.is_empty() || n.contains(['/', '\\']) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && self.cwd.join(n).exists());
+                    bad.push(b);
                 }
+                let conflict = bad.iter().any(|b| *b) || bad_re;
+                let changes = d.names.iter().zip(&new).filter(|(o, n)| o != n).count();
                 let mut act = 0;
-                egui::Window::new(t("Renombrar en lote"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(460.0);
-                        egui::Grid::new("batch").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                            ui.label(t("Buscar"));
-                            ui.add(egui::TextEdit::singleline(&mut d.find).desired_width(280.0));
-                            ui.end_row();
-                            ui.label(t("Reemplazar por"));
-                            ui.add(egui::TextEdit::singleline(&mut d.repl).desired_width(280.0));
-                            ui.end_row();
-                            ui.label(t("Prefijo"));
-                            ui.add(egui::TextEdit::singleline(&mut d.prefix).desired_width(280.0));
-                            ui.end_row();
-                            ui.label(t("Sufijo"));
-                            ui.add(egui::TextEdit::singleline(&mut d.suffix).desired_width(280.0));
-                            ui.end_row();
-                            ui.label(t("Numerar"));
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut d.number, t("añadir contador"));
-                                ui.add_enabled(d.number, egui::DragValue::new(&mut d.start).range(0..=99999).prefix(t("desde ")));
-                            });
-                            ui.end_row();
-                            ui.label(t("Mayúsculas"));
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut d.case, 0, t("sin cambio"));
-                                ui.selectable_value(&mut d.case, 1, t("minúsculas"));
-                                ui.selectable_value(&mut d.case, 2, t("MAYÚSCULAS"));
-                            });
-                            ui.end_row();
-                        });
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(t("Vista previa")).size(11.0).color(pal.subtle).strong());
-                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                            for (o, n) in d.names.iter().zip(&new).take(60) {
-                                ui.label(egui::RichText::new(format!("{o}  ->  {n}")).size(12.5));
-                            }
-                        });
-                        if conflict {
-                            ui.colored_label(Color32::from_rgb(235, 100, 100), t("Hay nombres vacíos, repetidos o que ya existen."));
-                        }
-                        ui.add_space(8.0);
+                let mut open = true;
+                let width = 560.0f32.min(ctx.content_rect().width() - 56.0).max(260.0);
+                let fw = (width - 150.0).max(120.0);
+                theme::card_window(ctx, &pal, t("Renombrar en lote"), 560.0, &mut open, |ui| {
+                    egui::Grid::new("batch").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                        ui.label(t("Plantilla"));
+                        ui.add(egui::TextEdit::singleline(&mut d.template).hint_text("{nombre} {n:3} {fecha} {padre}").desired_width(fw));
+                        ui.end_row();
+                        ui.label(t("Buscar"));
+                        ui.add(egui::TextEdit::singleline(&mut d.find).desired_width(fw));
+                        ui.end_row();
+                        ui.label(t("Reemplazar por"));
+                        ui.add(egui::TextEdit::singleline(&mut d.repl).hint_text(if d.regex { "$1" } else { "" }).desired_width(fw));
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut d.regex, t("Expresión regular"));
+                        ui.end_row();
+                        ui.label(t("Prefijo"));
+                        ui.add(egui::TextEdit::singleline(&mut d.prefix).desired_width(fw));
+                        ui.end_row();
+                        ui.label(t("Sufijo"));
+                        ui.add(egui::TextEdit::singleline(&mut d.suffix).desired_width(fw));
+                        ui.end_row();
+                        ui.label(t("Numerar"));
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!conflict, egui::Button::new(t("Renombrar"))).clicked() {
+                            ui.add_enabled(d.template.trim().is_empty(), egui::Checkbox::new(&mut d.number, t("añadir contador")));
+                            ui.add_enabled(d.number || !d.template.trim().is_empty(), egui::DragValue::new(&mut d.start).range(0..=99999).prefix(t("desde ")));
+                        });
+                        ui.end_row();
+                        ui.label(t("Mayúsculas"));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(&mut d.case, 0, t("sin cambio"));
+                            ui.selectable_value(&mut d.case, 1, t("minúsculas"));
+                            ui.selectable_value(&mut d.case, 2, t("MAYÚSCULAS"));
+                            ui.selectable_value(&mut d.case, 3, t("Título"));
+                        });
+                        ui.end_row();
+                    });
+                    theme::section(ui, &pal, t("Vista previa"));
+                    egui::ScrollArea::vertical().id_salt("batch_prev").min_scrolled_height(180.0).max_height(180.0).auto_shrink([false, false]).show(ui, |ui| {
+                        for ((o, n), b) in d.names.iter().zip(&new).zip(&bad).take(300) {
+                            let col = if *b { Color32::from_rgb(235, 100, 100) } else if o == n { pal.subtle } else { pal.text };
+                            ui.add(egui::Label::new(egui::RichText::new(format!("{o}  ->  {n}")).size(12.5).color(col)).truncate());
+                        }
+                    });
+                    if bad_re {
+                        ui.colored_label(Color32::from_rgb(235, 100, 100), t("Expresión regular no válida."));
+                    } else if conflict {
+                        ui.colored_label(Color32::from_rgb(235, 100, 100), t("Hay nombres vacíos, repetidos o que ya existen."));
+                    }
+                    ui.add_space(12.0);
+                    ui.allocate_ui_with_layout(vec2(width - 32.0, 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add_enabled_ui(!conflict && changes > 0, |ui| {
+                            if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Renombrar")).clicked() {
                                 act = 1;
                             }
-                            if ui.button(t("Cancelar")).clicked() {
-                                act = 2;
-                            }
                         });
+                        if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                            act = 2;
+                        }
                     });
+                });
+                if !open {
+                    act = 2;
+                }
                 if act == 1 && self.remote_ro(&self.cwd.clone()) {
                     act = 2;
                 }
@@ -8953,6 +9042,20 @@ impl App {
                             d.pw2 = "abd".into();
                         }
                     }
+                }
+                "batch" => {
+                    self.select_range(0, 3, false);
+                    self.open_batch();
+                    if let Dlg::Batch(d) = &mut self.dlg {
+                        d.template = "{padre}_{n:3}".into();
+                        d.find = "(a|e)".into();
+                        d.regex = true;
+                        d.repl = "_".into();
+                        d.case = 3;
+                    }
+                }
+                "pass" => {
+                    self.dlg = Dlg::ArchPass(ArchPass { src: PathBuf::from("/tmp/secreto.zip"), dst: PathBuf::from("/tmp/x"), meta: OpMeta::Other, pass: String::new(), show: false, wrong: true, focus: true });
                 }
                 "del" => self.confirm_delete = Some(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]),
                 "props" => self.open_props(),

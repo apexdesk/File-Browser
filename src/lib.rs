@@ -4,6 +4,7 @@ pub mod archive;
 pub mod audio;
 pub mod index;
 pub mod commands;
+pub mod contentsearch;
 pub mod diskusage;
 pub mod docview;
 pub mod comic;
