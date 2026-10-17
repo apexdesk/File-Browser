@@ -350,6 +350,7 @@ impl PaneState {
 }
 
 pub struct App {
+    traced_ui: bool,
     cfg: Config,
     pal: Pal,
     ctx: egui::Context,
@@ -953,15 +954,15 @@ impl App {
         let sys_theme = Arc::new(std::sync::atomic::AtomicU8::new(0));
         #[cfg(target_os = "linux")]
         {
-            let first = detect_system_dark();
-            sys_theme.store(first.map(|d| if d { 2 } else { 1 }).unwrap_or(0), Ordering::Relaxed);
+            // la detección lanza procesos (gdbus, gsettings): fuera del arranque; mientras tanto se
+            // usa el último tema guardado y, si el sistema ha cambiado, se ajusta con la animación
             let (st, c) = (sys_theme.clone(), ctx.clone());
             std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(3));
                 let v = detect_system_dark().map(|d| if d { 2 } else { 1 }).unwrap_or(0);
                 if st.swap(v, Ordering::Relaxed) != v {
                     c.request_repaint();
                 }
+                std::thread::sleep(Duration::from_secs(3));
             });
         }
         if cfg.theme_mode == 0 {
@@ -1040,6 +1041,7 @@ impl App {
             index::start(tools::all_roots(), cc.egui_ctx.clone());
         }
         let mut app = App {
+            traced_ui: false,
             transparent: !cfg.native_deco,
             thumbs: Thumbs::new(&ctx),
             pworker: preview::Worker::new(&ctx),
@@ -8646,6 +8648,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.traced_ui {
+            self.traced_ui = true;
+            if std::env::var_os("FB_SHOT").is_some() {
+                eprintln!("[trace] primer fotograma: {:?}", crate::T0.get().map(|t| t.elapsed()));
+            }
+        }
         self.drag_out_tick(&ctx, frame);
         self.window_drag_tick(&ctx);
         let pal = self.pal;

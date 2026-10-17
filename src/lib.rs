@@ -55,13 +55,30 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
     eframe::NativeOptions { viewport: vb, ..Default::default() }
 }
 
+/// Instante de arranque del proceso (para la traza de rendimiento de FB_SHOT).
+pub static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result {
-    eframe::run_native("File Browser", opts, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
+    if std::env::var_os("FB_SHOT").is_some() {
+        eprintln!("[trace] antes de eframe: {:?}", T0.get().map(|t| t.elapsed()));
+    }
+    eframe::run_native("File Browser", opts, Box::new(move |cc| {
+            let tr = std::env::var_os("FB_SHOT").is_some();
+            if tr {
+                eprintln!("[trace] contexto GL listo: {:?}", T0.get().map(|t| t.elapsed()));
+            }
+            let a = app::App::new(cc, cfg);
+            if tr {
+                eprintln!("[trace] App::new listo: {:?}", T0.get().map(|t| t.elapsed()));
+            }
+            Ok(Box::new(a))
+        }))
 }
 
 /// Punto de entrada de escritorio.
 #[cfg(not(target_os = "android"))]
 pub fn run() -> eframe::Result {
+    let _ = T0.set(std::time::Instant::now());
     // `ssh` nos llama como programa de contraseñas (SSH_ASKPASS) para conectar por SFTP
     sftp::askpass_main();
     if let system::Cli::Exit(code) = system::start() {
