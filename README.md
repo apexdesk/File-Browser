@@ -134,4 +134,4 @@ It runs sandboxed with access to your files (`--filesystem=host`); launching ext
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[PolyForm Strict License 1.0.0](LICENSE). The source is public so you can read and audit it, and you may use it for personal and other noncommercial purposes. Distributing it or making changes or derivative works is not permitted, nor is commercial use. This is a source-available licence, not an open-source one. Versions up to v0.8.3 were published under MIT and remain available under those terms. Third-party dependencies keep their own licences.
