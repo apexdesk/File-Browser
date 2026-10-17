@@ -475,7 +475,7 @@ pub enum Op {
     Copy { srcs: Vec<PathBuf>, dst: PathBuf, mv: bool, policy: Policy },
     Trash(Vec<PathBuf>),
     Delete(Vec<PathBuf>),
-    Zip { srcs: Vec<PathBuf>, out: PathBuf },
+    Compress { srcs: Vec<PathBuf>, out: PathBuf, opts: crate::tools::CompressOpts },
     Unzip { src: PathBuf, dst: PathBuf },
 }
 
@@ -801,11 +801,11 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     ctx.request_repaint();
                 }
             }
-            Op::Zip { srcs, out } => {
+            Op::Compress { srcs, out, opts } => {
                 let total: u64 = srcs.iter().map(|s| size_of_tree(s)).sum();
                 p.total.store(total.max(1), AO::Relaxed);
                 *p.label.lock().unwrap() = t("Comprimiendo…").into();
-                match crate::tools::zip_paths(&srcs, &out, &p, &ctx) {
+                match crate::tools::compress_paths(&srcs, &out, &opts, &p, &ctx) {
                     Ok(()) => {
                         p.created.lock().unwrap().push(out.file_name().unwrap().to_string_lossy().into_owned());
                         p.pairs.lock().unwrap().push((out.clone(), out.clone()));

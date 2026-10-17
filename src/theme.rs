@@ -628,6 +628,7 @@ fn tone_color(p: &Pal, t: Tone) -> Color32 {
 /// Botón de diálogo: relleno según su función, esquinas redondas y realce al pasar el ratón.
 pub fn dialog_button(ui: &mut egui::Ui, p: &Pal, kind: Btn, text: &str) -> egui::Response {
     let font = egui::FontId::proportional(14.0);
+    let enabled = ui.is_enabled();
     let (fill, fg, border) = match kind {
         Btn::Primary => (p.accent, Color32::WHITE, p.accent),
         Btn::Danger => (Color32::from_rgb(214, 70, 70), Color32::WHITE, Color32::from_rgb(214, 70, 70)),
@@ -635,6 +636,8 @@ pub fn dialog_button(ui: &mut egui::Ui, p: &Pal, kind: Btn, text: &str) -> egui:
     };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
     let size = vec2((galley.size().x + 36.0).max(84.0), 34.0);
+    let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
+    let (fill, fg, border) = (dim(fill), dim(fg), dim(border));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut fill = fill;

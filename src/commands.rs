@@ -107,7 +107,7 @@ pub const ALL: &[Info] = &[
     c!(OpenWith, "openwith", "Abrir con…", "", true),
     c!(Hash, "hash", "Calcular hash…", "", true),
     c!(Dups, "dups", "Buscar archivos duplicados…", "", true),
-    c!(Zip, "zip", "Comprimir en ZIP", "", true),
+    c!(Zip, "zip", "Comprimir…", "", true),
     c!(Unzip, "unzip", "Extraer aquí", "", true),
     c!(Copy, "copy", "Copiar", "Ctrl+C", false),
     c!(Cut, "cut", "Cortar", "Ctrl+X", false),

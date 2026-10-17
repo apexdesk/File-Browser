@@ -209,6 +209,7 @@ enum Dlg {
     None,
     OpenWith(OpenWithDlg),
     Hash(HashDlg),
+    Compress(CompressDlg),
     Dups(DupsDlg),
     Props(PropsDlg),
     Batch(BatchDlg),
@@ -224,6 +225,20 @@ enum Dlg {
     Options,
     About,
     Keys,
+}
+
+/// Diálogo «Comprimir…».
+struct CompressDlg {
+    srcs: Vec<PathBuf>,
+    /// Nombre sin extensión (la pone el formato).
+    name: String,
+    fmt: tools::ArchFmt,
+    level: u32,
+    protect: bool,
+    pw: String,
+    pw2: String,
+    show: bool,
+    focus: bool,
 }
 
 /// Datos para conectar con un recurso de red (la contraseña solo vive en memoria).
@@ -2121,7 +2136,7 @@ impl App {
         let touches = match &op {
             Op::Copy { srcs, dst, mv, .. } => virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
             Op::Trash(v) | Op::Delete(v) => remote(v),
-            Op::Zip { srcs, out } => crate::sftp::is_remote(out) || remote(srcs),
+            Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs),
             Op::Unzip { src, dst } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
         };
         if touches {
@@ -3095,7 +3110,7 @@ fn op_desc(op: &Op) -> String {
         Op::Copy { srcs, mv, .. } => format!("{} {}", if *mv { t("Moviendo") } else { t("Copiando") }, what(srcs)),
         Op::Trash(v) => format!("{} {}", t("Moviendo a la papelera"), what(v)),
         Op::Delete(v) => format!("{} {}", t("Eliminando"), what(v)),
-        Op::Zip { srcs, .. } => format!("{} {}", t("Comprimiendo"), what(srcs)),
+        Op::Compress { srcs, .. } => format!("{} {}", t("Comprimiendo"), what(srcs)),
         Op::Unzip { src, .. } => format!("{} {}", t("Extrayendo"), what(std::slice::from_ref(src))),
     }
 }
@@ -5644,7 +5659,7 @@ impl App {
                 ui.close();
             }
             ui.separator();
-            if ui.button(t("Comprimir en ZIP")).clicked() {
+            if ui.button(t("Comprimir…")).clicked() {
                 self.do_zip();
                 ui.close();
             }
@@ -6516,16 +6531,16 @@ impl App {
                     self.filter_focus = true;
                 }
                 ui.separator();
-                if mi(ui, t("Comprimir en ZIP"), "", has_sel) {
+                if mi(ui, t("Comprimir…"), "", has_sel) {
                     self.do_zip();
+                }
+                if mi(ui, t("Calcular hash (MD5, SHA-1, SHA-256)…"), "", self.sel_count == 1) {
+                    self.open_hash();
                 }
                 if mi(ui, t("Extraer aquí"), "", one_zip) {
                     self.do_unzip();
                 }
                 ui.separator();
-                if mi(ui, t("Calcular hash (MD5, SHA-1, SHA-256)…"), "", self.sel_count == 1) {
-                    self.open_hash();
-                }
                 if mi(ui, t("Buscar archivos duplicados…"), "", true) {
                     self.open_dups();
                 }
@@ -7010,18 +7025,18 @@ impl App {
         self.start_op(Op::Copy { srcs, dst, mv: false, policy: Policy::Rename }, OpMeta::Copy { mv: false, replay: false });
     }
 
+    /// Abre el diálogo de compresión con ZIP, el nombre habitual y el nivel normal.
     fn do_zip(&mut self) {
         let srcs = self.selected_paths();
         if srcs.is_empty() {
             return;
         }
-        let base = if srcs.len() == 1 {
+        let name = if srcs.len() == 1 {
             srcs[0].file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "archivo".into())
         } else {
             self.cwd.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "archivo".into())
         };
-        let out = fsys::unique_path(&self.cwd, &format!("{base}.zip"));
-        self.start_op(Op::Zip { srcs, out }, OpMeta::Generated);
+        self.dlg = Dlg::Compress(CompressDlg { srcs, name, fmt: tools::ArchFmt::Zip, level: 6, protect: false, pw: String::new(), pw2: String::new(), show: false, focus: true });
     }
 
     /// Abre un comprimido como carpeta de sólo lectura: lo extrae a la caché (una vez) y navega dentro.
@@ -8412,6 +8427,92 @@ impl App {
                 }
                 keep = open && !done;
             }
+            Dlg::Compress(d) => {
+                let mut open = true;
+                let mut go = false;
+                let mut cancel = false;
+                let width = 460.0;
+                theme::card_window(ctx, &pal, t("Comprimir"), width, &mut open, |ui| {
+                    theme::section(ui, &pal, t("Formato"));
+                    let mut sel = match d.fmt {
+                        tools::ArchFmt::Zip => 0u8,
+                        tools::ArchFmt::TarGz => 1,
+                        tools::ArchFmt::SevenZ => 2,
+                    };
+                    theme::tab_bar(ui, &pal, &mut sel, &["ZIP", "TAR.GZ", "7Z"]);
+                    d.fmt = [tools::ArchFmt::Zip, tools::ArchFmt::TarGz, tools::ArchFmt::SevenZ][sel as usize];
+                    if !d.fmt.can_encrypt() {
+                        d.protect = false;
+                    }
+                    theme::section(ui, &pal, t("Nombre del archivo"));
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(width - 90.0));
+                        if d.focus {
+                            r.request_focus();
+                            d.focus = false;
+                        }
+                        ui.label(egui::RichText::new(format!(".{}", d.fmt.ext())).color(pal.subtle));
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            go = true;
+                        }
+                    });
+                    theme::section(ui, &pal, t("Nivel de compresión"));
+                    let lv = [(0u32, t("Sin compresión")), (1, t("Rápida")), (6, t("Normal")), (9, t("Máxima"))];
+                    let cur = lv.iter().find(|(l, _)| *l == d.level).map(|(_, n)| *n).unwrap_or("");
+                    egui::ComboBox::from_id_salt("compress_level").selected_text(cur).width(200.0).show_ui(ui, |ui| {
+                        for (l, n) in lv {
+                            ui.selectable_value(&mut d.level, l, n);
+                        }
+                    });
+                    theme::section(ui, &pal, t("Contraseña"));
+                    ui.add_enabled_ui(d.fmt.can_encrypt(), |ui| {
+                        ui.checkbox(&mut d.protect, t("Proteger con contraseña"));
+                    });
+                    if !d.fmt.can_encrypt() {
+                        ui.label(egui::RichText::new(t("TAR.GZ no admite contraseña.")).size(12.0).color(pal.subtle));
+                    }
+                    if d.protect {
+                        ui.add_space(4.0);
+                        ui.add(egui::TextEdit::singleline(&mut d.pw).password(!d.show).hint_text(t("Contraseña")).desired_width(width - 20.0));
+                        ui.add(egui::TextEdit::singleline(&mut d.pw2).password(!d.show).hint_text(t("Repetir contraseña")).desired_width(width - 20.0));
+                        ui.checkbox(&mut d.show, t("Mostrar"));
+                        if !d.pw2.is_empty() && d.pw != d.pw2 {
+                            ui.label(egui::RichText::new(t("Las contraseñas no coinciden")).size(12.0).color(Color32::from_rgb(226, 86, 86)));
+                        }
+                        ui.add(egui::Label::new(egui::RichText::new(t("Cifrado AES-256. Otros programas lo abren; File Browser todavía no extrae archivos con contraseña.")).size(12.0).color(pal.subtle)).wrap());
+                    }
+                    ui.add_space(16.0);
+                    let valid = !d.name.trim().is_empty() && (!d.protect || (!d.pw.is_empty() && d.pw == d.pw2));
+                    ui.allocate_ui_with_layout(vec2(width, 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add_enabled_ui(valid, |ui| {
+                            if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Comprimir")).clicked() {
+                                go = true;
+                            }
+                        });
+                        if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                    if !valid {
+                        go = false;
+                    }
+                });
+                if cancel {
+                    open = false;
+                }
+                if go && open {
+                    let clean: String = d.name.trim().chars().filter(|c| !matches!(c, '/' | '\\' | '\0')).collect();
+                    let ext = format!(".{}", d.fmt.ext());
+                    let stem = clean.strip_suffix(&ext).unwrap_or(&clean).to_string();
+                    let out = fsys::unique_path(&self.cwd, &format!("{stem}{ext}"));
+                    let opts = tools::CompressOpts { fmt: d.fmt, level: d.level, password: if d.protect { Some(d.pw.clone()) } else { None } };
+                    let srcs = d.srcs.clone();
+                    self.start_op(Op::Compress { srcs, out, opts }, OpMeta::Generated);
+                    open = false;
+                }
+                keep = open;
+            }
             Dlg::Hash(d) => {
                 let mut open = true;
                 egui::Window::new(t("Hash del archivo"))
@@ -8672,6 +8773,17 @@ impl App {
                     self.dlg = Dlg::Options;
                     self.cfg.custom_themes.push(crate::config::CustomTheme { name: "Mio".into(), dark: true, colors: theme::palette(true).colors() });
                     self.edit_theme = "Mio".into();
+                }
+                "compress" => {
+                    if let Some(&i) = self.order.get(1) {
+                        self.select_only(i);
+                        self.do_zip();
+                        if let Dlg::Compress(d) = &mut self.dlg {
+                            d.protect = true;
+                            d.pw = "abc".into();
+                            d.pw2 = "abd".into();
+                        }
+                    }
                 }
                 "del" => self.confirm_delete = Some(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]),
                 "props" => self.open_props(),
