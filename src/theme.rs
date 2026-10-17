@@ -809,6 +809,10 @@ pub fn section(ui: &mut egui::Ui, p: &Pal, text: &str) {
 
 /// Ventana centrada con tarjeta redondeada y cabecera (título + cerrar). `open` pasa a false al cerrarla.
 pub fn card_window(ctx: &egui::Context, p: &Pal, title: &str, width: f32, open: &mut bool, body: impl FnOnce(&mut egui::Ui)) {
+    // en pantallas estrechas (móvil) la tarjeta se ajusta al ancho disponible y el contenido se desplaza
+    let screen = ctx.content_rect();
+    let width = width.min(screen.width() - 56.0).max(240.0);
+    let max_h = (screen.height() - 150.0).max(160.0);
     let frame = egui::Frame::new()
         .fill(p.panel)
         .stroke(Stroke::new(1.0, p.border))
@@ -832,7 +836,10 @@ pub fn card_window(ctx: &egui::Context, p: &Pal, title: &str, width: f32, open: 
                 });
             });
             ui.add_space(10.0);
-            body(ui);
+            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                ui.set_width(width - 8.0);
+                body(ui);
+            });
         });
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && ctx.memory(|m| m.focused().is_none()) {
         *open = false;

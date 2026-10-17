@@ -8257,8 +8257,8 @@ impl App {
                 let mut changed = false;
                 let mut res_sort = false;
                 let mut install_sys = false;
-                let width = 540.0;
-                theme::card_window(ctx, &pal, t("Opciones"), width, &mut open, |ui| {
+                let width = 540.0f32.min(ctx.content_rect().width() - 56.0).max(240.0) - 8.0;
+                theme::card_window(ctx, &pal, t("Opciones"), 540.0, &mut open, |ui| {
                         let mut tab = self.opts_tab;
                         theme::tab_bar(ui, &pal, &mut tab, &[t("General"), t("Columnas"), t("Temas")]);
                         self.opts_tab = tab;
@@ -8273,18 +8273,6 @@ impl App {
                             changed |= self.columns_editor(ui);
                             return;
                         }
-                        theme::section(ui, &pal, t("Vista"));
-                        changed |= ui.checkbox(&mut self.cfg.sys_icons, t("Usar iconos del sistema")).changed();
-                        changed |= ui.checkbox(&mut self.cfg.thumbs_on, t("Mostrar miniaturas de imágenes y vídeos")).changed();
-                        let hid = ui.checkbox(&mut self.cfg.show_hidden, t("Mostrar archivos ocultos")).changed();
-                        changed |= hid;
-                        res_sort |= hid;
-                        changed |= ui.checkbox(&mut self.cfg.show_sidebar, t("Mostrar barra lateral")).changed();
-                        changed |= ui.checkbox(&mut self.cfg.clip_panel, t("Mostrar panel del portapapeles")).changed();
-                        ui.horizontal(|ui| {
-                            ui.label(t("Tamaño de iconos"));
-                            changed |= ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false)).changed();
-                        });
                         theme::section(ui, &pal, t("Comportamiento"));
                         let mut single = self.cfg.single_click.unwrap_or(cfg!(target_os = "android"));
                         if ui.checkbox(&mut single, t("Abrir con un solo clic o toque")).changed() {
@@ -8315,6 +8303,18 @@ impl App {
                         }
                         changed |= ui.checkbox(&mut self.cfg.preview_window, t("Abrir el visor en una ventana aparte")).changed();
                         changed |= ui.checkbox(&mut self.cfg.native_deco, t("Usar la barra de título del sistema (requiere reiniciar)")).changed();
+                        theme::section(ui, &pal, t("Vista"));
+                        changed |= ui.checkbox(&mut self.cfg.sys_icons, t("Usar iconos del sistema")).changed();
+                        changed |= ui.checkbox(&mut self.cfg.thumbs_on, t("Mostrar miniaturas de imágenes y vídeos")).changed();
+                        let hid = ui.checkbox(&mut self.cfg.show_hidden, t("Mostrar archivos ocultos")).changed();
+                        changed |= hid;
+                        res_sort |= hid;
+                        changed |= ui.checkbox(&mut self.cfg.show_sidebar, t("Mostrar barra lateral")).changed();
+                        changed |= ui.checkbox(&mut self.cfg.clip_panel, t("Mostrar panel del portapapeles")).changed();
+                        ui.horizontal(|ui| {
+                            ui.label(t("Tamaño de iconos"));
+                            changed |= ui.add(egui::Slider::new(&mut self.cfg.zoom, 64.0..=200.0).show_value(false)).changed();
+                        });
                         theme::section(ui, &pal, t("Sistema"));
                         if system::can_install() {
                             if ui.button(t("Usar como gestor de archivos del sistema")).clicked() {
@@ -8350,7 +8350,7 @@ impl App {
                         ui.add_space(6.0);
                         ui.label(t("Intérprete del terminal (vacío = el predeterminado)"));
                         changed |= ui
-                            .add(egui::TextEdit::singleline(&mut self.cfg.shell).hint_text(crate::terminal::default_shell()).desired_width(320.0))
+                            .add(egui::TextEdit::singleline(&mut self.cfg.shell).hint_text(crate::terminal::default_shell()).desired_width(width - 20.0))
                             .changed();
                     });
                 if res_sort {
