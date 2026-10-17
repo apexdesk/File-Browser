@@ -5544,6 +5544,8 @@ impl App {
                     if ui.button(t("Mostrar en su carpeta")).clicked() {
                         self.reveal(&p);
                         ui.close();
+                        // la lista se ha recargado: `c` ya no es un índice válido
+                        return;
                     }
                 }
                 let e = &self.entries[c as usize];

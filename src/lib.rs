@@ -28,6 +28,8 @@ pub mod extras;
 pub mod fsys;
 pub mod gpu3d;
 pub mod pbr;
+#[cfg(test)]
+mod fuzz;
 pub mod i18n;
 pub mod mesh3d;
 pub mod netmount;
