@@ -27,6 +27,7 @@ pub mod config;
 pub mod extras;
 pub mod fsys;
 pub mod gpu3d;
+pub mod pbr;
 pub mod i18n;
 pub mod mesh3d;
 pub mod netmount;

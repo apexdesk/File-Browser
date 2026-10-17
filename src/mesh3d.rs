@@ -13,6 +13,8 @@ pub struct Mesh {
     pub center: [f32; 3],
     pub radius: f32,
     pub size: [f32; 3],
+    /// materiales y texturas (sólo glTF); el visor por GPU los usa, el software dibuja `tris` en plano
+    pub pbr: Option<std::sync::Arc<crate::pbr::Pbr>>,
 }
 
 impl Mesh {
@@ -37,7 +39,7 @@ impl Mesh {
         let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
         let size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
         let radius = ((size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt() / 2.0).max(1e-6);
-        Ok(Mesh { tris, center, radius, size })
+        Ok(Mesh { tris, center, radius, size, pbr: None })
     }
 }
 
@@ -594,7 +596,9 @@ impl Gltf {
         let count = a.get("count")?.num()? as usize;
         let ncomp = match a.get("type")?.str()? {
             "SCALAR" => 1,
+            "VEC2" => 2,
             "VEC3" => 3,
+            "VEC4" => 4,
             _ => return None,
         };
         let ct = a.get("componentType")?.num()? as u32;
@@ -608,16 +612,17 @@ impl Gltf {
         if count > 20_000_000 {
             return None;
         }
+        let normalized = matches!(a.get("normalized"), Some(crate::markup::Json::Bool(true)));
         let mut out = Vec::with_capacity(count * ncomp);
         for i in 0..count {
             for c in 0..ncomp {
                 let o = base + i * stride + c * csz;
                 let d = buf.get(o..o + csz)?;
                 out.push(match ct {
-                    5120 => d[0] as i8 as f64,
-                    5121 => d[0] as f64,
-                    5122 => i16::from_le_bytes([d[0], d[1]]) as f64,
-                    5123 => u16::from_le_bytes([d[0], d[1]]) as f64,
+                    5120 => d[0] as i8 as f64 / if normalized { 127.0 } else { 1.0 },
+                    5121 => d[0] as f64 / if normalized { 255.0 } else { 1.0 },
+                    5122 => i16::from_le_bytes([d[0], d[1]]) as f64 / if normalized { 32767.0 } else { 1.0 },
+                    5123 => u16::from_le_bytes([d[0], d[1]]) as f64 / if normalized { 65535.0 } else { 1.0 },
                     5125 => u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64,
                     5126 => f32::from_le_bytes([d[0], d[1], d[2], d[3]]) as f64,
                     _ => return None,
@@ -732,9 +737,310 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
             g.mesh_into(i, &ident, &mut tris).ok_or("malla no válida")?;
         }
     } else {
-        for r in roots {
+        for &r in &roots {
             g.walk(r, &ident, &mut tris, 0).ok_or("malla no válida")?;
         }
     }
-    Mesh::finish(tris)
+    let mut mesh = Mesh::finish(tris)?;
+    mesh.pbr = g.load_pbr(&roots, &ident, dir).map(std::sync::Arc::new);
+    Ok(mesh)
 }
+
+// ---------------------------------------------------------------------------
+// glTF: materiales PBR y texturas para el visor por GPU
+// ---------------------------------------------------------------------------
+
+const MAX_PBR_VERTS: usize = 5_000_000;
+const MAX_TEX_SIDE: u32 = 2048;
+
+fn jnum(j: Option<&crate::markup::Json>, d: f32) -> f32 {
+    j.and_then(|x| x.num()).map(|x| x as f32).unwrap_or(d)
+}
+
+fn jvec<const N: usize>(j: Option<&crate::markup::Json>, d: [f32; N]) -> [f32; N] {
+    let mut o = d;
+    if let Some(a) = j {
+        let v: Vec<f32> = a.arr().iter().filter_map(|x| x.num()).map(|x| x as f32).collect();
+        if v.len() >= N {
+            o.copy_from_slice(&v[..N]);
+        }
+    }
+    o
+}
+
+fn wrap_code(w: Option<f64>) -> u32 {
+    match w.map(|x| x as u32) {
+        Some(33071) => 0x812F, // CLAMP_TO_EDGE
+        Some(33648) => 0x8370, // MIRRORED_REPEAT
+        _ => 0x2901,           // REPEAT
+    }
+}
+
+impl Gltf {
+    /// Bytes de una imagen: URI de datos, archivo junto al modelo o vista de búfer.
+    fn image_bytes(&self, img: &crate::markup::Json, dir: &Path) -> Option<Vec<u8>> {
+        if let Some(u) = img.get("uri").and_then(|u| u.str()) {
+            if u.starts_with("data:") {
+                return Some(b64(u.split_once(',')?.1));
+            }
+            let rel = u.replace("%20", " ");
+            if rel.contains("..") || rel.starts_with('/') {
+                return None;
+            }
+            return std::fs::read(dir.join(rel)).ok();
+        }
+        let view = self.json.get("bufferViews")?.at(img.get("bufferView")?.num()? as usize)?;
+        let buf = self.buffers.get(view.get("buffer")?.num()? as usize)?;
+        let off = view.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize;
+        let len = view.get("byteLength")?.num()? as usize;
+        buf.get(off..off + len).map(|b| b.to_vec())
+    }
+
+    fn decode_image(bytes: &[u8]) -> Option<crate::pbr::Image> {
+        let d = if bytes.starts_with(&[0xFF, 0xD8]) {
+            crate::thumbs::decode_jpeg_from(std::io::Cursor::new(bytes), MAX_TEX_SIDE, 1)?
+        } else {
+            let img = image::load_from_memory(bytes).ok()?;
+            let img = if img.width() > MAX_TEX_SIDE || img.height() > MAX_TEX_SIDE { img.thumbnail(MAX_TEX_SIDE, MAX_TEX_SIDE) } else { img };
+            let rgba = img.into_rgba8();
+            crate::thumbs::Decoded { w: rgba.width() as usize, h: rgba.height() as usize, rgba: rgba.into_raw() }
+        };
+        Some(crate::pbr::Image { w: d.w, h: d.h, rgba: d.rgba })
+    }
+
+    /// Materiales, texturas y geometría con transformaciones. `None` si no hay nada que mostrar con PBR.
+    fn load_pbr(&self, roots: &[usize], ident: &M4, dir: &Path) -> Option<crate::pbr::Pbr> {
+        use crate::pbr::*;
+        let mut pbr = Pbr::default();
+        // texturas del archivo; las imágenes se decodifican sólo si alguna se usa
+        let jtex = self.json.get("textures").map(|t| t.arr()).unwrap_or(&[]);
+        let jimg = self.json.get("images").map(|t| t.arr()).unwrap_or(&[]);
+        let jsmp = self.json.get("samplers").map(|t| t.arr()).unwrap_or(&[]);
+        let mut used: Vec<bool> = vec![false; jtex.len()];
+        let tref = |t: Option<&crate::markup::Json>, used: &mut Vec<bool>| -> Option<usize> {
+            let i = t?.get("index")?.num()? as usize;
+            if i < used.len() {
+                used[i] = true;
+                Some(i)
+            } else {
+                None
+            }
+        };
+        for m in self.json.get("materials").map(|m| m.arr()).unwrap_or(&[]) {
+            let mut mat = Material::default();
+            // valores por defecto de glTF cuando el material existe
+            mat.metallic = 1.0;
+            mat.roughness = 1.0;
+            if let Some(p) = m.get("pbrMetallicRoughness") {
+                mat.base = jvec(p.get("baseColorFactor"), [1.0; 4]);
+                mat.metallic = jnum(p.get("metallicFactor"), 1.0);
+                mat.roughness = jnum(p.get("roughnessFactor"), 1.0);
+                mat.base_tex = tref(p.get("baseColorTexture"), &mut used);
+                mat.mr_tex = tref(p.get("metallicRoughnessTexture"), &mut used);
+            }
+            if let Some(sg) = m.get("extensions").and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness")) {
+                // aproximación: difuso como color base, sin metal y rugosidad = 1 - brillo
+                let d = jvec(sg.get("diffuseFactor"), [1.0; 4]);
+                mat.base = d;
+                mat.metallic = 0.0;
+                mat.roughness = 1.0 - jnum(sg.get("glossinessFactor"), 1.0);
+                mat.base_tex = tref(sg.get("diffuseTexture"), &mut used);
+                mat.mr_tex = None;
+            }
+            if let Some(n) = m.get("normalTexture") {
+                mat.normal_tex = tref(Some(n), &mut used);
+                mat.normal_scale = jnum(n.get("scale"), 1.0);
+            }
+            if let Some(o) = m.get("occlusionTexture") {
+                mat.occlusion_tex = tref(Some(o), &mut used);
+                mat.occlusion_strength = jnum(o.get("strength"), 1.0);
+            }
+            mat.emissive_tex = tref(m.get("emissiveTexture"), &mut used);
+            mat.emissive = jvec(m.get("emissiveFactor"), [0.0; 3]);
+            if let Some(s) = m.get("extensions").and_then(|e| e.get("KHR_materials_emissive_strength")) {
+                let k = jnum(s.get("emissiveStrength"), 1.0);
+                for c in &mut mat.emissive {
+                    *c *= k;
+                }
+            }
+            mat.alpha_mode = match m.get("alphaMode").and_then(|a| a.str()) {
+                Some("MASK") => 1,
+                Some("BLEND") => 2,
+                _ => 0,
+            };
+            mat.cutoff = jnum(m.get("alphaCutoff"), 0.5);
+            pbr.materials.push(mat);
+        }
+        // imágenes usadas
+        let mut img_of: Vec<Option<usize>> = vec![None; jimg.len()];
+        for (ti, t) in jtex.iter().enumerate() {
+            if !used[ti] {
+                pbr.textures.push(Tex { image: 0, wrap_s: 0x2901, wrap_t: 0x2901 });
+                continue;
+            }
+            // EXT_texture_webp / basisu: se prefiere la fuente que sepamos leer
+            let src = t.get("extensions").and_then(|e| e.get("EXT_texture_webp")).and_then(|w| w.get("source")).or_else(|| t.get("source")).and_then(|x| x.num()).map(|x| x as usize);
+            let smp = t.get("sampler").and_then(|x| x.num()).and_then(|i| jsmp.get(i as usize));
+            let (ws, wt) = (wrap_code(smp.and_then(|s| s.get("wrapS")).and_then(|x| x.num())), wrap_code(smp.and_then(|s| s.get("wrapT")).and_then(|x| x.num())));
+            let mut image = 0;
+            if let Some(si) = src.filter(|i| *i < jimg.len()) {
+                if img_of[si].is_none() && pbr.images.len() < 96 {
+                    if let Some(im) = self.image_bytes(&jimg[si], dir).and_then(|b| Self::decode_image(&b)) {
+                        img_of[si] = Some(pbr.images.len());
+                        pbr.images.push(im);
+                    }
+                }
+                if let Some(k) = img_of[si] {
+                    image = k;
+                    pbr.textures.push(Tex { image, wrap_s: ws, wrap_t: wt });
+                    continue;
+                }
+            }
+            // imagen ilegible: sin textura
+            pbr.textures.push(Tex { image: usize::MAX, wrap_s: ws, wrap_t: wt });
+            let _ = image;
+        }
+        // las texturas ilegibles se anulan en los materiales
+        let bad = |t: &mut Option<usize>, tex: &[Tex]| {
+            if let Some(i) = *t {
+                if tex.get(i).map(|x| x.image == usize::MAX).unwrap_or(true) {
+                    *t = None;
+                }
+            }
+        };
+        for m in &mut pbr.materials {
+            bad(&mut m.base_tex, &pbr.textures);
+            bad(&mut m.mr_tex, &pbr.textures);
+            bad(&mut m.normal_tex, &pbr.textures);
+            bad(&mut m.occlusion_tex, &pbr.textures);
+            bad(&mut m.emissive_tex, &pbr.textures);
+        }
+        // geometría
+        let mut total = 0usize;
+        if roots.is_empty() {
+            for i in 0..self.json.get("meshes").map(|m| m.arr().len()).unwrap_or(0) {
+                self.prims_of(i, ident, &mut pbr, &mut total)?;
+            }
+        } else {
+            for &r in roots {
+                self.walk_pbr(r, ident, &mut pbr, &mut total, 0)?;
+            }
+        }
+        if pbr.prims.is_empty() {
+            return None;
+        }
+        Some(pbr)
+    }
+
+    fn walk_pbr(&self, node: usize, parent: &M4, pbr: &mut crate::pbr::Pbr, total: &mut usize, depth: u32) -> Option<()> {
+        if depth > 64 {
+            return Some(());
+        }
+        let n = self.json.get("nodes")?.at(node)?;
+        let m = mul(parent, &node_matrix(n));
+        if let Some(mesh) = n.get("mesh").and_then(|x| x.num()) {
+            self.prims_of(mesh as usize, &m, pbr, total)?;
+        }
+        for c in n.get("children").map(|c| c.arr()).unwrap_or(&[]) {
+            if let Some(i) = c.num() {
+                self.walk_pbr(i as usize, &m, pbr, total, depth + 1)?;
+            }
+        }
+        Some(())
+    }
+
+    fn prims_of(&self, mesh: usize, m: &M4, pbr: &mut crate::pbr::Pbr, total: &mut usize) -> Option<()> {
+        use crate::pbr::*;
+        let det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5]);
+        let mirrored = det < 0.0;
+        for prim in self.json.get("meshes")?.at(mesh)?.get("primitives")?.arr() {
+            let mode = prim.get("mode").and_then(|x| x.num()).unwrap_or(4.0) as u32;
+            let attrs = prim.get("attributes")?;
+            let (pos, _) = self.accessor(attrs.get("POSITION")?.num()? as usize)?;
+            let nv = pos.len() / 3;
+            *total += nv;
+            if *total > MAX_PBR_VERTS {
+                return None;
+            }
+            let idx: Vec<usize> = match prim.get("indices").and_then(|x| x.num()) {
+                Some(i) => self.accessor(i as usize)?.0.into_iter().map(|v| v as usize).collect(),
+                None => (0..nv).collect(),
+            };
+            let tris: Vec<[usize; 3]> = match mode {
+                4 => idx.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+                5 => (0..idx.len().saturating_sub(2)).map(|i| if i % 2 == 0 { [idx[i], idx[i + 1], idx[i + 2]] } else { [idx[i + 1], idx[i], idx[i + 2]] }).collect(),
+                6 => (1..idx.len().saturating_sub(1)).map(|i| [idx[0], idx[i], idx[i + 1]]).collect(),
+                _ => continue,
+            };
+            let nrm = attrs.get("NORMAL").and_then(|a| a.num()).and_then(|i| self.accessor(i as usize)).map(|x| x.0).filter(|n| n.len() == nv * 3);
+            let uv = attrs.get("TEXCOORD_0").and_then(|a| a.num()).and_then(|i| self.accessor(i as usize)).filter(|x| x.1 == 2 && x.0.len() == nv * 2).map(|x| x.0);
+            let col = attrs.get("COLOR_0").and_then(|a| a.num()).and_then(|i| self.accessor(i as usize)).filter(|x| (x.1 == 3 || x.1 == 4) && x.0.len() == nv * x.1);
+            let mut verts = vec![0f32; nv * STRIDE];
+            // a espacio del visor: Y arriba -> Z arriba
+            let zup = |x: f32, y: f32, z: f32| [x, -z, y];
+            for i in 0..nv {
+                let (x, y, z) = (pos[i * 3] as f32, pos[i * 3 + 1] as f32, pos[i * 3 + 2] as f32);
+                let w = [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]];
+                let p = zup(w[0], w[1], w[2]);
+                let v = &mut verts[i * STRIDE..(i + 1) * STRIDE];
+                v[0..3].copy_from_slice(&p);
+                if let Some(n) = &nrm {
+                    let (nx, ny, nz) = (n[i * 3] as f32, n[i * 3 + 1] as f32, n[i * 3 + 2] as f32);
+                    let w = [m[0] * nx + m[4] * ny + m[8] * nz, m[1] * nx + m[5] * ny + m[9] * nz, m[2] * nx + m[6] * ny + m[10] * nz];
+                    let q = zup(w[0], w[1], w[2]);
+                    let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt().max(1e-20);
+                    v[3..6].copy_from_slice(&[q[0] / l, q[1] / l, q[2] / l]);
+                }
+                if let Some(t) = &uv {
+                    v[6] = t[i * 2] as f32;
+                    v[7] = t[i * 2 + 1] as f32;
+                }
+                match &col {
+                    Some((c, k)) => {
+                        for j in 0..*k {
+                            v[8 + j] = c[i * k + j] as f32;
+                        }
+                        if *k == 3 {
+                            v[11] = 1.0;
+                        }
+                    }
+                    None => v[8..12].copy_from_slice(&[1.0; 4]),
+                }
+            }
+            let mut indices: Vec<u32> = Vec::with_capacity(tris.len() * 3);
+            for t in &tris {
+                if t.iter().any(|&i| i >= nv) {
+                    continue;
+                }
+                let o = if mirrored { [t[0], t[2], t[1]] } else { *t };
+                indices.extend(o.iter().map(|&i| i as u32));
+            }
+            if nrm.is_none() {
+                // normales suaves a partir de las caras
+                let mut acc = vec![[0f32; 3]; nv];
+                for t in indices.chunks_exact(3) {
+                    let p = |k: u32| [verts[k as usize * STRIDE], verts[k as usize * STRIDE + 1], verts[k as usize * STRIDE + 2]];
+                    let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                    let n = cross(sub(b, a), sub(c, a));
+                    for &k in t {
+                        for j in 0..3 {
+                            acc[k as usize][j] += n[j];
+                        }
+                    }
+                }
+                for (i, a) in acc.iter().enumerate() {
+                    let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-20);
+                    verts[i * STRIDE + 3..i * STRIDE + 6].copy_from_slice(&[a[0] / l, a[1] / l, a[2] / l]);
+                }
+            }
+            let nmat = pbr.materials.len();
+            let material = prim.get("material").and_then(|x| x.num()).map(|x| x as usize).filter(|i| *i < nmat).unwrap_or_else(|| {
+                pbr.materials.push(Material::default());
+                pbr.materials.len() - 1
+            });
+            pbr.prims.push(Prim { verts, indices, material });
+        }
+        Some(())
+    }
+}
+
