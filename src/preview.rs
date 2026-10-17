@@ -333,7 +333,7 @@ fn load(job: &Job) -> Raw {
                 let mut names = Vec::new();
                 for e in rd.flatten() {
                     n += 1;
-                    if names.len() < 60 {
+                    if names.len() < 600 {
                         names.push(e.file_name().to_string_lossy().into_owned());
                     }
                     if n >= 200_000 {
@@ -900,48 +900,23 @@ impl Preview {
                         usage_ui(&cp, pal, ctx, area, self.path.clone(), uv, pointer, clicked);
                     }
                 } else {
-                    let c = pos2(content.center().x, area.top() + 70.0);
-                    theme::draw_folder(&cp, Rect::from_center_size(c, vec2(96.0, 96.0)));
-                    cp.text(
-                        pos2(content.center().x, c.y + 70.0),
-                        Align2::CENTER_CENTER,
-                        tf("{count} elementos", &[count]),
-                        FontId::proportional(15.0),
-                        pal.text,
-                    );
-                    let mut y = c.y + 104.0;
-                    for n in names.iter().take(((content.bottom() - y) / 20.0).max(0.0) as usize) {
-                        cp.text(pos2(content.center().x, y), Align2::CENTER_CENTER, n, FontId::proportional(13.0), pal.subtle);
-                        y += 20.0;
+                    cp.text(pos2(content.left() + 18.0, area.top() + 12.0), Align2::LEFT_CENTER, tf("{count} elementos", &[count]), FontId::proportional(13.0), pal.text);
+                    let list = Rect::from_min_max(pos2(area.left(), area.top() + 28.0), area.max);
+                    let (shown, _) = name_columns(&cp, pal, list, names.len(), |i| (names[i].as_str(), None, false), None);
+                    if *count > shown {
+                        cp.text(pos2(content.center().x, content.bottom() - 12.0), Align2::CENTER_CENTER, format!("… +{}", count - shown), FontId::proportional(12.0), pal.subtle);
                     }
                 }
             }
             Body::Archive { rows, truncated } => {
                 let head = if *truncated { format!("{} {}", tf("{count} elementos", &[&rows.len()]), t("(índice parcial)")) } else { tf("{count} elementos", &[&rows.len()]) };
                 cp.text(pos2(content.left() + 18.0, content.top() + 16.0), Align2::LEFT_CENTER, head, FontId::proportional(13.0), pal.text);
-                let top = content.top() + 38.0;
-                let fit = ((content.bottom() - top - 8.0) / 20.0).max(0.0) as usize;
-                for (i, (n, sz, dir)) in rows.iter().take(fit).enumerate() {
-                    let y = top + i as f32 * 20.0 + 10.0;
-                    let maxw = content.width() - 36.0 - 90.0;
-                    let mut name = n.clone();
-                    let mut g = cp.layout_no_wrap(name.clone(), FontId::proportional(13.0), pal.text);
-                    while g.size().x > maxw && name.chars().count() > 4 {
-                        let keep = name.chars().count() - ((name.chars().count() / 8).max(1));
-                        name = name.chars().take(keep).collect();
-                        g = cp.layout_no_wrap(format!("{name}…"), FontId::proportional(13.0), pal.text);
-                    }
-                    let col = if *dir { pal.accent } else { pal.text };
-                    let rr = Rect::from_min_max(pos2(content.left() + 8.0, y - 10.0), pos2(content.right() - 8.0, y + 10.0));
-                    if !*dir && self.entry_busy.is_none() && pointer.map(|q| rr.contains(q)).unwrap_or(false) {
-                        cp.rect_filled(rr, CornerRadius::same(6), pal.hover);
-                        if clicked {
-                            self.entry_pick = Some(n.clone());
-                        }
-                    }
-                    cp.galley(pos2(content.left() + 18.0, y - g.size().y / 2.0), g, col);
-                    if !*dir {
-                        cp.text(pos2(content.right() - 18.0, y), Align2::RIGHT_CENTER, human_size(*sz), FontId::proportional(12.0), pal.subtle);
+                let list = Rect::from_min_max(pos2(content.left(), content.top() + 32.0), pos2(content.right(), content.bottom() - 22.0));
+                let hover = if self.entry_busy.is_none() { pointer } else { None };
+                let (fit, hit) = name_columns(&cp, pal, list, rows.len(), |i| (rows[i].0.as_str(), (!rows[i].2).then_some(rows[i].1), rows[i].2), hover);
+                if let (Some(i), true) = (hit, clicked) {
+                    if !rows[i].2 {
+                        self.entry_pick = Some(rows[i].0.clone());
                     }
                 }
                 if let Some(n) = &self.entry_busy {
@@ -1516,6 +1491,43 @@ fn sectors(node: &crate::diskusage::Node, a0: f32, a1: f32, ring: usize, rings: 
         }
         a += span;
     }
+}
+
+/// Lista de nombres alineada a la izquierda y repartida en las columnas que quepan (se llenan de arriba abajo).
+/// Devuelve cuántos se han dibujado y el índice bajo el puntero, si lo hay y es seleccionable (no carpeta).
+fn name_columns<'a>(cp: &egui::Painter, pal: &Pal, area: Rect, n: usize, get: impl Fn(usize) -> (&'a str, Option<u64>, bool), pointer: Option<Pos2>) -> (usize, Option<usize>) {
+    const ROW: f32 = 22.0;
+    let inner = Rect::from_min_max(pos2(area.left() + 8.0, area.top() + 2.0), pos2(area.right() - 8.0, area.bottom() - 4.0));
+    let ncols = ((inner.width() / 250.0).floor() as usize).max(1);
+    let col_w = inner.width() / ncols as f32;
+    let per_col = ((inner.height() / ROW).floor() as usize).max(1);
+    let shown = n.min(per_col * ncols);
+    let mut hit = None;
+    for i in 0..shown {
+        let (name, size, dir) = get(i);
+        let (c, r) = (i / per_col, i % per_col);
+        let row = Rect::from_min_size(pos2(inner.left() + c as f32 * col_w, inner.top() + r as f32 * ROW), vec2(col_w - 6.0, ROW));
+        if !dir && pointer.map(|q| row.contains(q)).unwrap_or(false) {
+            cp.rect_filled(row, CornerRadius::same(6), pal.hover);
+            hit = Some(i);
+        }
+        let size_txt = size.map(human_size);
+        let maxw = col_w - 26.0 - if size_txt.is_some() { 64.0 } else { 0.0 };
+        let font = FontId::proportional(13.0);
+        let mut shown_name = name.to_string();
+        let mut g = cp.layout_no_wrap(shown_name.clone(), font.clone(), pal.text);
+        while g.size().x > maxw && shown_name.chars().count() > 4 {
+            let keep = shown_name.chars().count() - (shown_name.chars().count() / 8).max(1);
+            shown_name = shown_name.chars().take(keep).collect();
+            g = cp.layout_no_wrap(format!("{shown_name}…"), font.clone(), pal.text);
+        }
+        let col = if dir { pal.accent } else { pal.text };
+        cp.galley(pos2(row.left() + 8.0, row.center().y - g.size().y / 2.0), g, col);
+        if let Some(sz) = size_txt {
+            cp.text(pos2(row.right() - 6.0, row.center().y), Align2::RIGHT_CENTER, sz, FontId::proportional(11.5), pal.subtle);
+        }
+    }
+    (shown, hit)
 }
 
 fn usage_ui(cp: &egui::Painter, pal: &Pal, ctx: &egui::Context, area: Rect, root_path: PathBuf, uv: &mut UsageView, pointer: Option<Pos2>, clicked: bool) {
