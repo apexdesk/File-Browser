@@ -71,8 +71,28 @@ fn run_capture(mut cmd: Command) -> Option<Vec<u8>> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output().ok()?;
-    if out.status.success() && !out.stdout.is_empty() { Some(out.stdout) } else { None }
+    // un archivo corrupto puede dejar colgado a ffmpeg/magick: se mata pasado el plazo
+    let mut child = cmd.spawn().ok()?;
+    let mut so = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut so, &mut buf);
+        buf
+    });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.success(),
+            Ok(None) if std::time::Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(15)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    if ok && !out.is_empty() { Some(out) } else { None }
 }
 
 fn from_png_bytes(bytes: &[u8], max: u32) -> Option<Decoded> {

@@ -210,6 +210,7 @@ enum Dlg {
     OpenWith(OpenWithDlg),
     Hash(HashDlg),
     Compress(CompressDlg),
+    ArchPass(ArchPass),
     Dups(DupsDlg),
     Props(PropsDlg),
     Batch(BatchDlg),
@@ -225,6 +226,17 @@ enum Dlg {
     Options,
     About,
     Keys,
+}
+
+/// Contraseña de un comprimido protegido; al aceptar se repite la extracción.
+struct ArchPass {
+    src: PathBuf,
+    dst: PathBuf,
+    meta: OpMeta,
+    pass: String,
+    show: bool,
+    wrong: bool,
+    focus: bool,
 }
 
 /// Diálogo «Comprimir…».
@@ -561,6 +573,8 @@ pub struct App {
     pworker: preview::Worker,
     /// Panel de vista previa acoplado a la derecha (y su propio trabajador de carga).
     side: Option<Preview>,
+    /// Origen y destino de la extracción en curso, por si pide contraseña.
+    op_unzip: Option<(PathBuf, PathBuf)>,
     sworker: preview::Worker,
     hover_name: Option<String>,
     last_title: String,
@@ -1103,6 +1117,7 @@ impl App {
             thumbs: Thumbs::new(&ctx),
             pworker: preview::Worker::new(&ctx),
             side: None,
+            op_unzip: None,
             sworker: preview::Worker::new(&ctx),
             ctx,
             pal,
@@ -2162,7 +2177,7 @@ impl App {
             Op::Copy { srcs, dst, mv, .. } => virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || (*mv && remote(srcs)),
             Op::Trash(v) | Op::Delete(v) => remote(v),
             Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs),
-            Op::Unzip { src, dst } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
+            Op::Unzip { src, dst, .. } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src),
         };
         if touches {
             self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
@@ -2172,6 +2187,7 @@ impl App {
             self.queue.push_back((op, meta));
             return;
         }
+        self.op_unzip = if let Op::Unzip { src, dst, .. } = &op { Some((src.clone(), dst.clone())) } else { None };
         self.op_meta = meta;
         self.op_started = Instant::now();
         self.op_desc = op_desc(&op);
@@ -2322,6 +2338,12 @@ impl App {
             let pairs = op.pairs.lock().unwrap().clone();
             self.op = None;
             let meta = std::mem::replace(&mut self.op_meta, OpMeta::Other);
+            // comprimido protegido: se pide la contraseña y se repite la extracción
+            if let (Some(e), Some((src, dst))) = (errs.first().filter(|e| *e == crate::archive::NEED_PASS || *e == crate::archive::BAD_PASS), self.op_unzip.take()) {
+                let _ = std::fs::remove_dir_all(&dst);
+                self.dlg = Dlg::ArchPass(ArchPass { src, dst, meta, pass: String::new(), show: false, wrong: e == crate::archive::BAD_PASS, focus: true });
+                return;
+            }
             let mut enter: Option<PathBuf> = None;
             match meta {
                 OpMeta::OpenArchive { archive, root } => {
@@ -2436,9 +2458,9 @@ impl App {
             }
         }
         let modal = self.preview.is_some() || !matches!(self.dlg, Dlg::None);
-        egui::Panel::right("preview_panel")
+        let resp = egui::Panel::right("preview_panel")
             .frame(egui::Frame::new().fill(bgfill).inner_margin(egui::Margin { left: 4, right: 10, top: 0, bottom: 4 }))
-            .default_size(360.0)
+            .default_size(self.cfg.preview_w)
             .size_range(220.0..=760.0)
             .resizable(true)
             .show_separator_line(false)
@@ -2457,6 +2479,12 @@ impl App {
                 }
                 ui.allocate_rect(r, egui::Sense::hover());
             });
+        // el ancho se recuerda al soltar el borde
+        let w = resp.response.rect.width();
+        if (w - self.cfg.preview_w).abs() > 1.0 && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.cfg.preview_w = w;
+            self.cfg.save();
+        }
     }
 
     fn toggle_preview(&mut self) {
@@ -7147,7 +7175,7 @@ impl App {
             return;
         }
         let _ = std::fs::remove_dir_all(&root);
-        self.start_op(Op::Unzip { src: p.clone(), dst: root.clone() }, OpMeta::OpenArchive { archive: p, root });
+        self.start_op(Op::Unzip { src: p.clone(), dst: root.clone(), pass: None }, OpMeta::OpenArchive { archive: p, root });
     }
 
     /// Nombre corto de una carpeta; la raíz de un comprimido abierto se muestra con el nombre del archivo.
@@ -7203,7 +7231,7 @@ impl App {
                     if let Some(dir) = archive.parent() {
                         let stem = archive.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "extraido".into());
                         let dst = fsys::unique_path(dir, &stem);
-                        self.start_op(Op::Unzip { src: archive.clone(), dst }, OpMeta::Generated);
+                        self.start_op(Op::Unzip { src: archive.clone(), dst, pass: None }, OpMeta::Generated);
                     }
                 }
             });
@@ -7215,7 +7243,7 @@ impl App {
         let Some(src) = self.selected_paths().into_iter().next() else { return };
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "extraido".into());
         let dst = fsys::unique_path(&self.cwd, &stem);
-        self.start_op(Op::Unzip { src, dst }, OpMeta::Generated);
+        self.start_op(Op::Unzip { src, dst, pass: None }, OpMeta::Generated);
     }
 
     fn open_props(&mut self) {
@@ -8607,6 +8635,53 @@ impl App {
                 }
                 keep = open;
             }
+            Dlg::ArchPass(d) => {
+                let mut open = true;
+                let mut go = false;
+                let mut cancel = false;
+                let width = 400.0;
+                let name = d.src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                theme::card_window(ctx, &pal, t("Archivo protegido"), width, &mut open, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(tf("«{}» está protegido con contraseña.", &[&name])).color(pal.text)).wrap());
+                    ui.add_space(8.0);
+                    let r = ui.add(egui::TextEdit::singleline(&mut d.pass).password(!d.show).hint_text(t("Contraseña")).desired_width(width - 20.0));
+                    if d.focus {
+                        r.request_focus();
+                        d.focus = false;
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        go = true;
+                    }
+                    ui.checkbox(&mut d.show, t("Mostrar"));
+                    if d.wrong {
+                        ui.label(egui::RichText::new(t("Contraseña incorrecta")).size(12.0).color(Color32::from_rgb(226, 86, 86)));
+                    }
+                    ui.add_space(16.0);
+                    ui.allocate_ui_with_layout(vec2(width, 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add_enabled_ui(!d.pass.is_empty(), |ui| {
+                            if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Extraer")).clicked() {
+                                go = true;
+                            }
+                        });
+                        if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                if cancel {
+                    open = false;
+                }
+                if go && open && !d.pass.is_empty() {
+                    let meta = std::mem::replace(&mut d.meta, OpMeta::Other);
+                    let op = Op::Unzip { src: d.src.clone(), dst: d.dst.clone(), pass: Some(d.pass.clone()) };
+                    self.start_op(op, meta);
+                    open = false;
+                } else if !open {
+                    self.pending_select.clear();
+                }
+                keep = open;
+            }
             Dlg::Hash(d) => {
                 let mut open = true;
                 egui::Window::new(t("Hash del archivo"))
@@ -9460,8 +9535,20 @@ fn archive_marker(root: &Path) -> PathBuf {
     root.with_file_name(n)
 }
 
-/// Borra de la caché los comprimidos extraídos hace más de un día.
+/// Borra de la caché los comprimidos extraídos hace más de un día y las carpetas temporales
+/// (`inner-*`) de la vista previa que dejó un cierre brusco.
 pub fn clean_archive_cache() {
+    if let Some(dir) = dirs::cache_dir().map(|d| d.join("filebrowser")) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let stale = e.file_name().to_string_lossy().starts_with("inner-")
+                    && e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|a| a > Duration::from_secs(3600)).unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+    }
     let Some(dir) = dirs::cache_dir().map(|d| d.join("filebrowser-rs").join("archives")) else { return };
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
     let limit = Duration::from_secs(24 * 3600);

@@ -476,7 +476,7 @@ pub enum Op {
     Trash(Vec<PathBuf>),
     Delete(Vec<PathBuf>),
     Compress { srcs: Vec<PathBuf>, out: PathBuf, opts: crate::tools::CompressOpts },
-    Unzip { src: PathBuf, dst: PathBuf },
+    Unzip { src: PathBuf, dst: PathBuf, pass: Option<String> },
 }
 
 pub(crate) fn size_of_tree(p: &Path) -> u64 {
@@ -816,9 +816,9 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     }
                 }
             }
-            Op::Unzip { src, dst } => {
+            Op::Unzip { src, dst, pass } => {
                 *p.label.lock().unwrap() = t("Extrayendo…").into();
-                match crate::archive::extract_all(&src, &dst, &p, &ctx) {
+                match crate::archive::extract_all(&src, &dst, &p, &ctx, pass.as_deref()) {
                     Ok(top) => {
                         p.created.lock().unwrap().extend(top);
                         p.pairs.lock().unwrap().push((dst.clone(), dst.clone()));

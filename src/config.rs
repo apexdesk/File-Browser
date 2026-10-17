@@ -34,6 +34,8 @@ pub struct Config {
     pub show_sidebar: bool,
     pub term_open: bool,
     pub term_h: f32,
+    /// Ancho del panel de vista previa acoplado.
+    pub preview_w: f32,
     pub shell: String,
     pub native_deco: bool,
     pub show_menu_btn: bool,
@@ -86,6 +88,7 @@ impl Default for Config {
             show_sidebar: true,
             term_open: false,
             term_h: 240.0,
+            preview_w: 360.0,
             shell: String::new(),
             native_deco: false,
             show_menu_btn: true,
@@ -181,6 +184,7 @@ impl Config {
                 "thumbs" => c.thumbs_on = v != "0",
                 "sidebar" => c.show_sidebar = v != "0",
                 "term_open" => c.term_open = v == "1",
+                "preview_w" => c.preview_w = v.parse().unwrap_or(360.0f32).clamp(220.0, 760.0),
                 "term_h" => c.term_h = v.parse().unwrap_or(240.0f32).clamp(100.0, 900.0),
                 "menu_btn" => c.show_menu_btn = v != "0",
                 "lang" => c.lang = v.to_string(),
@@ -293,6 +297,7 @@ impl Config {
         s.push_str(&format!("sidebar={}\n", self.show_sidebar as u8));
         s.push_str(&format!("term_open={}\n", self.term_open as u8));
         s.push_str(&format!("term_h={}\n", self.term_h));
+        s.push_str(&format!("preview_w={}\n", self.preview_w));
         s.push_str(&format!("menu_btn={}\n", self.show_menu_btn as u8));
         s.push_str(&format!("lang={}\n", self.lang));
         s.push_str(&format!("restore_tabs={}\n", self.restore_tabs as u8));
