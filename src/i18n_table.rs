@@ -106,6 +106,7 @@ pub const TABLE: &[[&str; 10]] = &[
     ["Ver", "View", "Affichage", "Ansicht", "Ver", "Visualizza", "Вид", "查看", "表示", "보기"],
     ["Cuadrícula", "Grid", "Grille", "Raster", "Grelha", "Griglia", "Сетка", "网格", "グリッド", "격자"],
     ["Lista", "List", "Liste", "Liste", "Lista", "Elenco", "Список", "列表", "リスト", "목록"],
+    ["Panel de vista previa", "Preview panel", "Panneau d'aperçu", "Vorschaubereich", "Painel de pré-visualização", "Pannello anteprima", "Панель просмотра", "预览面板", "プレビューパネル", "미리 보기 패널"],
     ["Barra lateral", "Sidebar", "Barre latérale", "Seitenleiste", "Barra lateral", "Barra laterale", "Боковая панель", "侧边栏", "サイドバー", "사이드바"],
     ["Archivos ocultos", "Hidden files", "Fichiers cachés", "Versteckte Dateien", "Ficheiros ocultos", "File nascosti", "Скрытые файлы", "隐藏文件", "隠しファイル", "숨김 파일"],
     ["Miniaturas", "Thumbnails", "Miniatures", "Vorschaubilder", "Miniaturas", "Miniature", "Миниатюры", "缩略图", "サムネイル", "미리 보기 이미지"],
