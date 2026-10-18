@@ -124,7 +124,11 @@ fn file() -> Option<PathBuf> {
 impl Config {
     pub fn load() -> Config {
         let mut c = Config::default();
-        let Some(txt) = file().and_then(|f| crate::vfs::fs::read_to_string(f).ok()) else {
+        #[cfg(target_arch = "wasm32")]
+        let txt = crate::vfs::net::store_get("filebrowser.config");
+        #[cfg(not(target_arch = "wasm32"))]
+        let txt = file().and_then(|f| crate::vfs::fs::read_to_string(f).ok());
+        let Some(txt) = txt else {
             return c;
         };
         let mut has_theme = false;
@@ -270,7 +274,9 @@ impl Config {
     }
 
     pub fn save(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
         let Some(f) = file() else { return };
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(p) = f.parent() {
             let _ = crate::vfs::fs::create_dir_all(p);
         }
@@ -337,10 +343,15 @@ impl Config {
         s.push_str(&format!("native_deco={}\n", self.native_deco as u8));
         s.push_str(&format!("shell={}\n", self.shell.replace(['\n', '\r'], " ")));
         s.push_str(&format!("win={}x{}\n", self.win.0, self.win.1));
+        #[cfg(target_arch = "wasm32")]
+        crate::vfs::net::store_set("filebrowser.config", &s);
         // escritura atómica: un corte a medias no deja la configuración vacía
-        let tmp = f.with_extension("tmp");
-        if crate::vfs::fs::write(&tmp, s).is_ok() && crate::vfs::fs::rename(&tmp, &f).is_err() {
-            let _ = crate::vfs::fs::remove_file(&tmp);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tmp = f.with_extension("tmp");
+            if crate::vfs::fs::write(&tmp, s).is_ok() && crate::vfs::fs::rename(&tmp, &f).is_err() {
+                let _ = crate::vfs::fs::remove_file(&tmp);
+            }
         }
     }
 }

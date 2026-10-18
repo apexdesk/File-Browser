@@ -174,3 +174,14 @@ pub fn open_path(path: &str) {
         let _ = w.open_with_url_and_target(&format!("../{}", url_path(path)), "_blank");
     }
 }
+
+/// Almacén del navegador (`localStorage`): la configuración se guarda aquí, no en el servidor.
+pub fn store_get(key: &str) -> Option<String> {
+    web_sys::window()?.local_storage().ok()??.get_item(key).ok()?
+}
+
+pub fn store_set(key: &str, val: &str) {
+    if let Some(Ok(Some(st))) = web_sys::window().map(|w| w.local_storage()) {
+        let _ = st.set_item(key, val);
+    }
+}

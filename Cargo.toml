@@ -135,6 +135,6 @@ read-fonts = { path = "../apex-view/vendor/read-fonts" }
 wasm-bindgen = "=0.2.128"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlInputElement", "FileList", "File", "Blob", "Location", "XmlHttpRequest", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlInputElement", "FileList", "File", "Blob", "Location", "XmlHttpRequest", "Storage", "console"] }
 serde_json = "1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
