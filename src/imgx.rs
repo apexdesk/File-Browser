@@ -80,7 +80,7 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
         be32(data.get(p..p + 4)?)
     };
     p = p.checked_add(if version == 2 { 8 } else { 4 })?.checked_add(n)?;
-    let comp = be16(data.get(p..p + 2)?);
+    let comp = be16(data.get(p..p.checked_add(2)?)?);
     p += 2;
     let bpc = depth / 8;
     let plane = w * h * bpc;

@@ -858,6 +858,7 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
     let mut stdin = child.stdin.take();
     let (mut buf, mut log) = (String::new(), String::new());
     let t0 = Instant::now();
+    let mut sent_pass = false;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(chunk) => {
@@ -869,6 +870,13 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
                     let ans = if last.contains("anonymous") || last.contains("anónim") {
                         Some("n")
                     } else if last.contains("password") || last.contains("passphrase") || last.contains("contraseña") {
+                        // una contraseña rechazada no se reenvía: podría bloquear la cuenta
+                        if sent_pass {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(t("Contraseña incorrecta").to_string());
+                        }
+                        sent_pass = true;
                         Some(c.pass.as_str())
                     } else if last.contains("domain") || last.contains("dominio") {
                         Some(c.domain.as_str())
@@ -887,6 +895,7 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if t0.elapsed() > Duration::from_secs(90) {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(t("Tiempo de espera agotado").to_string());
                 }
             }
@@ -2636,7 +2645,7 @@ impl App {
             } else {
                 self.preview_step(-1);
             }
-        } else if k(Modifiers::NONE, Key::Enter) && is_video {
+        } else if is_video && k(Modifiers::NONE, Key::Enter) {
             if let Some(p) = &mut self.preview {
                 p.toggle_play(ctx);
             }
@@ -7548,13 +7557,16 @@ impl App {
         }
         if d.paths.len() == 1 && d.name != d.name_orig {
             let new = d.name.trim().to_string();
-            if new.is_empty() || new.contains(['/', '\\']) || new == "." || new == ".." {
+            if bad_name(&new) {
                 d.err = t("Nombre no válido").to_string();
                 return;
             }
             let src = d.paths[0].clone();
             let dst = src.with_file_name(&new);
-            if dst.exists() {
+            let case_only = new.to_lowercase() == d.name_orig.to_lowercase()
+                && dst.symlink_metadata().is_ok()
+                && matches!((std::fs::canonicalize(&src), std::fs::canonicalize(&dst)), (Ok(a), Ok(b)) if a == b);
+            if !case_only && dst.symlink_metadata().is_ok() {
                 d.err = t("Ya existe un elemento con ese nombre").to_string();
                 return;
             }
@@ -7633,6 +7645,11 @@ impl App {
     fn run_in_terminal(&mut self, p: &Path) {
         #[cfg(windows)]
         {
+            // cmd interpreta estos caracteres aunque vayan entre comillas: no se ejecuta esa ruta
+            if p.to_string_lossy().contains(['&', '|', '^', '%', '<', '>', '(', ')', '!', '"']) {
+                self.say(t("La ruta tiene caracteres de control: no se escribe en el terminal").to_string(), true);
+                return;
+            }
             let _ = std::process::Command::new("cmd")
                 .args(["/C", "start", "", "cmd", "/K"])
                 .arg(p)
@@ -7727,8 +7744,11 @@ impl App {
         let rows = self.trash_rows.lock().unwrap();
         let mut v = Vec::new();
         self.for_each_selected(|i| {
-            if let Some(r) = rows.get(i as usize) {
-                v.push(r.clone());
+            // la fila solo vale si coincide con la entrada mostrada (las filas pueden ser de una carga más nueva)
+            if let (Some(r), Some(e)) = (rows.get(i as usize), self.entries.get(i as usize)) {
+                if *r.parent.join(&r.name).to_string_lossy() == *e.name {
+                    v.push(r.clone());
+                }
             }
         });
         v
@@ -9618,7 +9638,10 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(1500));
 
-        self.handle_keys(&ctx);
+        let modal = !matches!(self.dlg, Dlg::None) || self.confirm_delete.is_some() || self.confirm_purge.is_some() || self.conflict.is_some() || self.quit_ask;
+        if !modal {
+            self.handle_keys(&ctx);
+        }
 
         // Archivos soltados desde el sistema: se copian a la carpeta actual.
         let (dropped, hovering) = ctx.input(|i| {

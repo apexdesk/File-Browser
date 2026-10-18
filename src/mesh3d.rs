@@ -725,10 +725,16 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
             Some(u) => {
                 let rel = u.replace("%20", " ");
                 // sólo dentro de la carpeta del modelo
-                if rel.contains("..") || rel.starts_with('/') {
+                if rel.contains("..") || rel.starts_with('/') || rel.contains([':', '\\']) {
                     return Err("ruta no permitida".into());
                 }
-                std::fs::read(dir.join(rel)).map_err(|e| e.to_string())?
+                // solo archivos normales y de tamaño razonable (una FIFO o /dev/zero colgaría el hilo)
+                let bp = dir.join(rel);
+                match std::fs::metadata(&bp) {
+                    Ok(m) if m.is_file() && m.len() <= 512 << 20 => {}
+                    _ => return Err("buffer no válido".into()),
+                }
+                std::fs::read(bp).map_err(|e| e.to_string())?
             }
             None if i == 0 => glb_bin.clone().ok_or("sin datos binarios")?,
             None => Vec::new(),

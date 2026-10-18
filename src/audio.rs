@@ -47,8 +47,12 @@ fn cover_image(data: &[u8]) -> Option<egui::ColorImage> {
     }
     let img = if data.starts_with(&[0xFF, 0xD8]) {
         let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(data));
-        let px = d.decode().ok()?;
+        d.read_info().ok()?;
         let i = d.info()?;
+        if i.width as u64 * i.height as u64 > 100_000_000 {
+            return None;
+        }
+        let px = d.decode().ok()?;
         let rgb: Vec<u8> = match i.pixel_format {
             jpeg_decoder::PixelFormat::RGB24 => px,
             jpeg_decoder::PixelFormat::L8 => px.iter().flat_map(|&v| [v, v, v]).collect(),
@@ -56,6 +60,11 @@ fn cover_image(data: &[u8]) -> Option<egui::ColorImage> {
         };
         image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(i.width as u32, i.height as u32, rgb)?)
     } else {
+        let r = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().ok()?;
+        let (w, h) = r.into_dimensions().ok()?;
+        if w as u64 * h as u64 > 100_000_000 {
+            return None;
+        }
         image::load_from_memory(data).ok()?
     };
     let img = if img.width() > 640 || img.height() > 640 { img.thumbnail(640, 640) } else { img };

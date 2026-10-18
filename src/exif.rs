@@ -318,6 +318,7 @@ pub fn scan_jpeg(path: &Path) -> Option<(u64, usize)> {
     f.by_ref().take(16 << 20).read_to_end(&mut buf).ok()?;
     let mut best: Option<(u64, usize)> = None;
     let mut i = 0;
+    let mut fails = 0;
     while i + 3 < buf.len() {
         if buf[i] == 0xFF && buf[i + 1] == 0xD8 && buf[i + 2] == 0xFF {
             // fin: el siguiente EOI tras recorrer los segmentos
@@ -328,6 +329,11 @@ pub fn scan_jpeg(path: &Path) -> Option<(u64, usize)> {
                 }
                 i += n;
                 continue;
+            }
+            // cada candidato truncado recorre hasta el final: con tope no es cuadrático
+            fails += 1;
+            if fails > 32 {
+                break;
             }
         }
         i += 1;

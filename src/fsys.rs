@@ -143,9 +143,19 @@ pub fn spawn_load(
             }
         };
         // Convención freedesktop: los nombres listados en `.hidden` se ocultan.
-        let hidden_list: std::collections::HashSet<String> = fs::read_to_string(dir.join(".hidden"))
-            .map(|t| t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
-            .unwrap_or_default();
+        // solo un archivo normal y pequeño (una FIFO o /dev/zero bloquearía o agotaría la memoria)
+        let hidden_list: std::collections::HashSet<String> = {
+            use std::io::Read;
+            let hp = dir.join(".hidden");
+            match fs::metadata(&hp) {
+                Ok(m) if m.is_file() => {
+                    let mut s = String::new();
+                    let _ = fs::File::open(&hp).and_then(|f| f.take(1 << 20).read_to_string(&mut s));
+                    s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+                }
+                _ => Default::default(),
+            }
+        };
         let mut buf: Vec<Entry> = Vec::with_capacity(1024);
         let mut last = Instant::now();
         let mut target = 400usize;
@@ -482,9 +492,9 @@ pub enum Op {
 pub(crate) fn size_of_tree(p: &Path) -> u64 {
     match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => fs::read_dir(p)
-            .map(|rd| rd.flatten().map(|e| size_of_tree(&e.path())).sum::<u64>())
+            .map(|rd| rd.flatten().fold(0u64, |a, e| a.saturating_add(size_of_tree(&e.path()))))
             .unwrap_or(0)
-            + 1,
+            .saturating_add(1),
         Ok(m) => m.len().max(1),
         Err(_) => 0,
     }
@@ -725,7 +735,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     crate::sftp::sync_tree(s);
                 }
                 let costs: Vec<u64> = srcs.iter().map(|s| size_of_tree(s)).collect();
-                p.total.store(costs.iter().sum::<u64>().max(1), AO::Relaxed);
+                p.total.store(costs.iter().fold(0u64, |a, &c| a.saturating_add(c)).max(1), AO::Relaxed);
                 let mut buf: Vec<u8> = Vec::new();
                 for (src, cost) in srcs.into_iter().zip(costs) {
                     if p.cancelled() {
@@ -848,7 +858,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                 }
             }
             Op::Compress { srcs, out, opts } => {
-                let total: u64 = srcs.iter().map(|s| size_of_tree(s)).sum();
+                let total: u64 = srcs.iter().fold(0u64, |a, s| a.saturating_add(size_of_tree(s)));
                 p.total.store(total.max(1), AO::Relaxed);
                 *p.label.lock().unwrap() = t("Comprimiendo…").into();
                 match crate::tools::compress_paths(&srcs, &out, &opts, &p, &ctx) {

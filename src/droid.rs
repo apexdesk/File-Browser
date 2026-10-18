@@ -363,9 +363,11 @@ unsafe fn buffer_to_rgba(p: *mut u8, len: usize, f: &Fmt, max_w: usize) -> Resul
         let sh = f.i32(c"slice-height").unwrap_or(h as i32).max(h as i32) as usize;
         let cf = f.i32(c"color-format").unwrap_or(21);
         let (left, top) = (f.i32(c"crop-left").unwrap_or(0).max(0) as usize, f.i32(c"crop-top").unwrap_or(0).max(0) as usize);
-        let cw = f.i32(c"crop-right").map(|r| r as usize + 1).unwrap_or(w).saturating_sub(left);
-        let chh = f.i32(c"crop-bottom").map(|r| r as usize + 1).unwrap_or(h).saturating_sub(top);
-        if w == 0 || h == 0 || p.is_null() || len < stride * sh {
+        let cw = f.i32(c"crop-right").map(|r| (r.max(-1) + 1) as usize).unwrap_or(w).saturating_sub(left);
+        let chh = f.i32(c"crop-bottom").map(|r| (r.max(-1) + 1) as usize).unwrap_or(h).saturating_sub(top);
+        // un formato de salida incoherente (recortes enormes) no debe apuntar fuera del búfer
+        let need = stride.checked_mul(sh);
+        if w == 0 || h == 0 || p.is_null() || need.map(|n| len < n).unwrap_or(true) || top.checked_mul(stride).and_then(|t| t.checked_add(left)).map(|o| o >= len).unwrap_or(true) {
             return Ok(None);
         }
         let ybase = stride * sh;
@@ -684,6 +686,10 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                                 if !on_frame(w, h, px) {
                                     return Ok(false);
                                 }
+                            }
+                            // el último fotograma puede llegar con la marca de fin de flujo
+                            if info.flags & EOS != 0 {
+                                v_done = true;
                             }
                         }
                     }
