@@ -1433,7 +1433,8 @@ impl Preview {
             }
         }
         let sel = self.sel.filter(|s| s.page == page && s.a != s.b);
-        let range = sel.map(|s| if s.a <= s.b { (s.a, s.b) } else { (s.b, s.a) });
+        // una selección vieja puede apuntar a trozos que ya no existen
+        let range = sel.map(|s| if s.a <= s.b { (s.a, s.b) } else { (s.b, s.a) }).filter(|(a, _)| a.0 < runs.len());
         if let Some((a, b)) = range {
             for i in a.0..=b.0.min(runs.len().saturating_sub(1)) {
                 let r = &runs[i];

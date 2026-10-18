@@ -610,12 +610,12 @@ impl Pkg {
 
     fn read(&mut self, name: &str) -> Option<Vec<u8>> {
         use std::io::Read;
-        let mut f = self.ar.by_name(name).ok()?;
+        let f = self.ar.by_name(name).ok()?;
         if f.size() > 64 << 20 {
             return None;
         }
-        let mut v = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut v).ok()?;
+        let mut v = Vec::with_capacity((f.size() as usize).min(1 << 20));
+        f.take(64 << 20).read_to_end(&mut v).ok()?;
         Some(v)
     }
 

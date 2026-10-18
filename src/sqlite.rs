@@ -189,7 +189,7 @@ impl Db {
                     let cp = u16::from_be_bytes([*page.get(hdr + 8 + 2 * i)?, *page.get(hdr + 9 + 2 * i)?]) as usize;
                     let (size, a) = varint(page.get(cp..)?)?;
                     let (rowid, b) = varint(page.get(cp + a..)?)?;
-                    if size as usize > 64 << 20 {
+                    if size as usize > 1 << 20 {
                         continue;
                     }
                     let data = self.payload(&page, cp + a + b, size as usize)?;

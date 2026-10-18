@@ -104,7 +104,7 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(i) = r.find('&') {
         out.push_str(&r[..i]);
         r = &r[i..];
-        let Some(e) = r.find(';').filter(|e| *e <= 10) else {
+        let Some(e) = r.as_bytes().iter().take(11).position(|&b| b == b';') else {
             out.push('&');
             r = &r[1..];
             continue;
