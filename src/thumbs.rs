@@ -116,7 +116,7 @@ fn ffmpeg_frame(path: &Path, max: u32, video: bool) -> Option<Decoded> {
     let scale = format!("scale='min({max},iw)':'min({max},ih)':force_original_aspect_ratio=decrease");
     for seek in if video { vec!["1", "0"] } else { vec!["0"] } {
         let mut c = Command::new("ffmpeg");
-        c.args(["-v", "error", "-nostdin", "-ss", seek, "-i"]).arg(path);
+        c.args(["-v", "error", "-nostdin", "-ss", seek, "-protocol_whitelist", "file,pipe", "-i"]).arg(path);
         c.args(["-frames:v", "1", "-vf", &scale, "-f", "image2pipe", "-c:v", "png", "-"]);
         if let Some(b) = run_capture(c) {
             if let Some(d) = from_png_bytes(&b, max) {
@@ -140,11 +140,14 @@ fn magick_frame(path: &Path, max: u32) -> Option<Decoded> {
 
 fn decode_svg(path: &Path, max: u32) -> Option<Decoded> {
     let md = std::fs::metadata(path).ok()?;
-    if md.len() > 8 * 1024 * 1024 {
+    if md.len() > 4 * 1024 * 1024 {
         return None;
     }
     let data = std::fs::read(path).ok()?;
-    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?;
+    // un SVG no puede leer otros archivos del disco (<image href="/ruta">) para pintarlos en la miniatura
+    let mut opt = resvg::usvg::Options::default();
+    opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let tree = resvg::usvg::Tree::from_data(&data, &opt).ok()?;
     let sz = tree.size();
     let target = max.min(2048) as f32;
     let s = target / sz.width().max(sz.height()).max(1.0);
@@ -276,7 +279,7 @@ pub fn decode_jpeg_from<R: std::io::Read>(r: R, max: u32, orientation: u8) -> Op
     let info = dec.info()?;
     let (w0, h0) = (info.width as u32, info.height as u32);
     // sin tope, un JPEG diminuto que declare 65535×65535 pediría gigas de memoria
-    if w0 as u64 * h0 as u64 > 200_000_000 {
+    if w0 as u64 * h0 as u64 > 100_000_000 {
         return None;
     }
     if w0 > max || h0 > max {

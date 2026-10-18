@@ -58,7 +58,7 @@ pub struct Player {
 /// Duración en segundos leída de la cabecera de `ffmpeg -i`.
 fn probe_duration(path: &Path) -> f64 {
     let mut c = Command::new("ffmpeg");
-    quiet(&mut c).args(["-hide_banner", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    quiet(&mut c).args(["-hide_banner", "-protocol_whitelist", "file,pipe", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     let Ok(out) = c.output() else { return 0.0 };
     let s = String::from_utf8_lossy(&out.stderr);
     let Some(i) = s.find("Duration: ") else { return 0.0 };
@@ -124,7 +124,7 @@ impl Player {
         let g = self.shared.epoch.load(Ordering::SeqCst);
         let mut v = Command::new("ffmpeg");
         quiet(&mut v)
-            .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{pos:.3}"), "-re", "-i"])
+            .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{pos:.3}"), "-re", "-protocol_whitelist", "file,pipe", "-i"])
             .arg(&self.path)
             .args(["-an", "-sn", "-vf", "scale='min(1280,iw)':-2:flags=fast_bilinear,fps=30", "-f", "image2pipe", "-vcodec", "ppm", "-"])
             .stdin(Stdio::null())
@@ -180,7 +180,7 @@ impl Player {
         if self.has_audio {
             let mut a = Command::new("ffplay");
             quiet(&mut a)
-                .args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-ss", &format!("{pos:.3}"), "-i"])
+                .args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-ss", &format!("{pos:.3}"), "-protocol_whitelist", "file,pipe", "-i"])
                 .arg(&self.path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

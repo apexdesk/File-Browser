@@ -196,7 +196,7 @@ pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::
     if !safe(Path::new(entry)) {
         return Err("ruta no válida".into());
     }
-    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    crate::fsys::private_dir(dst);
     let out = dst.join(entry);
     if let Some(d) = out.parent() {
         fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -293,7 +293,8 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
     match fmt {
         Format::Tar | Format::TarGz => {
             let r = Counting { inner: BufReader::new(open()?), p };
-            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r)) } else { Box::new(r) };
+            // tope de bytes descomprimidos: un .tar.gz diminuto no puede llenar el disco
+            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r).take(MAX_EXPANDED)) } else { Box::new(r.take(MAX_EXPANDED)) };
             let mut ar = tar::Archive::new(rd);
             ar.set_preserve_permissions(false);
             let mut n = 0u32;

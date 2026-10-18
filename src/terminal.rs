@@ -96,7 +96,9 @@ impl Terminal {
                     if bp {
                         out.extend_from_slice(b"\x1b[200~");
                     }
-                    out.extend_from_slice(t.as_bytes());
+                    // sin ESC ni controles: un «\x1b[201~» pegado cerraría el modo y lo que sigue se ejecutaría
+                    let clean: String = t.replace("\r\n", "\n").chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+                    out.extend_from_slice(clean.as_bytes());
                     if bp {
                         out.extend_from_slice(b"\x1b[201~");
                     }

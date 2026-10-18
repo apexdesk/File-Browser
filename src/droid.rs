@@ -487,9 +487,9 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
 
         let clock = |sink: &Option<Sink>, anchor: &Option<(Instant, i64)>| -> i64 {
             if let Some(s) = sink {
-                start_us + (played.load(Ordering::Relaxed) as f64 / s.rate as f64 * 1e6) as i64
+                start_us.saturating_add((played.load(Ordering::Relaxed) as f64 / s.rate as f64 * 1e6) as i64)
             } else if let Some((t, p)) = anchor {
-                p + t.elapsed().as_micros() as i64
+                p.saturating_add(t.elapsed().as_micros() as i64)
             } else {
                 start_us
             }
@@ -643,7 +643,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                         }
                     }
                     if let Some((i, pts, info)) = pending {
-                        let due = !o.realtime || (sink.is_none() && anchor.is_none()) || pts <= clock(&sink, &anchor) + 8_000;
+                        let due = !o.realtime || (sink.is_none() && anchor.is_none()) || pts <= clock(&sink, &anchor).saturating_add(8_000);
                         // sin audio todavía en marcha, el primer fotograma sale de inmediato
                         if due {
                             pending = None;

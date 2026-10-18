@@ -179,7 +179,7 @@ mod wl {
                             let (out, wake, conn) = (st.dropped.clone(), st.wake.clone(), conn.clone());
                             std::thread::spawn(move || {
                                 let mut buf = Vec::new();
-                                let _ = std::fs::File::from(rd).read_to_end(&mut buf);
+                                let _ = std::fs::File::from(rd).take(1 << 20).read_to_end(&mut buf);
                                 out.lock().unwrap().extend(parse_uri_list(&buf));
                                 offer.finish();
                                 offer.destroy();

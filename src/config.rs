@@ -138,12 +138,12 @@ impl Config {
                 "clip_panel" => c.clip_panel = v != "0",
                 "col_view" => c.col_view = v == "1",
                 k if k.starts_with("colw.") => {
-                    if let Ok(w) = v.parse::<f32>() {
+                    if let Some(w) = v.parse::<f32>().ok().filter(|x| x.is_finite()) {
                         c.col_w.push((k["colw.".len()..].to_string(), w.clamp(40.0, 400.0)));
                     }
                 }
                 "grid" => c.grid = v == "1",
-                "zoom" => c.zoom = v.parse().unwrap_or(120.0f32).clamp(64.0, 200.0),
+                "zoom" => c.zoom = v.parse().ok().filter(|x: &f32| x.is_finite()).unwrap_or(120.0f32).clamp(64.0, 200.0),
                 "hidden" => c.show_hidden = v == "1",
                 "dark" => {
                     c.dark = v != "0";
@@ -184,8 +184,8 @@ impl Config {
                 "thumbs" => c.thumbs_on = v != "0",
                 "sidebar" => c.show_sidebar = v != "0",
                 "term_open" => c.term_open = v == "1",
-                "preview_w" => c.preview_w = v.parse().unwrap_or(360.0f32).clamp(220.0, 760.0),
-                "term_h" => c.term_h = v.parse().unwrap_or(240.0f32).clamp(100.0, 900.0),
+                "preview_w" => c.preview_w = v.parse().ok().filter(|x: &f32| x.is_finite()).unwrap_or(360.0f32).clamp(220.0, 760.0),
+                "term_h" => c.term_h = v.parse().ok().filter(|x: &f32| x.is_finite()).unwrap_or(240.0f32).clamp(100.0, 900.0),
                 "menu_btn" => c.show_menu_btn = v != "0",
                 "lang" => c.lang = v.to_string(),
                 "restore_tabs" => c.restore_tabs = v != "0",
@@ -206,7 +206,7 @@ impl Config {
                 "split" => c.split = v == "1",
                 k if k.starts_with("key.") => c.keys.push((k[4..].to_string(), v.to_string())),
                 "split_stack" => c.split_stack = v == "1",
-                "split_ratio" => c.split_ratio = v.parse().unwrap_or(0.5f32).clamp(0.2, 0.8),
+                "split_ratio" => c.split_ratio = v.parse().ok().filter(|x: &f32| x.is_finite()).unwrap_or(0.5f32).clamp(0.2, 0.8),
                 "split_dir" => c.split_dir = Some(PathBuf::from(v)),
                 "tab" => c.tabs.push(PathBuf::from(v)),
                 "tab2" => {
@@ -222,7 +222,7 @@ impl Config {
                 "last_dir" => c.last_dir = Some(PathBuf::from(v)),
                 "win" => {
                     if let Some((w, h)) = v.split_once('x') {
-                        if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                        if let (Some(w), Some(h)) = (w.parse::<f32>().ok().filter(|x| x.is_finite()), h.parse::<f32>().ok().filter(|x| x.is_finite())) {
                             c.win = (w.clamp(640.0, 8000.0), h.clamp(420.0, 6000.0));
                         }
                     }
