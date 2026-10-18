@@ -241,6 +241,11 @@ pub fn thumbable(kind: crate::fsys::Kind, ext: &str) -> bool {
 }
 
 /// Decodifica una imagen/SVG/vídeo a RGBA limitando el lado mayor a `max`.
+/// Lector de imágenes sobre la capa `vfs` (en la web, el archivo está en el servidor).
+pub fn open_image(path: &Path) -> std::io::Result<image::ImageReader<BufReader<File>>> {
+    image::ImageReader::new(BufReader::new(File::open(path)?)).with_guessed_format()
+}
+
 pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
@@ -262,10 +267,7 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
     if md.len() > 256 * 1024 * 1024 {
         return None;
     }
-    let img = image::ImageReader::open(path)
-        .ok()
-        .and_then(|r| r.with_guessed_format().ok())
-        .and_then(|r| r.decode().ok());
+    let img = open_image(path).ok().and_then(|r| r.decode().ok());
     let Some(img) = img else { return magick_frame(path, max) };
     let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
     let rgba = img.into_rgba8();

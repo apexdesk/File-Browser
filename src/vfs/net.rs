@@ -160,6 +160,11 @@ pub fn pick_files(ctx: egui::Context) {
         }
     });
     input.set_onchange(Some(on_change.unchecked_ref()));
+    // algunos navegadores solo abren el selector si el campo está en el documento
+    let _ = input.set_attribute("style", "display:none");
+    if let Some(body) = doc.body() {
+        let _ = body.append_child(&input);
+    }
     input.click();
 }
 
