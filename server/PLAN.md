@@ -111,7 +111,7 @@ Ctrl+C la invalida. El token no se guarda en disco.
   arrancar); un solo usuario, sin cierre de sesión. No se permite compartir `/` entero.
 - **Limitaciones aceptadas de la interfaz web:** cada consulta de metadatos es una petición síncrona (carpetas enormes van lentas);
   la búsqueda de contenido se hace en el hilo de la interfaz con tope de 3000 archivos; los duplicados y el cálculo de hashes bloquean
-  la página mientras duran; las miniaturas solo se decodifican para imágenes ≤ 4 MiB; copiar/mover entre raíces distintas no es posible.
+  la página mientras duran; las miniaturas solo se decodifican para imágenes ≤ 4 MiB; las operaciones `mv`/`cp` del servidor se limitan a una misma raíz.
 
 ## Decisiones abiertas
 - ~~`tiny_http` o servidor propio~~: resuelto, servidor propio sobre `std::net` (sin dependencias de red, ~400 líneas de HTTP/enrutado a auditar).
