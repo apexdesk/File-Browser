@@ -5492,7 +5492,7 @@ impl App {
         let fling = |hist: &[(f64, f32)], end: f64| -> f32 {
             let w = 0.12;
             let sum: f32 = hist.iter().filter(|(t, _)| end - t <= w).map(|(_, d)| d).sum();
-            let v = (sum / w as f32 * 1.8).clamp(-12000.0, 12000.0);
+            let v = (sum / w as f32 * 1.2).clamp(-12000.0, 12000.0);
             if v.abs() < 60.0 { 0.0 } else { v }
         };
         if self.touch {
@@ -5506,8 +5506,8 @@ impl App {
                     pdelta.y
                 };
                 self.kin_hist.retain(|(t, _)| now - t <= 0.1);
-                self.kin_hist.push((now, -dy * 1.25));
-                self.kin_off = (self.kin_off - dy * 1.25).clamp(0.0, max);
+                self.kin_hist.push((now, -dy * 1.875));
+                self.kin_off = (self.kin_off - dy * 1.875).clamp(0.0, max);
                 return Some(self.kin_off);
             }
             if r.drag_stopped() {
