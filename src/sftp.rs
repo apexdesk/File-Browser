@@ -468,7 +468,7 @@ struct Node {
 
 pub struct Session {
     root: PathBuf,
-    conn: Conn,
+    conn: Mutex<Conn>,
     client: Mutex<Option<Client>>,
     nodes: Mutex<HashMap<PathBuf, Node>>,
 }
@@ -509,7 +509,7 @@ impl Session {
         let mut g = self.client.lock().unwrap();
         for attempt in 0..2 {
             if g.is_none() {
-                *g = Some(spawn_ssh(&self.conn)?);
+                *g = Some(spawn_ssh(&self.conn.lock().unwrap().clone())?);
             }
             match f(g.as_mut().unwrap()) {
                 Ok(v) => return Ok(v),
@@ -585,11 +585,12 @@ pub fn connect(conn: Conn, path: &str) -> Result<PathBuf, String> {
         match g.iter().find(|s| s.root == root) {
             Some(s) => {
                 // nuevas credenciales: se reabre la conexión
+                *s.conn.lock().unwrap() = conn.clone();
                 *s.client.lock().unwrap() = None;
                 s.clone()
             }
             None => {
-                let s = Arc::new(Session { root: root.clone(), conn: conn.clone(), client: Mutex::new(None), nodes: Mutex::new(HashMap::new()) });
+                let s = Arc::new(Session { root: root.clone(), conn: Mutex::new(conn.clone()), client: Mutex::new(None), nodes: Mutex::new(HashMap::new()) });
                 g.push(s.clone());
                 s
             }
@@ -677,7 +678,8 @@ pub fn ensure_local_with(p: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut
 pub fn remote_label(p: &Path) -> Option<String> {
     let s = session_for(p)?;
     let r = s.remote_of(p).or_else(|| p.parent().and_then(|d| s.remote_of(d)))?;
-    Some(format!("sftp://{}@{}{}", s.conn.user, s.conn.host, r))
+    let c = s.conn.lock().unwrap();
+    Some(format!("sftp://{}@{}{}", c.user, c.host, r))
 }
 
 #[cfg(test)]
