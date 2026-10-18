@@ -3,7 +3,7 @@
 use crate::http::{self, Req, Rng};
 use crate::jail::{self, Root};
 use crate::page::{self, Hit, Row};
-use crate::{mime, timefmt, walk, zipstream};
+use crate::{mime, timefmt, walk, webui, zipstream};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -210,12 +210,23 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
     if tail.is_empty() {
         return http::redirect(s, &format!("/s/{tok}/"), req.head);
     }
+    if let Some(api) = tail.strip_prefix("/api/") {
+        return api_route(s, ctx, req, api);
+    }
+    if tail == "/app" {
+        return http::redirect(s, &format!("/s/{tok}/app/"), req.head);
+    }
+    if let Some(f) = tail.strip_prefix("/app/") {
+        let f = if f.is_empty() { "index.html" } else { f };
+        let Some((ctype, body)) = webui::get(f) else { return http::error(s, 404, req.head) };
+        return http::send(s, 200, ctype, body, req.head, &[("Content-Security-Policy", webui::CSP.to_string())]);
+    }
     let Some((comps, slash)) = jail::split_url(tail) else {
         return http::error(s, 404, req.head);
     };
     if comps.is_empty() {
         let names: Vec<String> = ctx.roots.iter().map(|r| r.name.clone()).collect();
-        return http::send(s, 200, "text/html; charset=utf-8", page::roots_page(tok, &names).as_bytes(), req.head, &[]);
+        return http::send(s, 200, "text/html; charset=utf-8", page::roots_page(tok, &names, webui::available()).as_bytes(), req.head, &[]);
     }
     let Some((root, canon)) = jail::resolve(&ctx.roots, &comps, ctx.hidden) else {
         return http::error(s, 404, req.head);
@@ -251,6 +262,43 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
         send_file(s, req, &comps, &canon)
     } else {
         http::error(s, 404, req.head)
+    }
+}
+
+/// Ruta virtual «a/b/c» (ya decodificada) → componentes validados.
+fn virt_path(p: &str) -> Option<Vec<String>> {
+    let mut v = Vec::new();
+    for c in p.split('/').filter(|c| !c.is_empty()) {
+        if !jail::valid_component(c) {
+            return None;
+        }
+        v.push(c.to_string());
+    }
+    (v.len() <= 64).then_some(v)
+}
+
+fn api_route(s: &mut Stream, ctx: &Ctx, req: &Req, api: &str) -> io::Result<()> {
+    let json = "application/json; charset=utf-8";
+    match api {
+        "list" => {
+            let Some(comps) = virt_path(&query_get(&req.query, "p").unwrap_or_default()) else {
+                return http::error(s, 400, req.head);
+            };
+            let (mut rows, truncated);
+            if comps.is_empty() {
+                rows = ctx.roots.iter().map(|r| Row { name: r.name.clone(), is_dir: true, size: 0, mtime: 0 }).collect::<Vec<_>>();
+                truncated = false;
+            } else {
+                let Some((root, canon)) = jail::resolve(&ctx.roots, &comps, ctx.hidden) else { return http::error(s, 404, req.head) };
+                if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
+                    return http::error(s, 404, req.head);
+                }
+                (rows, truncated) = list_dir(ctx, root, &canon);
+            }
+            sort_rows(&mut rows, "name", false);
+            http::send(s, 200, json, webui::list_json(&comps, &rows, truncated).as_bytes(), req.head, &[])
+        }
+        _ => http::error(s, 404, req.head),
     }
 }
 

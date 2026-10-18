@@ -75,8 +75,12 @@ fn crumbs(token: &str, comps: &[String]) -> String {
     h
 }
 
-pub fn roots_page(token: &str, names: &[String]) -> String {
-    let mut b = String::from("<h1>Carpetas compartidas</h1><table>");
+pub fn roots_page(token: &str, names: &[String], web: bool) -> String {
+    let mut b = String::from("<h1>Carpetas compartidas</h1>");
+    if web {
+        b.push_str(&format!("<p><a href=\"/s/{token}/app/\">Abrir la interfaz web</a></p>"));
+    }
+    b.push_str("<table>");
     for n in names {
         b.push_str(&format!(
             "<tr><td class=\"n\"><a href=\"/s/{token}/{e}/\">{}/</a></td><td class=\"s\"><a href=\"/s/{token}/{e}/?zip=1\">ZIP</a></td></tr>",

@@ -126,6 +126,9 @@ pub fn send(w: &mut impl Write, code: u16, ctype: &str, body: &[u8], head_only: 
         ("Cache-Control", "private, no-store".to_string()),
         ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".to_string()),
     ];
+    if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-security-policy")) {
+        h.retain(|(k, _)| !k.eq_ignore_ascii_case("content-security-policy"));
+    }
     h.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
     write_head(w, code, &h)?;
     if !head_only {
