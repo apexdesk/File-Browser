@@ -91,6 +91,7 @@ impl Ctx {
 /// Clave de limitación: las IPv6 se agrupan por /64 (un atacante controla todo ese rango).
 fn ip_key(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V6(a) if a.to_ipv4_mapped().is_some() => IpAddr::V4(a.to_ipv4_mapped().unwrap()),
         IpAddr::V6(a) => {
             let mut o = a.octets();
             o[8..].fill(0);
@@ -198,9 +199,7 @@ pub fn query_get(q: &str, key: &str) -> Option<String> {
 }
 
 fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result<()> {
-    if ctx.blocked(ip) {
-        return http::error(s, 429, req.head);
-    }
+    let blocked = ctx.blocked(ip);
     let Some(rest) = req.path.strip_prefix("/s/") else {
         return http::error(s, 404, req.head);
     };
@@ -208,12 +207,19 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
-    if !ct_eq(tok, &ctx.token) {
+    let tok_ok = ct_eq(tok, &ctx.token);
+    let creds_ok = ctx.auth.as_ref().is_none_or(|c| c.check(req.auth.as_deref()));
+    // quien ya probó conocer el enlace (y la contraseña, si la hay) no queda bloqueado por los intentos
+    // de otros desde su misma IP (un túnel las junta todas): sigue frenado quien adivina
+    if blocked && !(tok_ok && creds_ok) {
+        return http::error(s, 429, req.head);
+    }
+    if !tok_ok {
         ctx.fail(ip);
         return http::error(s, 404, req.head);
     }
-    if let Some(c) = &ctx.auth {
-        if !c.check(req.auth.as_deref()) {
+    if ctx.auth.is_some() {
+        if !creds_ok {
             // los intentos fallidos cuentan para el bloqueo por IP, igual que un token erróneo
             if req.auth.is_some() {
                 ctx.fail(ip);

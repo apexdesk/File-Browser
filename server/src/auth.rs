@@ -14,7 +14,10 @@ impl Creds {
     /// ¿Es válida la cabecera `Authorization`? Compara en tiempo constante.
     pub fn check(&self, header: Option<&str>) -> bool {
         let Some(h) = header else { return false };
-        let Some(b64) = h.strip_prefix("Basic ").or_else(|| h.strip_prefix("basic ")) else { return false };
+        let Some((scheme, b64)) = h.split_once(' ') else { return false };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return false;
+        }
         let Some(raw) = b64_decode(b64.trim()) else { return false };
         let Ok(raw) = String::from_utf8(raw) else { return false };
         let Some((u, p)) = raw.split_once(':') else { return false };
@@ -115,6 +118,7 @@ mod tests {
         // ana:s3cret:pass
         assert!(c.check(Some("Basic YW5hOnMzY3JldDpwYXNz")));
         assert!(!c.check(Some("Basic YW5hOnMzY3JldA==")));
+        assert!(c.check(Some("BASIC YW5hOnMzY3JldDpwYXNz")));
         assert!(!c.check(Some("Bearer x")));
         assert!(!c.check(None));
     }

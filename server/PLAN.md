@@ -113,6 +113,23 @@ Ctrl+C la invalida. El token no se guarda en disco.
   la búsqueda de contenido se hace en el hilo de la interfaz con tope de 3000 archivos; los duplicados y el cálculo de hashes bloquean
   la página mientras duran; las miniaturas solo se decodifican para imágenes ≤ 4 MiB; las operaciones `mv`/`cp` del servidor se limitan a una misma raíz.
 
+- **Auditoría web (hecha, 3 agentes a ciegas: rutas y escritura, HTTP/auth/DoS, navegador y contenido).** Sin salida de las raíces,
+  sin XSS, sin ejecución de contenido activo, sin saltos de autenticación ni de CSRF.
+  Corregido: `PUT` sin `Content-Length` vaciaba el archivo (ahora 411); con `--tls` una conexión muda retenía un hilo para siempre (la
+  respuesta de error tiene plazo); el bloqueo por IP ya no deja fuera a quien trae el enlace correcto (y la contraseña, si la hay);
+  `mv` ya no pisa un archivo distinto que solo difiere en mayúsculas; `rmrf`/`mv` de carpetas se niegan (409) si arrastrarían contenido
+  oculto; las raíces anidadas no se pueden borrar ni mover desde la exterior; `cp` respeta `--max-upload`; barrido al arrancar de los
+  `.fbtmp-*` huérfanos de más de una hora; un `PUT` que reemplaza conserva los permisos; cabeceras repetidas (`Content-Length`, `Host`,
+  `Origin`, `X-FB`, `Authorization`, `Range`, `If-None-Match`), `Content-Length` con signo y CR/LF sueltos se rechazan (400);
+  esquema `Basic` sin distinguir mayúsculas; `Origin` debe coincidir también en esquema (http/https según `--tls`); más caracteres
+  invisibles rechazados en nombres (U+061C, U+00AD, U+034F, rellenos hangul, etiquetas U+E0000–E007F); `window.open` con `noopener` y
+  `Cross-Origin-Opener-Policy: same-origin`; `form-action 'none'` en la CSP de `/app/`; IPv4 mapeada en IPv6 normalizada en los límites.
+  **Aceptado y documentado:** subidas y descargas muy lentas sin plazo total y sin cuota de disco (solo las puede abusar quien tiene el
+  enlace); TOCTOU de un atacante local con escritura en la carpeta compartida (mitigación fuerte: `openat2`/`O_PATH`); el PDF inline
+  sin `sandbox` (lo contiene el visor del navegador); `filebrowser.config` en `localStorage` se comparte por `host:puerto` (el token
+  cambia en cada arranque, así que no puede ser parte de la clave sin perder la persistencia); el token vive en la URL; el mapa del
+  limitador se vacía al superar 4096 IPs; el 503 por exceso de conexiones va en claro aunque haya `--tls`.
+
 ## Decisiones abiertas
 - ~~`tiny_http` o servidor propio~~: resuelto, servidor propio sobre `std::net` (sin dependencias de red, ~400 líneas de HTTP/enrutado a auditar).
 - ¿Android? Un servidor en el móvil implica servicio en primer plano; se deja fuera de v1.

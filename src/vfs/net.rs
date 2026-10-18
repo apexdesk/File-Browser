@@ -171,7 +171,7 @@ pub fn pick_files(ctx: egui::Context) {
 /// Abre un archivo del servidor en una pestaña nueva (el navegador lo muestra o lo descarga).
 pub fn open_path(path: &str) {
     if let Some(w) = web_sys::window() {
-        let _ = w.open_with_url_and_target(&format!("../{}", url_path(path)), "_blank");
+        let _ = w.open_with_url_and_target_and_features(&format!("../{}", url_path(path)), "_blank", "noopener");
     }
 }
 

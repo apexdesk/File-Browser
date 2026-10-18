@@ -44,7 +44,7 @@ pub fn pct_encode(s: &str) -> String {
 
 /// Caracteres de formato invisibles (marcas bidi, ancho cero, BOM): permitirían disfrazar extensiones en el listado.
 fn is_format(c: char) -> bool {
-    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{061C}' | '\u{00AD}' | '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{180E}' | '\u{3164}' | '\u{FFA0}' | '\u{E0000}'..='\u{E007F}')
 }
 
 /// Un componente de ruta aceptable: sin separadores, sin controles, sin `.`/`..`.
@@ -136,6 +136,14 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn rechaza_caracteres_invisibles_de_formato() {
+        for c in ['\u{061C}', '\u{00AD}', '\u{034F}', '\u{3164}', '\u{E0041}', '\u{202E}', '\u{200B}'] {
+            assert!(!valid_component(&format!("factura{c}fdp.exe")), "{c:?}");
+        }
+        assert!(valid_component("informe año 2026.pdf"));
     }
 
     #[test]

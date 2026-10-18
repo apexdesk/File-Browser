@@ -18,9 +18,9 @@ use std::time::Duration;
 /// Plazo para cada lectura del cuerpo: un envío que se queda parado se corta.
 const BODY_STALL: Duration = Duration::from_secs(30);
 
-fn csrf_ok(req: &Req) -> bool {
+fn csrf_ok(req: &Req, tls: bool) -> bool {
     let (Some(origin), Some(host)) = (&req.origin, &req.host) else { return false };
-    let o = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")).unwrap_or("");
+    let o = origin.strip_prefix(if tls { "https://" } else { "http://" }).unwrap_or("");
     req.xfb && !o.is_empty() && o == host
 }
 
@@ -32,6 +32,31 @@ fn status_of(e: &io::Error) -> u16 {
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidFilename => 400,
         io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => 507,
         _ => 500,
+    }
+}
+
+/// Al arrancar con `--write`: borra los `.fbtmp-*` de más de una hora que dejó un corte (kill, apagón).
+pub fn sweep_temp(roots: &[Root]) {
+    let limit = Duration::from_secs(3600);
+    let mut budget = 50_000usize;
+    let mut stack: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if budget == 0 {
+                return;
+            }
+            budget -= 1;
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() {
+                stack.push(e.path());
+            } else if t.is_file()
+                && e.file_name().to_string_lossy().starts_with(".fbtmp-")
+                && e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m.elapsed().is_ok_and(|a| a > limit))
+            {
+                let _ = fs::remove_file(e.path());
+            }
+        }
     }
 }
 
@@ -54,6 +79,11 @@ fn parent_and_name<'a>(ctx: &'a Ctx, comps: &[String]) -> Result<(&'a Root, Path
     if !ctx.hidden && name.starts_with('.') {
         return Err(403);
     }
+    // ni una raíz ni una carpeta que contenga otra raíz compartida (raíces anidadas)
+    let target = dir.join(name);
+    if ctx.roots.iter().any(|r| r.path.starts_with(&target)) {
+        return Err(403);
+    }
     Ok((root, dir, name.clone()))
 }
 
@@ -66,7 +96,7 @@ pub fn dispatch(s: &mut Stream, ctx: &Ctx, req: &Req, tail: &str) -> io::Result<
     if !ctx.write {
         return http::error(s, 405, false);
     }
-    if !csrf_ok(req) {
+    if !csrf_ok(req, ctx.tls.is_some()) {
         return http::error(s, 403, false);
     }
     let r = if req.method == http::Method::Put {
@@ -87,9 +117,14 @@ fn put_file(s: &mut Stream, ctx: &Ctx, req: &Req, tail: &str) -> Result<(), u16>
     if slash {
         return Err(404);
     }
+    // sin longitud declarada no se sabe si el cuerpo viene vacío o el cliente falló: no se vacía el archivo
+    if !req.has_length {
+        return Err(411);
+    }
     let (_, dir, name) = parent_and_name(ctx, &comps)?;
     let target = dir.join(&name);
-    if fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
+    let old = fs::symlink_metadata(&target).ok();
+    if old.as_ref().is_some_and(|m| m.is_dir()) {
         return Err(409);
     }
     if req.content_length > ctx.max_upload {
@@ -121,6 +156,10 @@ fn put_file(s: &mut Stream, ctx: &Ctx, req: &Req, tail: &str) -> Result<(), u16>
     if let Err(e) = r {
         let _ = fs::remove_file(&tmp);
         return Err(if e.kind() == io::ErrorKind::UnexpectedEof || e.kind() == io::ErrorKind::TimedOut { 400 } else { status_of(&e) });
+    }
+    // al reemplazar un archivo se conservan sus permisos (p. ej. el bit ejecutable)
+    if let Some(m) = old.filter(|m| m.is_file()) {
+        let _ = fs::set_permissions(&tmp, m.permissions());
     }
     if let Err(e) = fs::rename(&tmp, &target) {
         let _ = fs::remove_file(&tmp);
@@ -159,7 +198,16 @@ fn op(ctx: &Ctx, req: &Req) -> Result<(), u16> {
             let (_, dir, n) = parent_and_name(ctx, &p)?;
             let t = dir.join(n);
             let md = fs::symlink_metadata(&t).map_err(|e| status_of(&e))?;
-            if md.is_dir() { fs::remove_dir_all(t) } else { fs::remove_file(t) }.map_err(|e| status_of(&e))
+            if md.is_dir() {
+                // lo oculto no se ve ni se lista: tampoco se borra de rebote
+                if !ctx.hidden && has_hidden(&t) {
+                    return Err(409);
+                }
+                fs::remove_dir_all(t)
+            } else {
+                fs::remove_file(t)
+            }
+            .map_err(|e| status_of(&e))
         }
         ("mv", Some(to)) => {
             let (r1, d1, n1) = parent_and_name(ctx, &p)?;
@@ -168,10 +216,15 @@ fn op(ctx: &Ctx, req: &Req) -> Result<(), u16> {
                 return Err(400);
             }
             let (src, dst) = (d1.join(n1), d2.join(n2));
-            fs::symlink_metadata(&src).map_err(|e| status_of(&e))?;
-            // solo un cambio de mayúsculas puede «existir» ya en el destino (es el mismo archivo)
-            if fs::symlink_metadata(&dst).is_ok() && !same_ignoring_case(&src, &dst) {
+            let md = fs::symlink_metadata(&src).map_err(|e| status_of(&e))?;
+            if md.is_dir() && !ctx.hidden && has_hidden(&src) {
                 return Err(409);
+            }
+            // solo un cambio de mayúsculas puede «existir» ya en el destino, y solo si es el mismo archivo
+            if let Ok(d) = fs::symlink_metadata(&dst) {
+                if !same_file(&md, &d) {
+                    return Err(409);
+                }
             }
             fs::rename(src, dst).map_err(|e| status_of(&e))
         }
@@ -187,8 +240,33 @@ fn op(ctx: &Ctx, req: &Req) -> Result<(), u16> {
     }
 }
 
-fn same_ignoring_case(a: &Path, b: &Path) -> bool {
-    a != b && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+/// ¿Son el mismo archivo? (un sistema que no distingue mayúsculas ve `A` y `a` como uno solo)
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        // sin identificador de archivo a mano: solo se admite si el nombre difiere en mayúsculas (ya comprobado por el sistema)
+        true
+    }
+}
+
+/// ¿Hay algo oculto (nombre con «.») dentro de la carpeta, a cualquier profundidad? No sigue enlaces.
+fn has_hidden(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else { return false };
+    for e in rd.flatten() {
+        if e.file_name().to_string_lossy().starts_with('.') {
+            return true;
+        }
+        if e.file_type().is_ok_and(|t| t.is_dir()) && has_hidden(&e.path()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn mkdirs(ctx: &Ctx, comps: &[String]) -> io::Result<()> {
@@ -222,8 +300,12 @@ fn mkdirs(ctx: &Ctx, comps: &[String]) -> io::Result<()> {
 
 fn copy(ctx: &Ctx, from: &[String], to: &[String]) -> Result<(), u16> {
     let (r1, src) = jail::resolve(&ctx.roots, from, ctx.hidden).ok_or(404u16)?;
-    if !fs::metadata(&src).map_err(|e| status_of(&e))?.is_file() {
+    let md = fs::metadata(&src).map_err(|e| status_of(&e))?;
+    if !md.is_file() {
         return Err(400);
+    }
+    if md.len() > ctx.max_upload {
+        return Err(413);
     }
     let (r2, d2, n2) = parent_and_name(ctx, to)?;
     if r1.name != r2.name {
@@ -381,6 +463,128 @@ mod tests {
         assert_eq!(put(&s, "grande.bin", &[0u8; 64]), 413);
         assert!(!s.dir.join("raiz/grande.bin").exists());
         assert_eq!(put(&s, "ok.bin", &[0u8; 8]), 200);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    fn raw(s: &Srv, bytes: &[u8]) -> u16 {
+        let mut t = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        t.write_all(bytes).unwrap();
+        let mut out = Vec::new();
+        let _ = t.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn put_sin_longitud_no_vacia_el_archivo() {
+        let s = start(true, 1 << 20);
+        let h = format!("PUT /s/tok/raiz/a.txt HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-FB: 1\r\nOrigin: http://127.0.0.1:{p}\r\n\r\n", p = s.port);
+        assert_eq!(raw(&s, h.as_bytes()), 411);
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/a.txt")).unwrap(), "hola");
+        // declarar 0 explícitamente sí vacía
+        assert_eq!(put(&s, "a.txt", b""), 200);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mv_no_pisa_otro_archivo_que_solo_difiere_en_mayusculas() {
+        let s = start(true, 1 << 20);
+        std::fs::write(s.dir.join("raiz/Uno"), "A").unwrap();
+        std::fs::write(s.dir.join("raiz/uno"), "B").unwrap();
+        assert_eq!(op(&s, "op=mv&p=raiz/Uno&to=raiz/uno"), 409);
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/uno")).unwrap(), "B");
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/Uno")).unwrap(), "A");
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn lo_oculto_no_se_arrastra_al_borrar_ni_mover() {
+        let s = start(true, 1 << 20);
+        std::fs::create_dir_all(s.dir.join("raiz/d/x/.git")).unwrap();
+        std::fs::write(s.dir.join("raiz/d/x/.git/config"), "c").unwrap();
+        assert_eq!(op(&s, "op=rmrf&p=raiz/d"), 409);
+        assert_eq!(op(&s, "op=mv&p=raiz/d&to=raiz/e"), 409);
+        assert!(s.dir.join("raiz/d/x/.git/config").exists());
+        // sin nada oculto sí se puede
+        std::fs::create_dir_all(s.dir.join("raiz/limpia/y")).unwrap();
+        assert_eq!(op(&s, "op=rmrf&p=raiz/limpia"), 200);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn raices_anidadas_no_se_tocan_desde_la_exterior() {
+        let dir = std::env::temp_dir().join(format!("fbs_n_{}_{}", std::process::id(), crate::write::rand_hex()));
+        std::fs::create_dir_all(dir.join("x/sub/dentro")).unwrap();
+        std::fs::write(dir.join("x/sub/dentro/f"), "1").unwrap();
+        let canon = |p: &str| std::fs::canonicalize(dir.join(p)).unwrap();
+        let roots = vec![Root { name: "x".into(), path: canon("x") }, Root { name: "sub".into(), path: canon("x/sub") }];
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let ctx = Ctx::new(roots, "tok".into(), false, true, 1 << 20, None);
+        std::thread::spawn(move || serve(l, Arc::new(ctx), 16));
+        let s = Srv { port, dir };
+        assert_eq!(op(&s, "op=rmrf&p=x/sub"), 403);
+        assert_eq!(op(&s, "op=mv&p=x/sub&to=x/otro"), 403);
+        assert_eq!(op(&s, "op=rmrf&p=x/sub/dentro"), 200);
+        assert!(s.dir.join("x/sub").is_dir());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn cp_respeta_el_tope() {
+        let s = start(true, 10);
+        std::fs::write(s.dir.join("raiz/grande"), [0u8; 64]).unwrap();
+        assert_eq!(op(&s, "op=cp&p=raiz/grande&to=raiz/copia"), 413);
+        assert!(!s.dir.join("raiz/copia").exists());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn al_reemplazar_se_conservan_los_permisos() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = start(true, 1 << 20);
+        let p = s.dir.join("raiz/run.sh");
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(put(&s, "run.sh", b"#!/bin/sh\necho\n"), 200);
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o750);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn el_origen_debe_coincidir_con_el_esquema() {
+        let s = start(true, 1 << 20);
+        let h = vec![("X-FB", "1".into()), ("Origin", format!("https://127.0.0.1:{}", s.port))];
+        assert_eq!(req(&s, "PUT", "/s/tok/raiz/n.txt", &h, b"x").0, 403);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn quien_conoce_el_enlace_no_queda_bloqueado_por_otros() {
+        let s = start(false, 1 << 20);
+        for i in 0..25 {
+            assert_eq!(req(&s, "GET", &format!("/s/mal{i}/"), &[], b"").0, if i < 20 { 404 } else { 429 });
+        }
+        // la IP está bloqueada para adivinar, pero el enlace correcto sigue entrando
+        assert_eq!(req(&s, "GET", "/s/tok/api/info", &[], b"").0, 200);
+        assert_eq!(req(&s, "GET", "/s/otro/", &[], b"").0, 429);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn sweep_borra_solo_temporales_viejos() {
+        let s = start(true, 1 << 20);
+        let viejo = s.dir.join("raiz/sub/.fbtmp-viejo");
+        let nuevo = s.dir.join("raiz/.fbtmp-nuevo");
+        std::fs::write(&viejo, "x").unwrap();
+        std::fs::write(&nuevo, "x").unwrap();
+        let f = std::fs::File::options().write(true).open(&viejo).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)).unwrap();
+        drop(f);
+        let root = Root { name: "raiz".into(), path: std::fs::canonicalize(s.dir.join("raiz")).unwrap() };
+        crate::write::sweep_temp(&[root]);
+        assert!(!viejo.exists() && nuevo.exists());
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 }

@@ -227,6 +227,9 @@ fn run() -> Result<(), String> {
         });
     }
     println!("Ctrl+C para parar.");
+    if o.write {
+        write::sweep_temp(&roots);
+    }
     let mut ctx = server::Ctx::new(roots, token, o.hidden, o.write, o.max_upload_mib.saturating_mul(1 << 20), tls_cfg);
     ctx.auth = auth;
     server::serve(listener, Arc::new(ctx), o.max_conn);
