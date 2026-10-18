@@ -219,6 +219,7 @@ pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pass:
     p.total.store(ar.len() as u64, AO::Relaxed);
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     let mut top: Vec<String> = Vec::new();
+    let mut written = 0u64;
     for i in 0..ar.len() {
         if p.cancelled() {
             return Err("cancelado".into());
@@ -254,7 +255,16 @@ pub fn unzip_to(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pass:
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let mut out = File::create(&target).map_err(|e| format!("{}: {e}", rel.display()))?;
-            if let Err(e) = io::copy(&mut zf, &mut out) {
+            // el tamaño declarado puede mentir: se cuenta lo que realmente se escribe
+            let room = crate::archive::MAX_EXPANDED.saturating_sub(written);
+            let r = io::copy(&mut (&mut zf).take(room.saturating_add(1)), &mut out);
+            if let Ok(n) = &r {
+                written += n;
+                if written > crate::archive::MAX_EXPANDED {
+                    return Err("el contenido descomprimido supera el límite permitido".into());
+                }
+            }
+            if let Err(e) = r {
                 // ZipCrypto con contraseña errónea sólo falla al comprobar el CRC
                 return Err(if encrypted && pass.is_some() { crate::archive::BAD_PASS.into() } else { format!("{}: {e}", rel.display()) });
             }

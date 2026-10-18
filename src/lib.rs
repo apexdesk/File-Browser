@@ -182,6 +182,8 @@ pub fn android_insets() -> [f32; 4] {
         let vm = unsafe { jni::JavaVM::from_raw(vm as *mut _)? };
         let mut env = vm.attach_current_thread()?;
         let act = unsafe { JObject::from_raw(act as jni::sys::jobject) };
+        // marco local: se consulta cada medio segundo y sin él las referencias JNI se acumulan hasta abortar
+        env.with_local_frame(32, |env| -> jni::errors::Result<[f32; 4]> {
         let win = env.call_method(&act, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
         let decor = env.call_method(&win, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
         let wi = env.call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?.l()?;
@@ -207,6 +209,7 @@ pub fn android_insets() -> [f32; 4] {
             out[i] = a.max(b) as f32;
         }
         Ok(out)
+        })
     };
     go().unwrap_or_else(|_| {
         if let Ok(vm) = unsafe { jni::JavaVM::from_raw(vm as *mut _) } {
@@ -230,11 +233,13 @@ pub fn android_all_files() -> bool {
     let go = || -> jni::errors::Result<bool> {
         let vm = unsafe { jni::JavaVM::from_raw(vm as *mut _)? };
         let mut env = vm.attach_current_thread()?;
+        env.with_local_frame(16, |env| -> jni::errors::Result<bool> {
         let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
         if sdk < 30 {
             return Ok(true);
         }
         env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?.z()
+        })
     };
     go().unwrap_or(true)
 }

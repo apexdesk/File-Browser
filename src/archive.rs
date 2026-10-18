@@ -169,7 +169,7 @@ pub fn list(path: &Path, max: usize, budget: Duration) -> Result<Listing, String
         Format::Tar | Format::TarGz => {
             let f = File::open(path).map_err(|e| e.to_string())?;
             let r = Deadline { inner: BufReader::new(f), end: Instant::now() + budget };
-            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r)) } else { Box::new(r) };
+            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r).take(MAX_EXPANDED)) } else { Box::new(r) };
             let mut ar = tar::Archive::new(rd);
             let ents = ar.entries().map_err(|e| e.to_string())?;
             for e in ents {
@@ -278,6 +278,9 @@ pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::
 }
 
 /// Extrae todo `src` dentro de `dst`. Devuelve los nombres de primer nivel.
+/// Tope de bytes descomprimidos por extracción: por encima se trata como una bomba de descompresión.
+pub const MAX_EXPANDED: u64 = 64 << 30;
+
 pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pass: Option<&str>) -> Result<Vec<String>, String> {
     let fmt = detect(src).ok_or("formato no soportado")?;
     if fmt == Format::Zip {
@@ -306,6 +309,7 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
         }
         Format::SevenZ => {
             sevenz_header_ok(src)?;
+            let mut total = 0u64;
             let r = Counting { inner: BufReader::new(open()?), p };
             sevenz_rust2::decompress_with_extract_fn_and_password(r, dst, sevenz_rust2::Password::from(pass.unwrap_or("")), |entry, rd, dest| {
                 if p.cancelled() {
@@ -314,6 +318,10 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
                 // un nombre absoluto o con `..` escaparía de `dst` (PathBuf::join lo sustituiría entero)
                 if !safe(Path::new(entry.name())) {
                     return Ok(true);
+                }
+                total = total.saturating_add(entry.size());
+                if total > MAX_EXPANDED {
+                    return Err(sevenz_rust2::Error::Other("el contenido descomprimido supera el límite permitido".into()));
                 }
                 sevenz_rust2::default_entry_extract_fn(entry, rd, dest)
             })
