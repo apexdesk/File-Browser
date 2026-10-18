@@ -274,15 +274,15 @@ impl Config {
         }
         let mut s = String::new();
         for b in &self.bookmarks {
-            s.push_str(&format!("bookmark={}\n", b.display()));
+            s.push_str(&format!("bookmark={}\n", b.display().to_string().replace(['\n', '\r'], " ")));
         }
         s.push_str(&format!("grid={}\n", self.grid as u8));
         s.push_str(&format!("zoom={}\n", self.zoom));
         s.push_str(&format!("hidden={}\n", self.show_hidden as u8));
         s.push_str(&format!("dark={}\n", self.dark as u8));
         s.push_str(&format!("theme={}\n", self.theme_mode));
-        s.push_str(&format!("theme_light={}\n", self.theme_light));
-        s.push_str(&format!("theme_dark={}\n", self.theme_dark));
+        s.push_str(&format!("theme_light={}\n", self.theme_light.replace(['\n', '\r'], " ")));
+        s.push_str(&format!("theme_dark={}\n", self.theme_dark.replace(['\n', '\r'], " ")));
         for th in &self.custom_themes {
             let hex: Vec<String> = th.colors.iter().map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
             s.push_str(&format!("ctheme={}|{}|{}\n", th.name, th.dark as u8, hex.join(",")));
@@ -290,7 +290,7 @@ impl Config {
         s.push_str(&format!("sort={}\n", self.sort.as_str()));
         s.push_str(&format!("asc={}\n", self.asc as u8));
         if let Some(d) = &self.last_dir {
-            s.push_str(&format!("last_dir={}\n", d.display()));
+            s.push_str(&format!("last_dir={}\n", d.display().to_string().replace(['\n', '\r'], " ")));
         }
         s.push_str(&format!("sys_icons={}\n", self.sys_icons as u8));
         s.push_str(&format!("thumbs={}\n", self.thumbs_on as u8));
@@ -311,7 +311,7 @@ impl Config {
         s.push_str(&format!("clip_panel={}\n", self.clip_panel as u8));
         s.push_str(&format!("col_view={}\n", self.col_view as u8));
         for r in &self.recent {
-            s.push_str(&format!("recent={}\n", r.display()));
+            s.push_str(&format!("recent={}\n", r.display().to_string().replace(['\n', '\r'], " ")));
         }
         for (id, w) in &self.col_w {
             s.push_str(&format!("colw.{id}={w}\n"));
@@ -323,19 +323,23 @@ impl Config {
         s.push_str(&format!("split_stack={}\n", self.split_stack as u8));
         s.push_str(&format!("split_ratio={}\n", self.split_ratio));
         if let Some(d) = &self.split_dir {
-            s.push_str(&format!("split_dir={}\n", d.display()));
+            s.push_str(&format!("split_dir={}\n", d.display().to_string().replace(['\n', '\r'], " ")));
         }
         for t in &self.tabs {
-            s.push_str(&format!("tab={}\n", t.display()));
+            s.push_str(&format!("tab={}\n", t.display().to_string().replace(['\n', '\r'], " ")));
         }
         for (i, t) in &self.tabs2 {
-            s.push_str(&format!("tab2={}={}\n", i, t.display()));
+            s.push_str(&format!("tab2={}={}\n", i, t.display().to_string().replace(['\n', '\r'], " ")));
         }
         s.push_str(&format!("cur_tab={}\n", self.cur_tab));
         s.push_str(&format!("native_deco={}\n", self.native_deco as u8));
-        s.push_str(&format!("shell={}\n", self.shell));
+        s.push_str(&format!("shell={}\n", self.shell.replace(['\n', '\r'], " ")));
         s.push_str(&format!("win={}x{}\n", self.win.0, self.win.1));
-        let _ = std::fs::write(f, s);
+        // escritura atómica: un corte a medias no deja la configuración vacía
+        let tmp = f.with_extension("tmp");
+        if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &f).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 

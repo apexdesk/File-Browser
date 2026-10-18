@@ -2120,6 +2120,10 @@ impl App {
         if new.is_empty() || new == old || new == "." || new == ".." || new.contains(['/', '\\']) {
             return;
         }
+        if new.len() > 255 || new.chars().any(|c| c.is_control()) || (cfg!(windows) && bad_name(&new)) {
+            self.say(t("Nombre no válido").into(), true);
+            return;
+        }
         let from = self.cwd.join(&old_full);
         let to = from.with_file_name(&new);
         let case_only = new.to_lowercase() == old.to_lowercase();
@@ -2130,7 +2134,9 @@ impl App {
                 let (f, t2) = (from.clone(), to.clone());
                 move || {
                     // `rename` sobrescribe el destino en silencio: no se pisa un elemento que ya existe
-                    if !case_only && std::fs::symlink_metadata(&t2).is_ok() {
+                    // en un sistema que distingue mayúsculas, «foo» y «Foo» pueden ser archivos distintos
+                    let same_file = case_only && matches!((std::fs::canonicalize(&f), std::fs::canonicalize(&t2)), (Ok(a), Ok(b)) if a == b);
+                    if !same_file && std::fs::symlink_metadata(&t2).is_ok() {
                         return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("Ya existe un elemento con ese nombre")));
                     }
                     std::fs::rename(&f, &t2)

@@ -122,6 +122,9 @@ impl Db {
             types.push(t);
             p += k;
         }
+        if hl as usize > b.len() {
+            return None;
+        }
         let mut q = hl as usize;
         let mut vals = Vec::with_capacity(types.len());
         for t in types {
@@ -136,8 +139,9 @@ impl Db {
                 n if n >= 12 => ((n - 12) / 2) as usize,
                 _ => return None,
             };
-            let d = b.get(q..q + size)?;
-            q += size;
+            let end = q.checked_add(size)?;
+            let d = b.get(q..end)?;
+            q = end;
             vals.push(match t {
                 0 => Val::Null,
                 8 => Val::Int(0),

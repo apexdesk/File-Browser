@@ -118,6 +118,8 @@ fn tar_tree<W: Write>(b: &mut tar::Builder<W>, path: &Path, name: &str, p: &Prog
     } else if md.is_file() {
         let mut h = tar::Header::new_gnu();
         h.set_metadata(&md);
+        // archivo de un servidor SFTP: sin descargar sería un marcador vacío
+        crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
         let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
         b.append_data(&mut h, name, ProgRead { inner: f, p }).map_err(|e| format!("{name}: {e}"))?;
         p.done.fetch_add(1, AO::Relaxed);
@@ -160,6 +162,8 @@ fn sz_tree<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, path: &P
             sz_tree(w, &e.path(), &child, p, ctx)?;
         }
     } else if md.is_file() {
+        // archivo de un servidor SFTP: sin descargar sería un marcador vacío
+        crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
         let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
         w.push_archive_entry(ArchiveEntry::from_path(path, name.to_string()), Some(ProgRead { inner: f, p })).map_err(|e| format!("{name}: {e}"))?;
         p.done.fetch_add(1, AO::Relaxed);
@@ -191,6 +195,8 @@ fn add_tree<W: Write + io::Seek>(
         }
     } else if md.is_file() {
         zw.start_file(name, opts).map_err(|e| e.to_string())?;
+        // archivo de un servidor SFTP: sin descargar sería un marcador vacío
+        crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
         let mut f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
         loop {
             let n = f.read(buf).map_err(|e| format!("{name}: {e}"))?;
