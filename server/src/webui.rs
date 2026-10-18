@@ -14,7 +14,7 @@ pub fn get(name: &str) -> Option<(&'static str, &'static [u8])> {
 }
 
 /// CSP del cliente: scripts y wasm solo del propio origen.
-pub const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'";
+pub const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 pub fn json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);

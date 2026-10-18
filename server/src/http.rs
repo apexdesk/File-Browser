@@ -7,6 +7,7 @@ use std::time::Duration;
 const MAX_HEAD: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+const ERR_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Method {
@@ -26,6 +27,7 @@ pub struct Req {
     pub auth: Option<String>,
     /// Solo PUT/POST: tamaño del cuerpo, cabeceras para el control de origen y lo ya leído del cuerpo.
     pub content_length: u64,
+    pub has_length: bool,
     pub origin: Option<String>,
     pub host: Option<String>,
     pub xfb: bool,
@@ -36,7 +38,9 @@ pub struct Req {
 pub fn read_request(s: &mut Stream) -> Result<Req, u16> {
     s.set_deadline(Some(HEAD_DEADLINE));
     let r = read_head(s);
-    s.set_deadline(None);
+    // si falla, la respuesta de error también tiene plazo: con TLS el «write» puede estar completando
+    // un handshake que nunca llega, y sin plazo retendría el hilo para siempre
+    s.set_deadline(if r.is_err() { Some(ERR_DEADLINE) } else { None });
     r
 }
 
@@ -86,11 +90,16 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
         return Err(400);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut req = Req { method, head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None, auth: None, content_length: 0, origin: None, host: None, xfb: false, leftover: Vec::new() };
+    let mut req = Req { method, head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None, auth: None, content_length: 0, has_length: false, origin: None, host: None, xfb: false, leftover: Vec::new() };
     let mut n = 0;
+    let mut seen = std::collections::HashSet::new();
     for l in lines {
         n += 1;
         if n > MAX_HEADERS || l.starts_with(' ') || l.starts_with('\t') {
+            return Err(400);
+        }
+        // un CR o LF suelto lo trataría como fin de línea otro intermediario y no este servidor
+        if l.contains(['\r', '\n']) {
             return Err(400);
         }
         let (k, v) = l.split_once(':').ok_or(400u16)?;
@@ -98,13 +107,22 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
             return Err(400);
         }
         let v = v.trim();
-        match k.to_ascii_lowercase().as_str() {
+        let key = k.to_ascii_lowercase();
+        // una cabecera que decide algo no puede repetirse: dos lecturas distintas serían una puerta a la ambigüedad
+        if matches!(key.as_str(), "content-length" | "host" | "origin" | "x-fb" | "authorization" | "range" | "if-none-match") && !seen.insert(key.clone()) {
+            return Err(400);
+        }
+        match key.as_str() {
             "range" => req.range = Some(v.to_string()),
             "if-none-match" => req.inm = Some(v.to_string()),
             "authorization" => req.auth = Some(v.to_string()),
             "transfer-encoding" => return Err(400),
             "content-length" => {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(400);
+                }
                 req.content_length = v.parse::<u64>().map_err(|_| 400u16)?;
+                req.has_length = true;
                 // un GET con cuerpo no tiene sentido aquí
                 if req.content_length != 0 && matches!(method, Method::Get | Method::Head) {
                     return Err(400);
@@ -152,7 +170,7 @@ pub fn write_head(w: &mut impl Write, code: u16, headers: &[(&str, String)]) -> 
         let v: String = v.chars().filter(|c| *c != '\r' && *c != '\n').collect();
         o.push_str(&format!("{k}: {v}\r\n"));
     }
-    o.push_str("Connection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nCross-Origin-Resource-Policy: same-origin\r\n\r\n");
+    o.push_str("Connection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\n\r\n");
     w.write_all(o.as_bytes())
 }
 
@@ -244,6 +262,24 @@ mod tests {
         assert_eq!(req("GET / HTTP/1.1\r\n folded: x").err(), Some(400));
         assert_eq!(req("GET / HTTP/1.1\r\nsin-dos-puntos").err(), Some(400));
         assert_eq!(req("GET / HTTP/1.1\r\nTransfer-Encoding : chunked").err(), Some(400));
+    }
+
+    #[test]
+    fn cabeceras_ambiguas_se_rechazan() {
+        // repetidas
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 0").err(), Some(400));
+        assert_eq!(req("GET / HTTP/1.1\r\nHost: a\r\nHost: b").err(), Some(400));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nX-FB: 1\r\nx-fb: 1").err(), Some(400));
+        // solo dígitos
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: +1").err(), Some(400));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: 0x1").err(), Some(400));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length:").err(), Some(400));
+        // LF o CR sueltos dentro de la cabecera
+        assert_eq!(req("PUT /x HTTP/1.1\r\nX-A: 1\nTransfer-Encoding: chunked\r\nContent-Length: 1").err(), Some(400));
+        assert_eq!(req("GET / HTTP/1.1\r\nX-A: 1\rY: 2").err(), Some(400));
+        // la longitud declarada se distingue de la ausente
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: 0").map(|r| r.has_length).ok(), Some(true));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nHost: a").map(|r| r.has_length).ok(), Some(false));
     }
 
     #[test]
