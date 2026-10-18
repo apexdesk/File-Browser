@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 use crate::stream::Stream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_HEAD: usize = 8192;
 const MAX_HEADERS: usize = 64;
@@ -18,7 +18,13 @@ pub struct Req {
 
 /// Lee y valida una petición. El `Err` es el código de estado con el que responder.
 pub fn read_request(s: &mut Stream) -> Result<Req, u16> {
-    let start = Instant::now();
+    s.set_deadline(Some(HEAD_DEADLINE));
+    let r = read_head(s);
+    s.set_deadline(None);
+    r
+}
+
+fn read_head(s: &mut Stream) -> Result<Req, u16> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let end = loop {
@@ -28,8 +34,6 @@ pub fn read_request(s: &mut Stream) -> Result<Req, u16> {
         if buf.len() >= MAX_HEAD {
             return Err(431);
         }
-        let left = HEAD_DEADLINE.checked_sub(start.elapsed()).ok_or(408u16)?;
-        s.tcp().set_read_timeout(Some(left.max(Duration::from_millis(50)))).map_err(|_| 400u16)?;
         match s.read(&mut chunk) {
             Ok(0) => return Err(400),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -69,6 +73,9 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
             return Err(400);
         }
         let (k, v) = l.split_once(':').ok_or(400u16)?;
+        if k.is_empty() || k.contains([' ', '\t']) {
+            return Err(400);
+        }
         let v = v.trim();
         match k.to_ascii_lowercase().as_str() {
             "range" => req.range = Some(v.to_string()),
@@ -193,6 +200,7 @@ mod tests {
         assert_eq!(req("GET / HTTP/1.1\r\nContent-Length: 5").err(), Some(400));
         assert_eq!(req("GET / HTTP/1.1\r\n folded: x").err(), Some(400));
         assert_eq!(req("GET / HTTP/1.1\r\nsin-dos-puntos").err(), Some(400));
+        assert_eq!(req("GET / HTTP/1.1\r\nTransfer-Encoding : chunked").err(), Some(400));
     }
 
     #[test]

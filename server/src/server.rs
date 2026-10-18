@@ -39,7 +39,7 @@ impl Ctx {
 
     /// Reserva un hueco de conexión para esa IP; `false` si ya tiene demasiadas abiertas.
     fn enter(&self, ip: Option<IpAddr>) -> bool {
-        let Some(ip) = ip else { return true };
+        let Some(ip) = ip.map(ip_key) else { return true };
         let Ok(mut m) = self.per_ip.lock() else { return true };
         let n = m.entry(ip).or_insert(0);
         if *n >= MAX_PER_IP {
@@ -50,7 +50,7 @@ impl Ctx {
     }
 
     fn leave(&self, ip: Option<IpAddr>) {
-        let Some(ip) = ip else { return };
+        let Some(ip) = ip.map(ip_key) else { return };
         let Ok(mut m) = self.per_ip.lock() else { return };
         if let Some(n) = m.get_mut(&ip) {
             *n = n.saturating_sub(1);
@@ -61,13 +61,13 @@ impl Ctx {
     }
 
     fn blocked(&self, ip: Option<IpAddr>) -> bool {
-        let Some(ip) = ip else { return false };
+        let Some(ip) = ip.map(ip_key) else { return false };
         let Ok(m) = self.limiter.lock() else { return false };
         m.get(&ip).is_some_and(|(n, t)| *n >= FAIL_LIMIT && t.elapsed() < FAIL_WINDOW)
     }
 
     fn fail(&self, ip: Option<IpAddr>) {
-        let Some(ip) = ip else { return };
+        let Some(ip) = ip.map(ip_key) else { return };
         let Ok(mut m) = self.limiter.lock() else { return };
         if m.len() > 4096 {
             m.retain(|_, (_, t)| t.elapsed() < FAIL_WINDOW);
@@ -80,6 +80,31 @@ impl Ctx {
             *e = (0, Instant::now());
         }
         e.0 = e.0.saturating_add(1);
+    }
+}
+
+/// Clave de limitación: las IPv6 se agrupan por /64 (un atacante controla todo ese rango).
+fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(a) => {
+            let mut o = a.octets();
+            o[8..].fill(0);
+            IpAddr::V6(o.into())
+        }
+        v4 => v4,
+    }
+}
+
+/// Abre sin seguir un enlace en el último componente (cierra la ventana de carrera entre comprobar y abrir).
+fn open_nofollow(p: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(p)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(p)
     }
 }
 
@@ -137,10 +162,10 @@ fn handle(tcp: TcpStream, ctx: &Ctx) {
     let _ = tcp.set_nodelay(true);
     let ip = tcp.peer_addr().ok().map(|a| a.ip());
     let mut s = match &ctx.tls {
-        None => Stream::Plain(tcp),
+        None => Stream::plain(tcp),
         #[cfg(feature = "tls")]
         Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
-            Ok(c) => Stream::Tls(Box::new(rustls::StreamOwned::new(c, tcp))),
+            Ok(c) => Stream::tls(c, tcp),
             Err(_) => return,
         },
         #[cfg(not(feature = "tls"))]
@@ -333,7 +358,7 @@ fn send_zip(s: &mut Stream, ctx: &Ctx, req: &Req, comps: &[String], dir: &Path) 
         let r = if it.is_dir {
             z.add_dir(&name, it.mtime)
         } else {
-            match File::open(&it.path) {
+            match open_nofollow(&it.path) {
                 // un fichero ilegible se omite; un fallo de red corta el ZIP
                 Err(_) => Ok(()),
                 Ok(mut f) => match f.metadata() {
@@ -357,7 +382,7 @@ fn send_zip(s: &mut Stream, ctx: &Ctx, req: &Req, comps: &[String], dir: &Path) 
 }
 
 fn send_file(s: &mut Stream, req: &Req, comps: &[String], path: &Path) -> io::Result<()> {
-    let Ok(mut f) = File::open(path) else { return http::error(s, 404, req.head) };
+    let Ok(mut f) = open_nofollow(path) else { return http::error(s, 404, req.head) };
     let Ok(md) = f.metadata() else { return http::error(s, 404, req.head) };
     if !md.is_file() {
         return http::error(s, 404, req.head);
@@ -421,6 +446,17 @@ fn send_file(s: &mut Stream, req: &Req, comps: &[String], path: &Path) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_se_agrupa_por_64() {
+        let a: IpAddr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:1::1".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(ip_key(a), ip_key(b));
+        assert_ne!(ip_key(a), ip_key(c));
+        let v4: IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(ip_key(v4), v4);
+    }
 
     #[test]
     fn comparacion_constante() {

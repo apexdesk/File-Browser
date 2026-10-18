@@ -42,12 +42,17 @@ pub fn pct_encode(s: &str) -> String {
     o
 }
 
+/// Caracteres de formato invisibles (marcas bidi, ancho cero, BOM): permitirían disfrazar extensiones en el listado.
+fn is_format(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
 /// Un componente de ruta aceptable: sin separadores, sin controles, sin `.`/`..`.
 pub fn valid_component(c: &str) -> bool {
     if c.is_empty() || c == "." || c == ".." || c.len() > 255 {
         return false;
     }
-    if c.chars().any(|ch| ch == '/' || ch == '\\' || ch.is_control()) {
+    if c.chars().any(|ch| ch == '/' || ch == '\\' || ch.is_control() || is_format(ch)) {
         return false;
     }
     #[cfg(windows)]
@@ -55,9 +60,11 @@ pub fn valid_component(c: &str) -> bool {
         if c.contains(':') || c.ends_with('.') || c.ends_with(' ') {
             return false;
         }
-        let stem = c.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let stem = c.split('.').next().unwrap_or("").trim_end_matches(' ').to_uppercase();
         let reservado = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-            || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.chars().count() == 4
+                && stem.chars().nth(3).is_some_and(|d| d.is_ascii_digit() || matches!(d, '¹' | '²' | '³')));
         if reservado {
             return false;
         }
@@ -143,6 +150,10 @@ mod tests {
     #[test]
     fn rechaza_traversal_y_raros() {
         for u in ["/..", "/a/../b", "/a/%2e%2e/b", "/a/%2E%2E", "/a//b", "/a/b%2Fc", "/a/b%5Cc", "/a/%00", "/a/%0a", "/a\\b"] {
+            assert!(split_url(u).is_none(), "{u}");
+        }
+        // marcas bidi y de ancho cero (disfrazan extensiones)
+        for u in ["/a%E2%80%AEtxt.exe", "/a%E2%80%8Bb", "/%EF%BB%BFx"] {
             assert!(split_url(u).is_none(), "{u}");
         }
         assert_eq!(split_url("/a/b/").unwrap(), (s(&["a", "b"]), true));
