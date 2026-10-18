@@ -547,9 +547,14 @@ impl Preview {
     /// Dibuja el overlay. Devuelve la acción solicitada con el ratón.
     pub fn show(&mut self, ctx: &egui::Context, pal: &Pal, windowed: Option<bool>) -> Action {
         let screen = ctx.content_rect();
+        let touch_full = windowed.is_none() && (cfg!(target_os = "android") || ctx.input(|i| i.any_touches()));
         let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("preview_layer"));
         let p = ctx.layer_painter(layer);
-        let (card, rad) = if let Some(rounded) = windowed {
+        let (card, rad) = if touch_full {
+            // móvil: el visor ocupa toda la pantalla
+            p.rect_filled(screen, 0.0, pal.panel);
+            (screen, CornerRadius::ZERO)
+        } else if let Some(rounded) = windowed {
             // ventana propia sin decoración del sistema: la tarjeta ocupa toda la ventana
             let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
             let rad = if rounded && !max { CornerRadius::same(14) } else { CornerRadius::ZERO };
@@ -661,7 +666,9 @@ impl Preview {
         p.text(
             pos2(card.center().x, card.bottom() - foot_h / 2.0),
             Align2::CENTER_CENTER,
-            if touch {
+            if touch_full {
+                t("Atrás: cerrar   ·   Pellizca: zoom   ·   Doble toque: ajustar")
+            } else if touch {
                 t("Atrás o toque fuera: cerrar   ·   Pellizca: zoom   ·   Doble toque: ajustar")
             } else if matches!(self.body, Body::Doc) {
                 t("Re Pág / Av Pág: página   ·   Rueda: cambiar de página   ·   Ctrl+rueda: zoom   ·   Flechas: anterior / siguiente archivo   ·   Esc: cerrar")
@@ -1146,7 +1153,7 @@ impl Preview {
                 i.smooth_scroll_delta.y,
                 i.pointer.delta(),
                 i.pointer.button_double_clicked(egui::PointerButton::Primary),
-                i.pointer.primary_down(),
+                i.pointer.primary_down() && !edge_start(i),
             )
         });
         let pinch = ctx.input(|i| i.zoom_delta());
@@ -1488,7 +1495,7 @@ impl Preview {
             let (dy, drag, dbl) = ctx.input(|i| {
                 (
                     i.smooth_scroll_delta.y,
-                    if i.pointer.primary_down() { i.pointer.delta() } else { vec2(0.0, 0.0) },
+                    if i.pointer.primary_down() && !edge_start(i) { i.pointer.delta() } else { vec2(0.0, 0.0) },
                     i.pointer.button_double_clicked(egui::PointerButton::Primary),
                 )
             });
@@ -1510,7 +1517,7 @@ impl Preview {
         let scale = fit * self.zoom;
         let size = sz * scale;
         // la imagen no puede salirse del todo: siempre queda una franja visible
-        let lim = vec2(((size.x + area.width()) / 2.0 - 60.0).max(0.0), ((size.y + area.height()) / 2.0 - 60.0).max(0.0));
+        let lim = vec2(((size.x - avail.width()) / 2.0).max(0.0), ((size.y - avail.height()) / 2.0).max(0.0));
         self.pan = vec2(self.pan.x.clamp(-lim.x, lim.x), self.pan.y.clamp(-lim.y, lim.y));
         let rect = Rect::from_center_size(area.center() + self.pan, size);
         let shape = egui::epaint::RectShape::filled(rect, CornerRadius::same(8), Color32::WHITE)
@@ -1518,6 +1525,15 @@ impl Preview {
         p.add(shape);
         rect
     }
+}
+
+/// Un toque que empieza pegado al borde de la pantalla es el gesto de «atrás» del sistema: no mueve el contenido.
+fn edge_start(i: &egui::InputState) -> bool {
+    if !(cfg!(target_os = "android") || i.any_touches()) {
+        return false;
+    }
+    let sc = i.content_rect();
+    i.pointer.press_origin().map(|o| o.x < sc.left() + 32.0 || o.x > sc.right() - 32.0).unwrap_or(false)
 }
 
 /// Visita cada sector del gráfico: (nodo, ruta relativa, ángulo inicial/final, anillo 1.., índice de color).
