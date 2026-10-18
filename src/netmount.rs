@@ -261,13 +261,14 @@ mod imp {
                 "-e",
                 "on run argv",
                 "-e",
-                "mount volume (item 1 of argv) as user name (item 2 of argv) with password (item 3 of argv)",
+                "mount volume (item 1 of argv) as user name (item 2 of argv) with password (system attribute \"FB_MNT_PW\")",
                 "-e",
                 "end run",
                 &url,
                 &user,
-                &l.pass,
             ]);
+            // la contraseña va por el entorno, no por la línea de órdenes (visible con `ps`)
+            cmd.env("FB_MNT_PW", &l.pass);
         }
         let out = cmd.stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
         if !out.status.success() {

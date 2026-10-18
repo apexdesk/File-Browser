@@ -184,7 +184,11 @@ fn launch_registry_cmd(line: &str, path: &Path) {
         }
     };
     let q = format!("\"{}\"", path.display());
-    let mut args = rest.replace("%1", &q).replace("%L", &q).replace("%l", &q).replace("%*", &q).replace("%0", &q);
+    // si el comando ya entrecomilla «%1», no se duplican las comillas
+    let mut args = rest.clone();
+    for tok in ["%1", "%L", "%l", "%*", "%0"] {
+        args = args.replace(&format!("\"{tok}\""), &q).replace(tok, &q);
+    }
     if !rest.contains('%') {
         args.push(' ');
         args.push_str(&q);

@@ -445,6 +445,8 @@ pub struct App {
     clip_hidden: bool,
     /// Listados de las columnas estáticas de la vista de columnas: ruta -> (instante, filas).
     col_cache: HashMap<PathBuf, (Instant, Arc<Vec<(String, bool)>>)>,
+    /// Carpetas cuyo listado de columnas se está leyendo en un hilo.
+    col_busy: HashSet<PathBuf>,
     /// Se está pintando la columna activa de la vista de columnas (sin cabecera ni columnas extra).
     col_active: bool,
     /// Pestaña abierta en Opciones: 0 = general, 1 = columnas, 2 = temas.
@@ -1162,6 +1164,7 @@ impl App {
             arch: Vec::new(),
             clip_hidden: false,
             col_cache: HashMap::new(),
+            col_busy: HashSet::new(),
             col_active: false,
             opts_tab: 0,
             edit_theme: String::new(),
@@ -2077,17 +2080,20 @@ impl App {
         // Si lo del portapapeles del sistema es lo que cortamos nosotros, se conserva el «cortar»
         // (macOS no lo transporta en el portapapeles).
         let own = self.clipboard.clone();
-        let picked = match (tools::clip_get_files(), own) {
-            (Some((sp, _)), Some((op, true))) if sp == op => Some((op, true)),
-            (Some(sys), _) => Some(sys),
-            (None, own) => own,
-        };
-        let Some((srcs, cut)) = picked else { return };
         let dst = self.cwd.clone();
-        self.start_copy(srcs, dst, cut);
-        if cut {
-            self.clipboard = None;
-        }
+        // leer el portapapeles del sistema puede lanzar wl-paste/xclip: no se hace en el hilo de la interfaz
+        self.spawn_io(tools::clip_get_files, move |a, sys| {
+            let picked = match (sys, own) {
+                (Some((sp, _)), Some((op, true))) if sp == op => Some((op, true)),
+                (Some(sys), _) => Some(sys),
+                (None, own) => own,
+            };
+            let Some((srcs, cut)) = picked else { return };
+            a.start_copy(srcs, dst, cut);
+            if cut {
+                a.clipboard = None;
+            }
+        });
     }
 
     fn do_move_to(&mut self, dst: PathBuf) {
@@ -2307,10 +2313,20 @@ impl App {
                 err = Self::rename_checked(a, b).err();
             }
             Undo::Moved(pairs) => {
-                for (orig, new) in pairs {
+                for (k, (orig, new)) in pairs.iter().enumerate() {
                     let (a, b) = if is_redo { (orig, new) } else { (new, orig) };
                     if let Err(e) = Self::rename_checked(a, b) {
                         err = Some(e);
+                        if k > 0 {
+                            // los k primeros ya están hechos: se pasan a la pila contraria y sólo queda pendiente el resto
+                            let done = Undo::Moved(pairs[..k].to_vec());
+                            if is_redo { self.undo_stack.push(done) } else { self.redo_stack.push(done) }
+                            self.say(tf("No se pudo deshacer: {e}", &[&err.clone().unwrap()]), true);
+                            let rest = Undo::Moved(pairs[k..].to_vec());
+                            if is_redo { self.redo_stack.push(rest) } else { self.undo_stack.push(rest) }
+                            self.refresh();
+                            return;
+                        }
                         break;
                     }
                 }
@@ -3717,8 +3733,9 @@ impl App {
                 if !dir_s.is_empty() {
                     if let Ok(rd) = std::fs::read_dir(&dir_s) {
                         for e in rd.flatten() {
-                            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                                || std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false)
+                            let ft = e.file_type();
+                            if ft.as_ref().map(|t| t.is_dir()).unwrap_or(false)
+                                || (ft.map(|t| t.is_symlink()).unwrap_or(false) && std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false))
                             {
                                 names.push(e.file_name().to_string_lossy().into_owned());
                             }
@@ -4438,30 +4455,45 @@ impl App {
 
     /// Listado ligero de una carpeta para las columnas estáticas (con caché de unos segundos).
     fn col_rows(&mut self, dir: &Path) -> Arc<Vec<(String, bool)>> {
-        if let Some((t0, v)) = self.col_cache.get(dir) {
+        let cached = self.col_cache.get(dir).cloned();
+        if let Some((t0, v)) = &cached {
             if t0.elapsed() < Duration::from_secs(3) {
                 return v.clone();
             }
         }
-        let hidden = self.cfg.show_hidden;
-        let mut rows: Vec<(String, bool)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten().take(20_000) {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if !hidden && n.starts_with('.') {
-                    continue;
-                }
-                let d = e.file_type().map(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir())).unwrap_or(false);
-                rows.push((n, d));
-            }
+        // el listado se lee en un hilo (una carpeta de red o un disco dormido no debe congelar la ventana)
+        if self.col_busy.insert(dir.to_path_buf()) {
+            let hidden = self.cfg.show_hidden;
+            let d = dir.to_path_buf();
+            self.spawn_io(
+                {
+                    let d = d.clone();
+                    move || {
+                        let mut rows: Vec<(String, bool)> = Vec::new();
+                        if let Ok(rd) = std::fs::read_dir(&d) {
+                            for e in rd.flatten().take(20_000) {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if !hidden && n.starts_with('.') {
+                                    continue;
+                                }
+                                let dir = e.file_type().map(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir())).unwrap_or(false);
+                                rows.push((n, dir));
+                            }
+                        }
+                        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| fsys::natural_cmp(&a.0, &b.0)));
+                        Arc::new(rows)
+                    }
+                },
+                move |a, v| {
+                    a.col_busy.remove(&d);
+                    if a.col_cache.len() > 64 {
+                        a.col_cache.clear();
+                    }
+                    a.col_cache.insert(d, (Instant::now(), v));
+                },
+            );
         }
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| fsys::natural_cmp(&a.0, &b.0)));
-        let v = Arc::new(rows);
-        if self.col_cache.len() > 64 {
-            self.col_cache.clear();
-        }
-        self.col_cache.insert(dir.to_path_buf(), (Instant::now(), v.clone()));
-        v
+        cached.map(|(_, v)| v).unwrap_or_default()
     }
 
     /// Columna estática (carpeta ascendente o contenido de la carpeta seleccionada).

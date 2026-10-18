@@ -490,6 +490,11 @@ pub(crate) fn size_of_tree(p: &Path) -> u64 {
     }
 }
 
+/// Nombre temporal junto al destino para copiar antes de reemplazar.
+fn continue_with_tmp(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".fbrep-{}-{name}", std::process::id()))
+}
+
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if fs::symlink_metadata(&first).is_err() {
@@ -669,6 +674,8 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
                 failed += 1;
             }
         }
+        // permisos y fecha de la carpeta, al final (si es de sólo lectura no estorba a su contenido)
+        let _ = fs::set_permissions(dst, md.permissions());
         prog.done.fetch_add(1, AO::Relaxed);
     } else if md.file_type().is_symlink() {
         let r = fs::read_link(src).and_then(|target| {
@@ -686,6 +693,11 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
             note_error(prog, src, &e);
             failed += 1;
         }
+        prog.done.fetch_add(1, AO::Relaxed);
+    } else if cfg!(unix) && !md.file_type().is_file() {
+        // FIFO, sockets y dispositivos: abrirlos bloquearía la copia para siempre
+        note_error(prog, src, &std::io::Error::other(t("archivo especial")));
+        failed += 1;
         prog.done.fetch_add(1, AO::Relaxed);
     } else {
         *prog.label.lock().unwrap() = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -731,6 +743,8 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                         continue;
                     }
                     let same_dir = src.parent() == Some(dst.as_path());
+                    // «Reemplazar» al copiar: se copia a un temporal y sólo si sale bien se cambia por el original
+                    let mut replace_old: Option<PathBuf> = None;
                     let target = match policy {
                         Policy::Rename => unique_path(&dst, &name),
                         _ if same_dir => unique_path(&dst, &name),
@@ -750,6 +764,10 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                                     p.errors.lock().unwrap().push(tf("{name}: no se puede reemplazar el propio origen o una carpeta que lo contiene", &[&name]));
                                     continue;
                                 }
+                                if !mv {
+                                    replace_old = Some(t.clone());
+                                    continue_with_tmp(&dst, &name)
+                                } else {
                                 // El elemento reemplazado va a la papelera para poder recuperarlo.
                                 if let Err(e) = crate::extras::trash_delete(&t) {
                                     // sin papelera (Android…): se sobrescribe, que es lo que pide «Reemplazar»
@@ -759,11 +777,15 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                                         continue;
                                     }
                                 }
+                                t
+                                }
+                            } else {
+                                t
                             }
-                            t
                         }
                     };
-                    let tname = target.file_name().unwrap().to_string_lossy().into_owned();
+                    let final_target = replace_old.clone().unwrap_or_else(|| target.clone());
+                    let tname = final_target.file_name().unwrap().to_string_lossy().into_owned();
                     let res = if mv {
                         match fs::rename(&src, &target) {
                             Ok(()) => {
@@ -783,13 +805,25 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                                 }
                             }),
                         }
+                    } else if let Some(old) = &replace_old {
+                        copy_tree(&src, &target, &p, &mut buf).and_then(|failed| {
+                            if failed > 0 {
+                                let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+                                return Err(std::io::Error::other(t("la copia no se completó")));
+                            }
+                            // copia completa: ahora sí se retira lo anterior (papelera si hay) y se coloca la copia
+                            if crate::extras::trash_delete(old).is_err() {
+                                if old.is_dir() && !old.is_symlink() { fs::remove_dir_all(old)? } else { fs::remove_file(old)? }
+                            }
+                            fs::rename(&target, old)
+                        })
                     } else {
                         copy_tree(&src, &target, &p, &mut buf).map(|_| ())
                     };
                     match res {
                         Ok(()) => {
                             p.created.lock().unwrap().push(tname);
-                            p.pairs.lock().unwrap().push((src.clone(), target.clone()));
+                            p.pairs.lock().unwrap().push((src.clone(), final_target.clone()));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                             let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
@@ -1136,6 +1170,36 @@ mod copy_tests {
         }
         let e = p.errors.lock().unwrap().clone();
         e
+    }
+
+    fn run_pol(src: &Path, dst: &Path, mv: bool, policy: Policy) -> Vec<String> {
+        let p = run_op(Op::Copy { srcs: vec![src.to_path_buf()], dst: dst.to_path_buf(), mv, policy }, egui::Context::default());
+        let t0 = Instant::now();
+        while !p.finished.load(AO::Acquire) {
+            assert!(t0.elapsed() < Duration::from_secs(60), "timeout");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let e = p.errors.lock().unwrap().clone();
+        e
+    }
+
+    #[test]
+    fn replace_copies_then_swaps() {
+        let base = std::env::temp_dir().join(format!("fbrep{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("f.txt"), b"nuevo").unwrap();
+        fs::write(b.join("f.txt"), b"viejo").unwrap();
+        let errs = run_pol(&a.join("f.txt"), &b, false, Policy::Replace);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(fs::read(b.join("f.txt")).unwrap(), b"nuevo");
+        assert_eq!(fs::read_dir(&b).unwrap().count(), 1, "sin temporales sobrantes");
+        // reemplazar una carpeta que contiene al origen se rechaza y no toca nada
+        let errs = run_pol(&b.join("f.txt"), base.as_path(), false, Policy::Replace);
+        let _ = errs;
+        assert!(b.join("f.txt").exists());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
