@@ -236,6 +236,10 @@ fn read_limited(path: &std::path::Path, max: u64) -> Option<String> {
 
 /// Primeras líneas de un archivo de texto.
 fn text_raw(path: &std::path::Path) -> Raw {
+    // una tubería con nombre o un dispositivo bloquearían para siempre el hilo de vistas previas
+    if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+        return Raw::Err(t("No se pudo abrir").into());
+    }
     let Ok(f) = std::fs::File::open(path) else {
         return Raw::Err(t("No se pudo abrir").into());
     };

@@ -104,7 +104,10 @@ impl Db {
         let local = if k <= x { k } else { m };
         let mut out = page.get(at..at + local)?.to_vec();
         let mut next = be(page.get(at + local..at + local + 4)?);
+        // una cadena de desbordamiento no puede tener más páginas que las necesarias (corta ciclos)
+        let mut hops = total / (u - 4).max(1) + 2;
         while out.len() < total && next != 0 {
+            hops = hops.checked_sub(1)?;
             let p = self.page(next)?;
             let take = (total - out.len()).min(u - 4);
             out.extend_from_slice(p.get(4..4 + take)?);

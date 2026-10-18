@@ -133,6 +133,7 @@ fn load_obj(f: std::fs::File) -> Result<Mesh, String> {
         } else if let Some(rest) = l.strip_prefix("f ") {
             let idx: Vec<usize> = rest
                 .split_whitespace()
+                .take(1000)
                 .filter_map(|t| {
                     let i: i64 = t.split('/').next()?.parse().ok()?;
                     let n = verts.len() as i64;
@@ -585,6 +586,8 @@ fn node_matrix(n: &crate::markup::Json) -> M4 {
 struct Gltf {
     json: crate::markup::Json,
     buffers: Vec<Vec<u8>>,
+    /// Nodos visitados: un grafo con hijos repetidos explotaría de forma exponencial.
+    visits: std::cell::Cell<u32>,
 }
 
 impl Gltf {
@@ -607,17 +610,17 @@ impl Gltf {
             5122 | 5123 => 2,
             _ => 4,
         };
-        let base = view.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize + a.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize;
+        let base = (view.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize).saturating_add(a.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize);
         let stride = view.get("byteStride").and_then(|x| x.num()).map(|x| x as usize).filter(|s| *s > 0).unwrap_or(csz * ncomp);
         if count > 20_000_000 {
             return None;
         }
         let normalized = matches!(a.get("normalized"), Some(crate::markup::Json::Bool(true)));
-        let mut out = Vec::with_capacity(count * ncomp);
+        let mut out = Vec::with_capacity((count * ncomp).min(buf.len()));
         for i in 0..count {
             for c in 0..ncomp {
-                let o = base + i * stride + c * csz;
-                let d = buf.get(o..o + csz)?;
+                let o = base.checked_add(i.checked_mul(stride)?)?.checked_add(c * csz)?;
+                let d = buf.get(o..o.checked_add(csz)?)?;
                 out.push(match ct {
                     5120 => d[0] as i8 as f64 / if normalized { 127.0 } else { 1.0 },
                     5121 => d[0] as f64 / if normalized { 255.0 } else { 1.0 },
@@ -649,7 +652,8 @@ impl Gltf {
             };
             for t in order {
                 for i in t {
-                    let p = pos.get(i * 3..i * 3 + 3)?;
+                    let b3 = i.checked_mul(3)?;
+                    let p = pos.get(b3..b3.checked_add(3)?)?;
                     let (x, y, z) = (p[0] as f32, p[1] as f32, p[2] as f32);
                     let wx = m[0] * x + m[4] * y + m[8] * z + m[12];
                     let wy = m[1] * x + m[5] * y + m[9] * z + m[13];
@@ -668,6 +672,10 @@ impl Gltf {
     fn walk(&self, node: usize, parent: &M4, tris: &mut Vec<f32>, depth: u32) -> Option<()> {
         if depth > 64 {
             return Some(());
+        }
+        self.visits.set(self.visits.get() + 1);
+        if self.visits.get() > 100_000 {
+            return None;
         }
         let n = self.json.get("nodes")?.at(node)?;
         let m = mul(parent, &node_matrix(n));
@@ -726,7 +734,7 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
             None => Vec::new(),
         });
     }
-    let g = Gltf { json, buffers };
+    let g = Gltf { json, buffers, visits: std::cell::Cell::new(0) };
     let ident: M4 = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
     let mut tris = Vec::new();
     let scene = g.json.get("scene").and_then(|s| s.num()).unwrap_or(0.0) as usize;
@@ -784,10 +792,15 @@ impl Gltf {
                 return Some(b64(u.split_once(',')?.1));
             }
             let rel = u.replace("%20", " ");
-            if rel.contains("..") || rel.starts_with('/') {
+            if rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') || rel.contains(':') {
                 return None;
             }
-            return std::fs::read(dir.join(rel)).ok();
+            let p = dir.join(rel);
+            // nada de tuberías ni dispositivos, y con tope de tamaño
+            if !std::fs::metadata(&p).map(|m| m.is_file() && m.len() <= 256 << 20).unwrap_or(false) {
+                return None;
+            }
+            return std::fs::read(p).ok();
         }
         let view = self.json.get("bufferViews")?.at(img.get("bufferView")?.num()? as usize)?;
         let buf = self.buffers.get(view.get("buffer")?.num()? as usize)?;
@@ -935,6 +948,10 @@ impl Gltf {
     fn walk_pbr(&self, node: usize, parent: &M4, pbr: &mut crate::pbr::Pbr, total: &mut usize, depth: u32) -> Option<()> {
         if depth > 64 {
             return Some(());
+        }
+        self.visits.set(self.visits.get() + 1);
+        if self.visits.get() > 100_000 {
+            return None;
         }
         let n = self.json.get("nodes")?.at(node)?;
         let m = mul(parent, &node_matrix(n));

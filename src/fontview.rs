@@ -136,6 +136,9 @@ pub fn specimen(path: &Path) -> Result<Decoded, String> {
 /// Datos de la fuente como pares (etiqueta, valor).
 pub fn info(path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    if std::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
+        return out;
+    }
     let Ok(data) = std::fs::read(path) else { return out };
     let Some(font) = open(&data) else { return out };
     let s = |id: StringId| font.localized_strings(id).english_or_first().map(|x| x.to_string()).filter(|x| !x.is_empty());

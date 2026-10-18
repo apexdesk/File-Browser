@@ -37,13 +37,25 @@ fn json_into(nodes: &mut Vec<Node>, label: String, j: &Json) -> u32 {
         }
         Json::Arr(v) => {
             let id = add(nodes, label, format!("[ ] {}", v.len()), 3);
-            let kids: Vec<u32> = v.iter().enumerate().map(|(i, x)| json_into(nodes, format!("[{i}]"), x)).collect();
+            let mut kids: Vec<u32> = Vec::new();
+            for (i, x) in v.iter().enumerate() {
+                if nodes.len() >= MAX_NODES {
+                    break;
+                }
+                kids.push(json_into(nodes, format!("[{i}]"), x));
+            }
             nodes[id as usize].kids = kids;
             id
         }
         Json::Obj(v) => {
             let id = add(nodes, label, format!("{{ }} {}", v.len()), 3);
-            let kids: Vec<u32> = v.iter().map(|(k, x)| json_into(nodes, k.clone(), x)).collect();
+            let mut kids: Vec<u32> = Vec::new();
+            for (k, x) in v.iter() {
+                if nodes.len() >= MAX_NODES {
+                    break;
+                }
+                kids.push(json_into(nodes, k.clone(), x));
+            }
             nodes[id as usize].kids = kids;
             id
         }
@@ -129,7 +141,7 @@ impl TreeView {
             self.rows.push((id, d));
             if self.open.contains(&id) {
                 for &k in self.tree.nodes[id as usize].kids.iter().rev() {
-                    stack.push((k, d + 1));
+                    stack.push((k, d.saturating_add(1)));
                 }
             }
         }

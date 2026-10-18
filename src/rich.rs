@@ -125,14 +125,14 @@ fn inline_d(s: &str, depth: u32) -> Vec<Span> {
                     continue;
                 }
                 // [texto](destino)
-                let mut depth = 0;
+                let mut nest = 0;
                 let mut close = None;
                 for j in open..c.len() {
                     match c[j] {
-                        '[' => depth += 1,
+                        '[' => nest += 1,
                         ']' => {
-                            depth -= 1;
-                            if depth == 0 {
+                            nest -= 1;
+                            if nest == 0 {
                                 close = Some(j);
                                 break;
                             }

@@ -268,7 +268,10 @@ fn mp4(path: &Path, v: &mut Vid) -> bool {
             moov = Some(b);
             break;
         }
-        pos += size;
+        pos = match pos.checked_add(size) {
+            Some(p) => p,
+            None => break,
+        };
     }
     let Some(moov) = moov else { return false };
     let top = children(&moov);
