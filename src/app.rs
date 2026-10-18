@@ -644,6 +644,15 @@ fn standard_places() -> Vec<Place> {
         }
     };
     add(t("Inicio"), dirs::home_dir(), Glyph::Home, "home");
+    // en la web, las carpetas que comparte el servidor
+    if crate::vfs::WEB && let Ok(rd) = crate::vfs::fs::read_dir("/") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                add(&name, Some(e.path()), Glyph::Folder, "");
+            }
+        }
+    }
     #[cfg(target_os = "android")]
     {
         // Android no define los directorios XDG: usamos los habituales del almacenamiento
@@ -1060,11 +1069,11 @@ impl App {
             eprintln!("aviso: no se encontró una fuente CJK del sistema");
         }
         let mut cfg = cfg;
-        if cfg!(target_os = "android") {
+        if cfg!(target_os = "android") || crate::vfs::WEB {
             cfg.preview_window = false;
         }
-        // Android: sin botones de ventana propios (minimizar/maximizar/cerrar no existen)
-        if cfg!(target_os = "android") {
+        // Android y web: sin botones de ventana propios (minimizar/maximizar/cerrar no existen)
+        if cfg!(target_os = "android") || crate::vfs::WEB {
             cfg.native_deco = true;
         }
         // en pantallas estrechas (móvil) la barra lateral empieza oculta
@@ -3721,7 +3730,7 @@ impl App {
             }
         }
         ui.separator();
-        if menu_row(ui, &pal, t("Conectar a un servidor…"), false, None) {
+        if !crate::vfs::WEB && menu_row(ui, &pal, t("Conectar a un servidor…"), false, None) {
             self.connect_uri(String::new());
             ui.close();
         }
@@ -4345,9 +4354,11 @@ impl App {
                     }
                 }
             }
-            let r = side_item(ui, &pal, Glyph::Plus, None, t("Conectar a un servidor…"), false, false);
-            if r.clicked() {
-                connect = Some(String::new());
+            if !crate::vfs::WEB {
+                let r = side_item(ui, &pal, Glyph::Plus, None, t("Conectar a un servidor…"), false, false);
+                if r.clicked() {
+                    connect = Some(String::new());
+                }
             }
         });
         if show_recent {
@@ -4415,7 +4426,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let label = egui::RichText::new(t("Terminal")).size(12.0);
-                if ui.selectable_label(self.cfg.term_open, label).on_hover_text(t("Mostrar/ocultar terminal (F12)")).clicked() {
+                if !crate::vfs::WEB && ui.selectable_label(self.cfg.term_open, label).on_hover_text(t("Mostrar/ocultar terminal (F12)")).clicked() {
                     self.toggle_terminal();
                 }
                 if self.cfg.grid {
@@ -5728,7 +5739,7 @@ impl App {
                         cmd = Some(Cmd::Paste);
                     }
                     if ui.button(t("Eliminar")).clicked() {
-                        cmd = Some(if cfg!(target_os = "android") { Cmd::DeletePerm } else { Cmd::Trash });
+                        cmd = Some(if cfg!(target_os = "android") || crate::vfs::WEB { Cmd::DeletePerm } else { Cmd::Trash });
                     }
                     ui.menu_button("...", |ui| self.context_menu(ui));
                   });
@@ -5912,7 +5923,7 @@ impl App {
                             self.run_program(&p);
                             ui.close();
                         }
-                        if ui.button(t("Ejecutar en el terminal")).clicked() {
+                        if !crate::vfs::WEB && ui.button(t("Ejecutar en el terminal")).clicked() {
                             self.run_in_terminal(&p);
                             ui.close();
                         }
@@ -6018,7 +6029,7 @@ impl App {
                 self.dlg = Dlg::NewFile(t("Nuevo archivo.txt").into());
                 ui.close();
             }
-            if ui.button(t("Abrir terminal aquí")).clicked() {
+            if !crate::vfs::WEB && ui.button(t("Abrir terminal aquí")).clicked() {
                 self.terminal_here();
                 ui.close();
             }
@@ -6680,6 +6691,9 @@ impl App {
     }
 
     fn toggle_terminal(&mut self) {
+        if crate::vfs::WEB {
+            return;
+        }
         if self.cfg.term_open {
             self.cfg.term_open = false;
             self.term_focus = false;
@@ -6833,14 +6847,18 @@ impl App {
                     self.open_props();
                 }
                 ui.separator();
-                if mi(ui, t("Nueva ventana"), "Ctrl+N", true) {
+                #[cfg(target_arch = "wasm32")]
+                if mi(ui, t("Subir archivos…"), "", crate::vfs::net::writable()) {
+                    crate::vfs::net::pick_files(self.ctx.clone());
+                }
+                if !crate::vfs::WEB && mi(ui, t("Nueva ventana"), "Ctrl+N", true) {
                     self.new_window();
                 }
                 if mi(ui, t("Reabrir pestaña cerrada"), "Ctrl+Mayús+T", !self.closed_tabs.is_empty()) {
                     self.reopen_tab();
                 }
                 ui.separator();
-                if mi(ui, t("Salir"), "Ctrl+Q", true) {
+                if !crate::vfs::WEB && mi(ui, t("Salir"), "Ctrl+Q", true) {
                     self.cfg.save();
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -6919,7 +6937,7 @@ impl App {
                     self.cfg.show_menu_btn = !self.cfg.show_menu_btn;
                     self.cfg.save();
                 }
-                if mi_check(ui, t("Terminal"), "F12", self.cfg.term_open) {
+                if !crate::vfs::WEB && mi_check(ui, t("Terminal"), "F12", self.cfg.term_open) {
                     self.toggle_terminal();
                 }
                 ui.separator();
@@ -6999,11 +7017,11 @@ impl App {
                     self.open_dups();
                 }
                 ui.separator();
-                if mi(ui, t("Abrir terminal aquí"), "", true) {
+                if !crate::vfs::WEB && mi(ui, t("Abrir terminal aquí"), "", true) {
                     self.terminal_here();
                 }
                 #[cfg(not(target_os = "android"))]
-                if mi(ui, t("Compartir esta carpeta…"), "", true) {
+                if !crate::vfs::WEB && mi(ui, t("Compartir esta carpeta…"), "", true) {
                     self.share_folder();
                 }
                 if mi(ui, t("Calcular tamaño / Propiedades"), "Alt+Enter", true) {
@@ -9903,8 +9921,12 @@ impl eframe::App for App {
 
         // Archivos soltados desde el sistema: se copian a la carpeta actual.
         let (dropped, hovering) = ctx.input(|i| {
+            #[cfg(target_arch = "wasm32")]
+            for f in &i.raw.dropped_files {
+                crate::vfs::net::read_dropped(f.clone(), ctx.clone());
+            }
             (
-                i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>(),
+                if crate::vfs::WEB { Vec::new() } else { i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>() },
                 !i.raw.hovered_files.is_empty(),
             )
         });
@@ -9913,6 +9935,16 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             let dst = self.cwd.clone();
             self.start_copy(dropped, dst, false);
+        }
+
+        // Web: lo soltado en la página o elegido con «Subir…» se guarda en la carpeta actual
+        #[cfg(target_arch = "wasm32")]
+        for (name, bytes) in crate::vfs::net::take_uploads() {
+            let dst = crate::fsys::unique_path(&self.cwd, &name);
+            match crate::vfs::fs::write(&dst, &bytes) {
+                Ok(()) => self.refresh(),
+                Err(e) => self.msg = Some((format!("{name}: {e}"), Instant::now(), true)),
+            }
         }
 
         // Ventana redondeada: el fondo se pinta aquí y los paneles son transparentes.

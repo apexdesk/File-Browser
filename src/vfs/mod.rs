@@ -3,6 +3,9 @@
 //! En escritorio son `std::fs` y `std::thread` sin más. En WebAssembly no hay disco ni hilos: los
 //! archivos son los del equipo que sirve la página (`filebrowser-server`, preguntándole por XHR
 //! síncrono) y el trabajo que iría a otro hilo se hace en el momento.
+/// ¿Corre en el navegador? (sin terminal, papelera, servidores SFTP ni ventanas propias)
+pub const WEB: bool = cfg!(target_arch = "wasm32");
+
 use std::io;
 use std::path::{Path, PathBuf};
 

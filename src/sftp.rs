@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(c.realpath(".").unwrap(), "/home/u");
         let l = c.list("/home/u").unwrap();
         assert_eq!(l.len(), 2);
-        assert!(l.iter().any(|e| e.name == "sub" && e.attrs.v_is_dir()));
+        assert!(l.iter().any(|e| e.name == "sub" && e.attrs.is_dir()));
         let big = l.iter().find(|e| e.name == "big.bin").unwrap();
         assert_eq!(big.attrs.size, 300_000);
         assert_eq!(big.attrs.mtime, 1_700_000_000);

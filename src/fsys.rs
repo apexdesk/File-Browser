@@ -928,12 +928,25 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
 }
 
 pub fn open_external(path: &Path) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if !path.v_is_dir() {
+            crate::vfs::net::open_path(&path.to_string_lossy());
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    open_external_native(path);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_external_native(path: &Path) {
     // archivo de un servidor SFTP: se descarga y luego se abre
     if crate::sftp::is_remote(path) && !path.v_is_dir() {
         let p = path.to_path_buf();
         crate::vfs::thread::spawn(move || {
             if crate::sftp::ensure_local(&p).is_ok() {
-                open_external(&p);
+                open_external_native(&p);
             }
         });
         return;

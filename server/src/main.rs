@@ -11,6 +11,7 @@ mod tls;
 mod timefmt;
 mod walk;
 mod webui;
+mod write;
 mod zipstream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const USO: &str = "\
-filebrowser-server — comparte carpetas por HTTP (solo lectura)
+filebrowser-server — comparte carpetas por HTTP (por defecto, solo lectura)
 
 Uso: filebrowser-server [opciones] CARPETA [CARPETA…]
 
@@ -28,6 +29,8 @@ Uso: filebrowser-server [opciones] CARPETA [CARPETA…]
   --ttl TIEMPO   caduca pasado ese tiempo: 30s, 90m, 2h, 1d (por defecto: sin caducidad)
   --max-conn N   conexiones simultáneas máximas (por defecto 32)
   --tls          HTTPS con certificado autofirmado (el navegador avisará; se imprime la huella)
+  --write        deja también subir, borrar, mover y copiar (por defecto, solo lectura)
+  --max-upload N tamaño máximo de un archivo subido, en MiB (por defecto 2048)
   --hidden       sirve también archivos y carpetas que empiezan por «.» (por defecto se ocultan)
   --i-know       permite ejecutarlo como root/administrador
   -h, --help     esta ayuda
@@ -44,6 +47,8 @@ struct Opts {
     hidden: bool,
     tls: bool,
     i_know: bool,
+    write: bool,
+    max_upload_mib: u64,
 }
 
 fn parse_ttl(s: &str) -> Option<Duration> {
@@ -60,7 +65,7 @@ fn parse_ttl(s: &str) -> Option<Duration> {
 }
 
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { dirs: Vec::new(), bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0, ttl: None, max_conn: 32, hidden: false, tls: false, i_know: false };
+    let mut o = Opts { dirs: Vec::new(), bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0, ttl: None, max_conn: 32, hidden: false, tls: false, i_know: false, write: false, max_upload_mib: 2048 };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} necesita un valor"));
@@ -73,6 +78,8 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
                 o.max_conn = val("--max-conn")?.parse().ok().filter(|n| (1..=1024).contains(n)).ok_or("--max-conn: entre 1 y 1024")?
             }
             "--hidden" => o.hidden = true,
+            "--write" => o.write = true,
+            "--max-upload" => o.max_upload_mib = val("--max-upload")?.parse().ok().filter(|n| *n >= 1).ok_or("--max-upload: MiB, al menos 1")?,
             "--tls" => o.tls = true,
             "--i-know" => o.i_know = true,
             s if s.starts_with("--") => return Err(format!("opción desconocida: {s}")),
@@ -169,7 +176,7 @@ fn run() -> Result<(), String> {
     };
     let url = format!("{}://{host}:{port}/s/{token}/", if o.tls { "https" } else { "http" });
 
-    println!("Compartiendo (solo lectura):");
+    println!("Compartiendo ({}):", if o.write { "LECTURA Y ESCRITURA: quien tenga el enlace puede subir, borrar y mover" } else { "solo lectura" });
     for r in &roots {
         println!("  {} → {}", r.name, r.path.display());
     }
@@ -195,7 +202,7 @@ fn run() -> Result<(), String> {
         });
     }
     println!("Ctrl+C para parar.");
-    server::serve(listener, Arc::new(server::Ctx::new(roots, token, o.hidden, tls_cfg)), o.max_conn);
+    server::serve(listener, Arc::new(server::Ctx::new(roots, token, o.hidden, o.write, o.max_upload_mib.saturating_mul(1 << 20), tls_cfg)), o.max_conn);
     Ok(())
 }
 

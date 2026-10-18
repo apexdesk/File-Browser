@@ -1,6 +1,6 @@
 //! Aceptación de conexiones, límites y enrutado.
 
-use crate::http::{self, Req, Rng};
+use crate::http::{self, Method, Req, Rng};
 use crate::jail::{self, Root};
 use crate::page::{self, Hit, Row};
 use crate::{mime, timefmt, walk, webui, zipstream};
@@ -27,14 +27,17 @@ pub struct Ctx {
     pub roots: Vec<Root>,
     pub token: String,
     pub hidden: bool,
+    /// `--write`: deja subir, borrar, mover y copiar (por defecto, solo lectura)
+    pub write: bool,
+    pub max_upload: u64,
     pub tls: Option<crate::tls::Config>,
     limiter: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
 }
 
 impl Ctx {
-    pub fn new(roots: Vec<Root>, token: String, hidden: bool, tls: Option<crate::tls::Config>) -> Self {
-        Ctx { roots, token, hidden, tls, limiter: Mutex::new(HashMap::new()), per_ip: Mutex::new(HashMap::new()) }
+    pub fn new(roots: Vec<Root>, token: String, hidden: bool, write: bool, max_upload: u64, tls: Option<crate::tls::Config>) -> Self {
+        Ctx { roots, token, hidden, write, max_upload, tls, limiter: Mutex::new(HashMap::new()), per_ip: Mutex::new(HashMap::new()) }
     }
 
     /// Reserva un hueco de conexión para esa IP; `false` si ya tiene demasiadas abiertas.
@@ -185,7 +188,7 @@ fn handle(tcp: TcpStream, ctx: &Ctx) {
     }
 }
 
-fn query_get(q: &str, key: &str) -> Option<String> {
+pub fn query_get(q: &str, key: &str) -> Option<String> {
     q.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         (k == key).then(|| jail::pct_decode(&v.replace('+', " "))).flatten()
@@ -209,6 +212,9 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
     }
     if tail.is_empty() {
         return http::redirect(s, &format!("/s/{tok}/"), req.head);
+    }
+    if matches!(req.method, Method::Put | Method::Post) {
+        return crate::write::dispatch(s, ctx, req, tail);
     }
     if let Some(api) = tail.strip_prefix("/api/") {
         return api_route(s, ctx, req, api);
@@ -266,7 +272,7 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
 }
 
 /// Ruta virtual «a/b/c» (ya decodificada) → componentes validados.
-fn virt_path(p: &str) -> Option<Vec<String>> {
+pub fn virt_path(p: &str) -> Option<Vec<String>> {
     let mut v = Vec::new();
     for c in p.split('/').filter(|c| !c.is_empty()) {
         if !jail::valid_component(c) {
@@ -280,7 +286,7 @@ fn virt_path(p: &str) -> Option<Vec<String>> {
 fn api_route(s: &mut Stream, ctx: &Ctx, req: &Req, api: &str) -> io::Result<()> {
     let json = "application/json; charset=utf-8";
     match api {
-        "info" => http::send(s, 200, json, b"{\"write\":false}", req.head, &[]),
+        "info" => http::send(s, 200, json, format!("{{\"write\":{}}}", ctx.write).as_bytes(), req.head, &[]),
         "list" => {
             let Some(comps) = virt_path(&query_get(&req.query, "p").unwrap_or_default()) else {
                 return http::error(s, 400, req.head);
