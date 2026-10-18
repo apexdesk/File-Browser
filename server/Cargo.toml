@@ -1,0 +1,28 @@
+[package]
+name = "filebrowser-server"
+version = "0.1.0"
+edition = "2024"
+license = "PolyForm-Strict-1.0.0"
+description = "Comparte carpetas por HTTP (solo lectura) con enlace secreto; proyecto aparte del gestor File Browser"
+
+[[bin]]
+name = "filebrowser-server"
+path = "src/main.rs"
+
+[features]
+# HTTPS con certificado autofirmado generado al arrancar (`--tls`). Sin él, el binario no lleva TLS.
+default = ["tls"]
+tls = ["dep:rustls", "dep:rcgen", "dep:sha2"]
+
+[dependencies]
+getrandom = "0.3"
+qrcode = { version = "0.14", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.14", optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+zip = { version = "9.0.1", default-features = false }
