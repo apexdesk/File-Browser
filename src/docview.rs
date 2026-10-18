@@ -81,13 +81,27 @@ impl Pages for ApexPages {
     }
 }
 
+/// Abre un documento de oficina o PDF; en la web los bytes vienen del servidor (la biblioteca lee del disco real).
+pub fn open_doc(p: &Path) -> Result<apex_view::Document, apex_view::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return apex_view::Document::open_path(p);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let len = crate::vfs::fs::metadata(p)?.len();
+        if len > 64 << 20 {
+            return Err(apex_view::Error::TooLarge);
+        }
+        apex_view::Document::open_bytes(crate::vfs::fs::read(p)?)
+    }
+}
+
 fn opener_for(path: &Path) -> Opener {
     let p = path.to_path_buf();
     if p.extension().and_then(|e| e.to_str()).map(crate::comic::is_comic_ext).unwrap_or(false) {
         return Arc::new(move || crate::comic::open(&p).map(|c| Box::new(c) as Box<dyn Pages>));
     }
     Arc::new(move || {
-        apex_view::Document::open_path(&p).map(|d| Box::new(ApexPages(d)) as Box<dyn Pages>).map_err(|e| err_text(&e))
+        open_doc(&p).map(|d| Box::new(ApexPages(d)) as Box<dyn Pages>).map_err(|e| err_text(&e))
     })
 }
 
@@ -96,7 +110,7 @@ pub fn thumb(path: &Path, max: u32) -> Option<Decoded> {
     if crate::vfs::fs::metadata(path).ok()?.len() > THUMB_MAX_BYTES {
         return None;
     }
-    let mut doc = apex_view::Document::open_path(path).ok()?;
+    let mut doc = open_doc(path).ok()?;
     let (w, h) = doc.page_size(0).ok()?;
     if w <= 0.0 || h <= 0.0 {
         return None;
@@ -146,6 +160,10 @@ pub struct Find {
 
 /// Documento abierto en la vista previa.
 pub struct DocView {
+    #[cfg(target_arch = "wasm32")]
+    w_render: Option<(Box<dyn Pages>, Receiver<Req>)>,
+    #[cfg(target_arch = "wasm32")]
+    w_text: Option<(Box<dyn Pages>, Receiver<TextReq>)>,
     tx: Sender<Req>,
     text_tx: Option<Sender<TextReq>>,
     rx: Receiver<Resp>,
@@ -169,6 +187,74 @@ pub struct DocView {
     pub find: Option<Find>,
 }
 
+/// Dibuja la página pedida y la envía; `false` si ya no hay nadie al otro lado.
+fn render_one(doc: &mut dyn Pages, req: Req, l: &Arc<AtomicU64>, rt: &Sender<Resp>, ctx: &egui::Context) -> bool {
+    let Req::Render { id, page, width } = req;
+    let l2 = l.clone();
+    let msg = match doc.render(page, width, &move || l2.load(Ordering::Relaxed) != id) {
+        Ok(img) => Resp::Page { id, page, width, img },
+        Err(m) if m.is_empty() => return true,
+        Err(msg) => Resp::PageFailed { id, msg },
+    };
+    if rt.send(msg).is_err() {
+        return false;
+    }
+    ctx.request_repaint();
+    true
+}
+
+/// Atiende una petición de texto (páginas o búsqueda); `false` si ya no hay nadie al otro lado.
+fn text_one(doc: &mut dyn Pages, req: TextReq, rt: &Sender<Resp>, ctx: &egui::Context, lf: &AtomicU64) -> bool {
+    match req {
+        TextReq::Runs { page } => {
+            let runs = doc.runs(page);
+            if rt.send(Resp::Runs { page, runs }).is_err() {
+                return false;
+            }
+            ctx.request_repaint();
+        }
+        TextReq::Search { id, query } => {
+            let q = query.to_lowercase();
+            let n = doc.count();
+            let mut batch: Vec<Hit> = Vec::new();
+            let mut total = 0usize;
+            for page in 0..n {
+                if lf.load(Ordering::Relaxed) != id {
+                    break;
+                }
+                for r in doc.runs(page) {
+                    let low: Vec<char> = r.text.to_lowercase().chars().collect();
+                    let qc: Vec<char> = q.chars().collect();
+                    let len = low.len().max(1) as f32;
+                    let mut i = 0;
+                    while !qc.is_empty() && i + qc.len() <= low.len() {
+                        if low[i..i + qc.len()] == qc[..] && total < MAX_HITS {
+                            batch.push(Hit { page, x: r.x + r.w * i as f32 / len, y: r.y, w: r.w * qc.len() as f32 / len, h: r.h });
+                            total += 1;
+                            i += qc.len();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                let last = page + 1 == n;
+                if !batch.is_empty() || last || page % 8 == 7 {
+                    let hits = std::mem::take(&mut batch);
+                    if rt.send(Resp::Hits { id, hits, scanned: page + 1, done: last }).is_err() {
+                        return false;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            if n == 0 {
+                let _ = rt.send(Resp::Hits { id, hits: Vec::new(), scanned: 0, done: true });
+                ctx.request_repaint();
+            }
+        }
+    }
+    true
+}
+
 impl DocView {
     pub fn new(ctx: &egui::Context, path: &PathBuf) -> DocView {
         let opener = opener_for(path);
@@ -176,36 +262,44 @@ impl DocView {
         let (resp_tx, rx) = channel::<Resp>();
         let latest = Arc::new(AtomicU64::new(0));
         let (l, ctx2, op, rt) = (latest.clone(), ctx.clone(), opener.clone(), resp_tx.clone());
-        crate::vfs::thread::spawn(move || {
-            let mut doc = match op() {
+        let _ = &l;
+        let start = move || -> Option<Box<dyn Pages>> {
+            let doc = match op() {
                 Ok(d) => d,
                 Err(m) => {
                     let _ = rt.send(Resp::Failed(m));
                     ctx2.request_repaint();
-                    return;
+                    return None;
                 }
             };
             let _ = rt.send(Resp::Opened { count: doc.count() });
             ctx2.request_repaint();
-            while let Ok(mut req) = req_rx.recv() {
-                // sólo importa la última petición
-                while let Ok(r) = req_rx.try_recv() {
-                    req = r;
+            Some(doc)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (l, rt, ctx2) = (l.clone(), resp_tx.clone(), ctx.clone());
+            crate::vfs::thread::spawn(move || {
+                let Some(mut doc) = start() else { return };
+                while let Ok(mut req) = req_rx.recv() {
+                    // sólo importa la última petición
+                    while let Ok(r) = req_rx.try_recv() {
+                        req = r;
+                    }
+                    if !render_one(&mut *doc, req, &l, &rt, &ctx2) {
+                        return;
+                    }
                 }
-                let Req::Render { id, page, width } = req;
-                let l2 = l.clone();
-                let msg = match doc.render(page, width, &move || l2.load(Ordering::Relaxed) != id) {
-                    Ok(img) => Resp::Page { id, page, width, img },
-                    Err(m) if m.is_empty() => continue,
-                    Err(msg) => Resp::PageFailed { id, msg },
-                };
-                if rt.send(msg).is_err() {
-                    return;
-                }
-                ctx2.request_repaint();
-            }
-        });
+            });
+        }
+        // sin hilos: el documento se abre ya y las peticiones se atienden en `poll`
+        #[cfg(target_arch = "wasm32")]
+        let w_render = start().map(|d| (d, req_rx));
         DocView {
+            #[cfg(target_arch = "wasm32")]
+            w_render,
+            #[cfg(target_arch = "wasm32")]
+            w_text: None,
             tx,
             text_tx: None,
             rx,
@@ -233,64 +327,46 @@ impl DocView {
         if self.text_tx.is_none() {
             let (tx, rx) = channel::<TextReq>();
             let (op, rt, ctx, lf) = (self.opener.clone(), self.resp_tx.clone(), self.ctx.clone(), self.latest_find.clone());
+            #[cfg(not(target_arch = "wasm32"))]
             crate::vfs::thread::spawn(move || {
                 let Ok(mut doc) = op() else { return };
                 while let Ok(req) = rx.recv() {
-                    match req {
-                        TextReq::Runs { page } => {
-                            let runs = doc.runs(page);
-                            if rt.send(Resp::Runs { page, runs }).is_err() {
-                                return;
-                            }
-                            ctx.request_repaint();
-                        }
-                        TextReq::Search { id, query } => {
-                            let q = query.to_lowercase();
-                            let n = doc.count();
-                            let mut batch: Vec<Hit> = Vec::new();
-                            let mut total = 0usize;
-                            for page in 0..n {
-                                if lf.load(Ordering::Relaxed) != id {
-                                    break;
-                                }
-                                for r in doc.runs(page) {
-                                    let low: Vec<char> = r.text.to_lowercase().chars().collect();
-                                    let qc: Vec<char> = q.chars().collect();
-                                    let len = low.len().max(1) as f32;
-                                    let mut i = 0;
-                                    while !qc.is_empty() && i + qc.len() <= low.len() {
-                                        if low[i..i + qc.len()] == qc[..] && total < MAX_HITS {
-                                            batch.push(Hit { page, x: r.x + r.w * i as f32 / len, y: r.y, w: r.w * qc.len() as f32 / len, h: r.h });
-                                            total += 1;
-                                            i += qc.len();
-                                        } else {
-                                            i += 1;
-                                        }
-                                    }
-                                }
-                                let last = page + 1 == n;
-                                if !batch.is_empty() || last || page % 8 == 7 {
-                                    let hits = std::mem::take(&mut batch);
-                                    if rt.send(Resp::Hits { id, hits, scanned: page + 1, done: last }).is_err() {
-                                        return;
-                                    }
-                                    ctx.request_repaint();
-                                }
-                            }
-                            if n == 0 {
-                                let _ = rt.send(Resp::Hits { id, hits: Vec::new(), scanned: 0, done: true });
-                                ctx.request_repaint();
-                            }
-                        }
+                    if !text_one(&mut *doc, req, &rt, &ctx, &lf) {
+                        return;
                     }
                 }
             });
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = (&rt, &ctx, &lf);
+                self.w_text = op().ok().map(|d| (d, rx));
+            }
             self.text_tx = Some(tx);
         }
         self.text_tx.as_ref().unwrap()
     }
 
+    /// Sin hilos (web) las peticiones se atienden aquí, una por fotograma.
+    #[cfg(target_arch = "wasm32")]
+    fn pump(&mut self) {
+        if let Some((doc, rx)) = &mut self.w_render {
+            if let Some(mut req) = rx.try_recv().ok() {
+                while let Ok(r) = rx.try_recv() {
+                    req = r;
+                }
+                render_one(&mut **doc, req, &self.latest, &self.resp_tx, &self.ctx);
+            }
+        }
+        if let Some((doc, rx)) = &mut self.w_text {
+            if let Ok(req) = rx.try_recv() {
+                text_one(&mut **doc, req, &self.resp_tx, &self.ctx, &self.latest_find);
+            }
+        }
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        self.pump();
         while let Ok(r) = self.rx.try_recv() {
             match r {
                 Resp::Opened { count } => {
@@ -455,3 +531,4 @@ pub fn join_runs<'a>(runs: impl Iterator<Item = &'a Run>, clip: Option<(usize, u
     }
     out
 }
+
