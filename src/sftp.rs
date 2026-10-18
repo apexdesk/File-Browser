@@ -596,7 +596,7 @@ pub fn connect(conn: Conn, path: &str) -> Result<PathBuf, String> {
             }
         }
     };
-    let _ = std::fs::create_dir_all(&root);
+    crate::fsys::private_dir(&root);
     let start = if path.is_empty() || path == "/" {
         sess.with_client(|c| c.realpath("."))?
     } else {

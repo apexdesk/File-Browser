@@ -117,7 +117,7 @@ impl Index {
         }
         b.extend(self.dir.iter().map(|&d| d as u8));
         if let Some(d) = file.parent() {
-            let _ = std::fs::create_dir_all(d);
+            crate::fsys::private_dir(d);
         }
         let tmp = file.with_extension("tmp");
         if std::fs::write(&tmp, &b).is_ok() {

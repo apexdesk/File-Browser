@@ -314,7 +314,10 @@ pub fn markdown(text: &str) -> Rich {
             let mut rows = vec![split_row(tr)];
             i += 2;
             while i < lines.len() && lines[i].contains('|') && !lines[i].trim().is_empty() {
-                rows.push(split_row(lines[i]));
+                // tope de filas: una tabla enorme cuenta como un solo bloque y congelaría el pintado
+                if rows.len() < 5000 {
+                    rows.push(split_row(lines[i]));
+                }
                 i += 1;
             }
             r.blocks.push(Block::Table(rows));

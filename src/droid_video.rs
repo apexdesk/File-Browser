@@ -33,6 +33,10 @@ pub struct Player {
 }
 
 impl Player {
+    pub fn duration(&self) -> f64 {
+        self.duration
+    }
+
     pub fn new(ctx: &egui::Context, path: &Path) -> Player {
         let info = crate::droid::probe(path);
         Player {

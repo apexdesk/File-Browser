@@ -43,7 +43,8 @@ struct Shared {
 pub struct Player {
     path: PathBuf,
     ctx: egui::Context,
-    pub duration: f64,
+    /// Duración (bits de un f64): se lee en un hilo para no bloquear la interfaz.
+    duration_bits: Arc<AtomicU64>,
     shared: Arc<Shared>,
     video: Option<Child>,
     audio: Option<Child>,
@@ -70,11 +71,23 @@ fn probe_duration(path: &Path) -> f64 {
 }
 
 impl Player {
+    pub fn duration(&self) -> f64 {
+        f64::from_bits(self.duration_bits.load(Ordering::Relaxed))
+    }
+
     pub fn new(ctx: &egui::Context, path: &Path) -> Player {
         Player {
             path: path.to_path_buf(),
             ctx: ctx.clone(),
-            duration: probe_duration(path),
+            duration_bits: {
+                let bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+                let (b, p, c) = (bits.clone(), path.to_path_buf(), ctx.clone());
+                std::thread::spawn(move || {
+                    b.store(probe_duration(&p).to_bits(), Ordering::Relaxed);
+                    c.request_repaint();
+                });
+                bits
+            },
             shared: Arc::new(Shared::default()),
             video: None,
             audio: None,
@@ -92,7 +105,7 @@ impl Player {
 
     pub fn position(&self) -> f64 {
         let p = self.base + self.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if self.duration > 0.0 { p.min(self.duration) } else { p }
+        if self.duration() > 0.0 { p.min(self.duration()) } else { p }
     }
 
     fn stop_procs(&mut self) {
@@ -193,13 +206,13 @@ impl Player {
             self.started = None;
             self.stop_procs();
         } else {
-            let at = if self.duration > 0.0 && self.base >= self.duration - 0.2 { 0.0 } else { self.base };
+            let at = if self.duration() > 0.0 && self.base >= self.duration() - 0.2 { 0.0 } else { self.base };
             self.start(at);
         }
     }
 
     pub fn seek_to(&mut self, secs: f64) {
-        let max = if self.duration > 0.5 { self.duration - 0.3 } else { f64::MAX };
+        let max = if self.duration() > 0.5 { self.duration() - 0.3 } else { f64::MAX };
         self.start(secs.clamp(0.0, max));
     }
 
@@ -219,7 +232,7 @@ impl Player {
         }
         let g = self.shared.epoch.load(Ordering::SeqCst);
         if self.started.is_some() && self.shared.ended.load(Ordering::SeqCst) == g {
-            self.base = if self.duration > 0.0 { self.duration } else { self.position() };
+            self.base = if self.duration() > 0.0 { self.duration() } else { self.position() };
             self.started = None;
             self.stop_procs();
         }
