@@ -2089,6 +2089,10 @@ impl App {
     }
 
     fn start_rename(&mut self) {
+        if self.sel_count > 1 {
+            self.open_batch();
+            return;
+        }
         if let Some(c) = self.cursor.filter(|&c| self.is_sel(c)) {
             if let Some(e) = self.entries.get(c as usize) {
                 if self.touch {
@@ -5795,10 +5799,6 @@ impl App {
                         }
                     }
                     self.open_with_menu(ui);
-                    if ui.button(t("Calcular hash…")).clicked() {
-                        self.open_hash();
-                        ui.close();
-                    }
                 }
                 let Some(e) = self.entries.get(c as usize) else { return };
                 if e.is_dir() {
@@ -5853,6 +5853,11 @@ impl App {
                 self.do_zip();
                 ui.close();
             }
+            let one_file = self.sel_count == 1 && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| !e.is_dir()).unwrap_or(false);
+            if one_file && ui.button(t("Calcular hash…")).clicked() {
+                self.open_hash();
+                ui.close();
+            }
             let is_zip = self.sel_count == 1
                 && self.cursor.and_then(|c| self.entries.get(c as usize)).map(|e| crate::archive::detect(Path::new(&*e.name)).is_some()).unwrap_or(false);
             if is_zip && ui.button(t("Abrir comprimido")).clicked() {
@@ -5868,10 +5873,6 @@ impl App {
             ui.separator();
             if ui.button(t("Renombrar   (F2)")).clicked() {
                 self.start_rename();
-                ui.close();
-            }
-            if self.sel_count > 1 && ui.button(t("Renombrar en lote…")).clicked() {
-                self.open_batch();
                 ui.close();
             }
             if ui.button(t("Mover a la papelera   (Supr)")).clicked() {
@@ -6664,9 +6665,6 @@ impl App {
                 if mi(ui, t("Renombrar"), "F2", has_sel) {
                     self.start_rename();
                 }
-                if mi(ui, t("Renombrar en lote…"), "", self.sel_count > 1) {
-                    self.open_batch();
-                }
                 if mi(ui, t("Mover a la papelera"), t("Supr"), has_sel) {
                     self.do_trash();
                 }
@@ -6780,6 +6778,9 @@ impl App {
                 }
                 if mi(ui, t("Calcular hash (MD5, SHA-1, SHA-256)…"), "", self.sel_count == 1) {
                     self.open_hash();
+                }
+                if mi(ui, t("Renombrar en lote…"), "F2", self.sel_count > 1) {
+                    self.open_batch();
                 }
                 if mi(ui, t("Extraer aquí"), "", one_zip) {
                     self.do_unzip();
