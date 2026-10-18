@@ -214,6 +214,7 @@ pub enum Glyph {
     Trash,
     Clock,
     Columns,
+    Search,
 }
 
 /// Trazo con terminaciones redondeadas (egui no las ofrece): se añaden discos en los extremos.
@@ -514,6 +515,10 @@ pub fn draw_glyph(p: &Painter, c: Pos2, s: f32, g: Glyph, col: Color32) {
         Glyph::Clock => {
             p.circle_stroke(q(0.0, 0.0), 8.0, st);
             path(p, &[q(0.0, -4.5), q(0.0, 0.0), q(4.0, 2.5)], false, st);
+        }
+        Glyph::Search => {
+            p.circle_stroke(q(-1.5, -1.5), 6.5, st);
+            path(p, &[q(3.5, 3.5), q(8.0, 8.0)], false, st);
         }
         Glyph::Check => {
             path(p, &[q(-8.0, -8.0), q(8.0, -8.0), q(8.0, 8.0), q(-8.0, 8.0)], true, st);

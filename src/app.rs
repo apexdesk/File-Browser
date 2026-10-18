@@ -3524,6 +3524,22 @@ impl App {
                 egui::Popup::menu(&more).show(|ui| {
                     egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| self.phone_menu(ui));
                 });
+                // filtrar por nombre: abre la barra de filtro bajo ésta
+                let pf_id = egui::Id::new("phone_filter");
+                let pf_on = ui.ctx().data(|d| d.get_temp::<u8>(pf_id)).unwrap_or(0) > 0;
+                let (r, flt) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+                if flt.hovered() || pf_on || !self.filter.is_empty() {
+                    ui.painter().rect_filled(r, CornerRadius::same(12), if pf_on { pal.sel } else { pal.hover });
+                }
+                theme::draw_glyph(ui.painter(), r.center(), 22.0, Glyph::Search, if pf_on || !self.filter.is_empty() { pal.accent } else { pal.text });
+                if flt.clicked() {
+                    if pf_on {
+                        self.filter.clear();
+                        self.spawn_sort();
+                    }
+                    // 12 fotogramas de foco forzado al abrir: el teclado del móvil quita el foco de forma transitoria
+                    ui.ctx().data_mut(|d| d.insert_temp(pf_id, if pf_on { 0u8 } else { 12u8 }));
+                }
                 // selección múltiple
                 let (r, sel) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
                 if sel.hovered() || self.sel_mode {
@@ -3575,11 +3591,6 @@ impl App {
         if menu_row(ui, &pal, t("Seleccionar todo"), false, None) {
             self.sel_mode = true;
             self.run_cmd(Cmd::SelectAll);
-            ui.close();
-        }
-        if menu_row(ui, &pal, t("Filtrar esta carpeta"), false, None) {
-            self.ctx.data_mut(|d| d.insert_temp(egui::Id::new("phone_filter"), true));
-            self.filter_focus = true;
             ui.close();
         }
         if menu_row(ui, &pal, t("Buscar en subcarpetas"), false, None) {
@@ -4897,7 +4908,7 @@ impl App {
         // el tamaño del icono sigue al deslizador de forma continua; el sobrante de ancho se
         // reparte como separación entre celdas, sin huecos fijos a los lados
         let zoom = zoom0;
-        let (cell_w, cell_h, row_pad) = if grid { ((width - 8.0) / cols as f32, zoom + 50.0, 8.0) } else { (0.0, if self.phone { 56.0 } else if self.touch { 48.0 } else { 32.0 }, 4.0) };
+        let (cell_w, cell_h, row_pad) = if grid { ((width - 8.0) / cols as f32, zoom + 50.0, 8.0) } else { (0.0, if self.phone { 44.0 } else if self.touch { 48.0 } else { 32.0 }, 4.0) };
         let single = self.cfg.single_click.unwrap_or(cfg!(target_os = "android"));
         self.cols = cols;
         let rows = n.div_ceil(cols);
@@ -9521,20 +9532,25 @@ impl eframe::App for App {
                 .frame(bar(6, 4))
                 .show_separator_line(false)
                 .show(ui, |ui| self.phone_bar(ui));
-            // filtro por nombre de la carpeta actual (se abre desde el menú ⋮)
+            // filtro por nombre de la carpeta actual (icono de la barra superior)
             let pf_id = egui::Id::new("phone_filter");
-            let pf = ui.ctx().data(|d| d.get_temp::<bool>(pf_id)).unwrap_or(false);
-            if pf || !self.filter.is_empty() {
-                egui::Panel::top("phonefilter").frame(bar(6, 4)).show_separator_line(false).show(ui, |ui| {
+            let pf_n = ui.ctx().data(|d| d.get_temp::<u8>(pf_id)).unwrap_or(0);
+            if pf_n > 0 || !self.filter.is_empty() {
+                egui::Panel::top("phonefilter").frame(bar(2, 4)).show_separator_line(false).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let te = egui::TextEdit::singleline(&mut self.filter)
+                            // id fijo, como en la barra de direcciones: si cambia se pierde el foco y se oculta el teclado
+                            .id(egui::Id::new("phone_filter_edit"))
                             .hint_text(t("Filtrar…"))
                             .desired_width((ui.available_width() - 60.0).max(80.0))
                             .margin(egui::Margin::symmetric(12, 10));
                         let r = ui.add(te);
-                        if self.filter_focus {
-                            r.request_focus();
-                            self.filter_focus = false;
+                        if pf_n > 1 {
+                            if !r.has_focus() {
+                                r.request_focus();
+                            }
+                            ui.ctx().data_mut(|d| d.insert_temp(pf_id, pf_n - 1));
+                            ui.ctx().request_repaint();
                         }
                         if r.changed() {
                             self.spawn_sort();
@@ -9544,7 +9560,7 @@ impl eframe::App for App {
                         if resp.clicked() {
                             self.filter.clear();
                             self.spawn_sort();
-                            ui.ctx().data_mut(|d| d.insert_temp(pf_id, false));
+                            ui.ctx().data_mut(|d| d.insert_temp(pf_id, 0u8));
                         }
                     });
                 });
