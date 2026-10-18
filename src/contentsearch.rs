@@ -15,6 +15,8 @@ const TEXT_MAX: u64 = 16 << 20;
 /// Documentos: tamaño máximo y páginas que se examinan.
 const DOC_MAX: u64 = 40 << 20;
 const DOC_PAGES: usize = 300;
+/// En la web la búsqueda se hace de golpe en el hilo de la interfaz: archivos examinados como máximo.
+const WEB_MAX_FILES: u64 = 3000;
 
 pub fn spawn(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Context) -> Arc<Search> {
     let st = Arc::new(Search::default());
@@ -26,7 +28,8 @@ pub fn spawn(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Conte
         let rx = Arc::new(Mutex::new(rx));
         let found = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = Vec::new();
-        for _ in 0..n {
+        // sin hilos (web) no hay trabajadores esperando en el canal: se examina en el propio recorrido
+        for _ in 0..if crate::vfs::WEB { 0 } else { n } {
             let (rx, s, needle, found, ctx) = (rx.clone(), s.clone(), needle.clone(), found.clone(), ctx.clone());
             workers.push(crate::vfs::thread::spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
@@ -57,8 +60,20 @@ pub fn spawn(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Conte
                     if !pseudo_fs(&e.path()) {
                         stack.push(e.path());
                     }
-                } else if ft.v_is_file() && tx.send(e.path()).is_err() {
-                    break 'walk;
+                } else if ft.v_is_file() {
+                    if crate::vfs::WEB {
+                        // cada archivo es una petición al servidor: tope para no dejar la página colgada
+                        if s.scanned.fetch_add(1, AO::Relaxed) >= WEB_MAX_FILES {
+                            break 'walk;
+                        }
+                        let p = e.path();
+                        if file_matches(&p, &needle) {
+                            s.results.lock().unwrap().push((p, false));
+                            found.fetch_add(1, AO::Relaxed);
+                        }
+                    } else if tx.send(e.path()).is_err() {
+                        break 'walk;
+                    }
                 }
             }
         }
@@ -77,7 +92,7 @@ fn file_matches(p: &Path, needle: &str) -> bool {
     if crate::docview::is_doc_path(p) {
         return md.len() <= DOC_MAX && doc_contains(p, needle);
     }
-    if md.len() == 0 {
+    if md.len() == 0 || (crate::vfs::WEB && md.len() > TEXT_MAX / 8) {
         return false;
     }
     let Ok(f) = fs::File::open(p) else { return false };
@@ -93,7 +108,7 @@ fn file_matches(p: &Path, needle: &str) -> bool {
 }
 
 fn doc_contains(p: &Path, needle: &str) -> bool {
-    let Ok(mut doc) = apex_view::Document::open_path(p) else { return false };
+    let Ok(mut doc) = crate::docview::open_doc(p) else { return false };
     for page in 0..doc.page_count().min(DOC_PAGES) {
         let Ok(runs) = doc.page_runs(page) else { continue };
         let text = runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(" ");

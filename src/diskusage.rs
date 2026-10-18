@@ -62,7 +62,7 @@ pub fn start(path: PathBuf, ctx: &egui::Context, limited: bool) -> Scan {
         files: scan.files.clone(),
         cancel: scan.cancel.clone(),
         partial: scan.partial.clone(),
-        budget: limited.then(|| (200_000, web_time::Instant::now() + std::time::Duration::from_secs(10))),
+        budget: (limited || crate::vfs::WEB).then(|| (200_000, web_time::Instant::now() + std::time::Duration::from_secs(10))),
         egui: ctx.clone(),
         // se rellena en el hilo: `metadata` sobre un montaje de red caído bloquearía la interfaz
         #[cfg(unix)]
