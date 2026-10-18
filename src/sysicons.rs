@@ -339,23 +339,24 @@ mod linux {
             }
             let mut res = None;
             'themes: for dirs in &self.themes {
-                let mut cands: Vec<(i32, &Dir)> = dirs
+                let mut cands: Vec<(i64, &Dir)> = dirs
                     .iter()
                     .filter(|d| !d.symbolic)
                     .map(|d| {
+                        let (want, dsize, dmin, dmax, dthr) = (want as i64, d.size as i64, d.min as i64, d.max as i64, d.threshold as i64);
                         let dist = match d.kind {
-                            0 => (d.size - want).abs(),
+                            0 => (dsize - want).abs(),
                             1 => {
-                                if want < d.min { d.min - want } else if want > d.max { want - d.max } else { 0 }
+                                if want < dmin { dmin - want } else if want > dmax { want - dmax } else { 0 }
                             }
                             _ => {
-                                if want < d.size - d.threshold { d.size - d.threshold - want }
-                                else if want > d.size + d.threshold { want - d.size - d.threshold }
+                                if want < dsize - dthr { dsize - dthr - want }
+                                else if want > dsize + dthr { want - dsize - dthr }
                                 else { 0 }
                             }
                         };
                         // preferir tamaños algo mayores (más nitidez al reducir)
-                        (dist * 2 + if d.size < want && d.kind != 1 { 1 } else { 0 }, d)
+                        (dist * 2 + if dsize < want && d.kind != 1 { 1 } else { 0 }, d)
                     })
                     .collect();
                 cands.sort_by_key(|c| c.0);

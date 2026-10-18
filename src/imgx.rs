@@ -71,15 +71,15 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
     // saltar color mode data, image resources y layer/mask info
     let mut p = 26;
     let n = be32(data.get(p..p + 4)?);
-    p += 4 + n;
+    p = p.checked_add(4)?.checked_add(n)?;
     let n = be32(data.get(p..p + 4)?);
-    p += 4 + n;
+    p = p.checked_add(4)?.checked_add(n)?;
     let n = if version == 2 {
         u64::from_be_bytes(data.get(p..p + 8)?.try_into().ok()?) as usize
     } else {
         be32(data.get(p..p + 4)?)
     };
-    p += if version == 2 { 8 } else { 4 } + n;
+    p = p.checked_add(if version == 2 { 8 } else { 4 })?.checked_add(n)?;
     let comp = be16(data.get(p..p + 2)?);
     p += 2;
     let bpc = depth / 8;

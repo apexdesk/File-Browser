@@ -275,6 +275,10 @@ pub fn decode_jpeg_from<R: std::io::Read>(r: R, max: u32, orientation: u8) -> Op
     dec.read_info().ok()?;
     let info = dec.info()?;
     let (w0, h0) = (info.width as u32, info.height as u32);
+    // sin tope, un JPEG diminuto que declare 65535×65535 pediría gigas de memoria
+    if w0 as u64 * h0 as u64 > 200_000_000 {
+        return None;
+    }
     if w0 > max || h0 > max {
         // escalado por DCT (1/2, 1/4, 1/8): mucho más rápido que decodificar completo
         let s = (max as f32 / w0.max(h0) as f32).min(1.0);

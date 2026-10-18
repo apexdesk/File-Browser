@@ -526,6 +526,7 @@ mod clip_impl {
             }
             Err(_) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 None
             }
         }
@@ -735,8 +736,7 @@ mod clip_impl {
   var urls = pb.readObjectsForClassesOptions($([$.NSURL]), opts);
   var out = [];
   if (urls) { for (var i = 0; i < urls.count; i++) { out.push(ObjC.unwrap(urls.objectAtIndex(i).path)); } }
-  return out.join("
-");
+  return out.join("\n");
 }"#;
 
     pub fn set_files(paths: &[PathBuf], _cut: bool) -> bool {

@@ -329,6 +329,9 @@ fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> R
             carry = None;
         } else {
             // remuestreo lineal; el último fotograma pasa al siguiente paquete
+            if rate_in < 1000 {
+                continue;
+            }
             let step = rate_in as f64 / rate_out as f64;
             if !had_carry {
                 phase = 0.0;

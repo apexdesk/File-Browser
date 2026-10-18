@@ -169,7 +169,7 @@ pub fn list(path: &Path, max: usize, budget: Duration) -> Result<Listing, String
         Format::Tar | Format::TarGz => {
             let f = File::open(path).map_err(|e| e.to_string())?;
             let r = Deadline { inner: BufReader::new(f), end: Instant::now() + budget };
-            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r).take(MAX_EXPANDED)) } else { Box::new(r) };
+            let rd: Box<dyn Read> = if fmt == Format::TarGz { Box::new(flate2::read::GzDecoder::new(r).take(MAX_EXPANDED)) } else { Box::new(r.take(MAX_EXPANDED)) };
             let mut ar = tar::Archive::new(rd);
             let ents = ar.entries().map_err(|e| e.to_string())?;
             for e in ents {
@@ -330,6 +330,9 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
                 sevenz_rust2::Error::MaybeBadPassword(_) => BAD_PASS.to_string(),
                 e => pw_msg(e.to_string(), pass.is_some()),
             })?;
+            if p.cancelled() {
+                return Err("cancelado".into());
+            }
         }
         #[cfg(target_os = "android")]
         Format::Rar => return Err("RAR no está soportado en Android".into()),
@@ -350,6 +353,9 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
                 }
                 let ok = safe(&e.filename);
                 done = done.saturating_add(e.unpacked_size);
+                if done > MAX_EXPANDED {
+                    return Err("el contenido descomprimido supera el límite permitido".into());
+                }
                 cur = if ok && e.is_file() {
                     h.extract_with_base(dst).map_err(|e| pw_msg(e.to_string(), pass.is_some()))?
                 } else if ok && e.is_directory() {

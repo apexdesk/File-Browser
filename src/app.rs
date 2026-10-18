@@ -145,6 +145,8 @@ struct BatchDlg {
     regex: bool,
     mtimes: Vec<i64>,
     parent: String,
+    /// Carpeta donde se abrió: el diálogo no se mueve con la navegación.
+    dir: PathBuf,
 }
 
 /// Acción reversible registrada para deshacer/rehacer.
@@ -511,6 +513,10 @@ pub struct App {
     net_busy: Arc<AtomicBool>,
     /// Lista de red calculada en segundo plano (consulta procesos y puede tardar).
     net_list: Arc<std::sync::Mutex<Option<Vec<NetPlace>>>>,
+    /// Unidades y raíces del índice, calculadas en un hilo (en Windows `exists()` de cada letra puede colgarse).
+    drives_slot: Arc<std::sync::Mutex<Option<(Vec<Place>, Vec<PathBuf>)>>>,
+    drives_busy: Arc<AtomicBool>,
+    index_roots: Vec<PathBuf>,
     net_refreshing: Arc<AtomicBool>,
     net_shares: Arc<std::sync::Mutex<Option<NetShares>>>,
     /// Trabajos de E/S lentos (crear, renombrar…) hechos en un hilo; cada uno deja aquí lo que debe
@@ -1210,6 +1216,9 @@ impl App {
             net_err: Arc::new(std::sync::Mutex::new(None)),
             net_busy: Arc::new(AtomicBool::new(false)),
             net_list: Arc::new(std::sync::Mutex::new(None)),
+            drives_slot: Arc::new(std::sync::Mutex::new(None)),
+            drives_busy: Arc::new(AtomicBool::new(false)),
+            index_roots: tools::all_roots(),
             net_refreshing: Arc::new(AtomicBool::new(false)),
             net_shares: Arc::new(std::sync::Mutex::new(None)),
             io_done: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1371,6 +1380,9 @@ impl App {
         if self.other.is_some() {
             // el panel con foco pasa a ser el único
             self.ensure_live(self.active_side);
+            if let Some(o) = self.other.as_ref().and_then(|o| o.search_st.clone()) {
+                o.cancel.store(true, Ordering::Relaxed);
+            }
             self.other = None;
             self.active_side = 0;
             self.live_side = 0;
@@ -2213,8 +2225,8 @@ impl App {
                 virt_mode(dst).is_some() || crate::sftp::is_remote(dst) || inarch(dst) || (*mv && (remote(srcs) || srcs.iter().any(|p| inarch(p))))
             }
             Op::Trash(v) | Op::Delete(v) => remote(v) || v.iter().any(|p| inarch(p)),
-            Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs) || inarch(out),
-            Op::Unzip { src, dst, .. } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src) || inarch(dst),
+            Op::Compress { srcs, out, .. } => crate::sftp::is_remote(out) || remote(srcs) || inarch(out) || virt_mode(out).is_some(),
+            Op::Unzip { src, dst, .. } => crate::sftp::is_remote(dst) || crate::sftp::is_remote(src) || inarch(dst) || virt_mode(dst).is_some(),
         };
         if touches {
             self.say(t("Los servidores SFTP son de sólo lectura").into(), true);
@@ -2280,7 +2292,8 @@ impl App {
     }
 
     fn rename_checked(a: &Path, b: &Path) -> Result<(), String> {
-        if std::fs::symlink_metadata(b).is_ok() {
+        let same = matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
+        if !same && std::fs::symlink_metadata(b).is_ok() {
             return Err(tf("{}: ya existe", &[&b.display()]));
         }
         std::fs::rename(a, b).map_err(|e| format!("{}: {e}", a.display()))
@@ -2305,7 +2318,7 @@ impl App {
             Undo::Created(items) => {
                 if is_redo {
                     for (p, dir) in items {
-                        let r = if *dir { std::fs::create_dir_all(p) } else { std::fs::File::create(p).map(|_| ()) };
+                        let r = if *dir { std::fs::create_dir_all(p) } else { std::fs::OpenOptions::new().write(true).create_new(true).open(p).map(|_| ()) };
                         if let Err(e) = r {
                             err = Some(format!("{}: {e}", p.display()));
                             break;
@@ -4007,6 +4020,20 @@ impl App {
                 a.refresh_network();
             },
         );
+    }
+
+    /// Recalcula unidades y raíces del índice en un hilo (evita bloquear la interfaz con unidades dormidas o de red).
+    fn refresh_drives(&mut self) {
+        if self.drives_busy.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (slot, flag, ctx) = (self.drives_slot.clone(), self.drives_busy.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let v = (list_drives(), tools::all_roots());
+            *slot.lock().unwrap() = Some(v);
+            flag.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
     }
 
     /// Recalcula la lista de sitios de red en un hilo (evita bloquear la interfaz).
@@ -6007,7 +6034,7 @@ fn batch_name(old: &str, d: &BatchDlg, i: usize, re: Option<&regex::Regex>) -> S
         stem.to_string()
     } else {
         let date = d.mtimes.get(i).map(|&m| crate::fsys::fmt_time(m)).unwrap_or_default();
-        expand_template(&d.template, stem, d.start as usize + i, date.get(..10).unwrap_or(""), &d.parent)
+        expand_template(&d.template, stem, (d.start as usize).saturating_add(i), date.get(..10).unwrap_or(""), &d.parent)
     };
     if !d.find.is_empty() {
         s = match (d.regex, re) {
@@ -6033,7 +6060,7 @@ fn batch_name(old: &str, d: &BatchDlg, i: usize, re: Option<&regex::Regex>) -> S
     }
     s = format!("{}{}{}", d.prefix, s, d.suffix);
     if d.number && d.template.trim().is_empty() {
-        s = format!("{} {:03}", s, d.start as usize + i);
+        s = format!("{} {:03}", s, (d.start as usize).saturating_add(i));
     }
     if ext.is_empty() { s } else { format!("{s}.{ext}") }
 }
@@ -6082,7 +6109,10 @@ fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
     // en Windows sólo existe el atributo de sólo lectura (bit de escritura del propietario)
-    let md = std::fs::metadata(p)?;
+    let md = std::fs::symlink_metadata(p)?;
+    if md.file_type().is_symlink() {
+        return Ok(());
+    }
     let mut perm = md.permissions();
     perm.set_readonly(bits & 0o200 == 0);
     std::fs::set_permissions(p, perm)?;
@@ -6145,7 +6175,16 @@ fn is_program(_: &Path) -> bool {
     false
 }
 
+/// ¿Lleva la ruta caracteres de control? Teclearla en el terminal permitiría inyectar órdenes.
+fn has_ctl(p: &Path) -> bool {
+    p.to_string_lossy().chars().any(|c| c.is_control())
+}
+
+/// `cd` a la ruta para teclearlo en el terminal; vacío si la ruta no es segura de teclear.
 fn shell_quote(p: &Path) -> String {
+    if has_ctl(p) {
+        return String::new();
+    }
     #[cfg(windows)]
     {
         format!("cd /d \"{}\"\r", p.display())
@@ -6355,12 +6394,18 @@ impl App {
             self.save_tab();
             let t = self.tabs.remove(i);
             self.closed_tabs.push(t);
+            if self.closed_tabs.len() > 20 {
+                self.closed_tabs.remove(0);
+            }
             let n = i.min(self.tabs.len() - 1);
             self.restore_tab(n);
         } else {
             self.save_tab();
             let t = self.tabs.remove(i);
             self.closed_tabs.push(t);
+            if self.closed_tabs.len() > 20 {
+                self.closed_tabs.remove(0);
+            }
             if i < self.cur_tab {
                 self.cur_tab -= 1;
             }
@@ -6542,7 +6587,10 @@ impl App {
         self.cfg.term_open = true;
         self.ensure_term();
         let cmd = shell_quote(&self.cwd);
-        if let Some(t) = &mut self.term {
+        if cmd.is_empty() {
+            self.say(t("La ruta tiene caracteres de control: no se escribe en el terminal").into(), true);
+        }
+        if let (Some(t), false) = (&mut self.term, cmd.is_empty()) {
             t.send(cmd.as_bytes());
             self.term_focus = true;
         }
@@ -6583,8 +6631,9 @@ impl App {
         let focus = self.term_focus;
         if let Some(t) = &mut self.term {
             t.show(ui, rect, &pal, focus);
-            if cd_here {
-                t.send(shell_quote(&self.cwd).as_bytes());
+            let q = shell_quote(&self.cwd);
+            if cd_here && !q.is_empty() {
+                t.send(q.as_bytes());
             }
         }
         if close {
@@ -7514,6 +7563,7 @@ impl App {
             regex: false,
             mtimes,
             parent,
+            dir: self.cwd.clone(),
             names,
             find: String::new(),
             repl: String::new(),
@@ -7567,6 +7617,10 @@ impl App {
         self.cfg.term_open = true;
         self.ensure_term();
         let dir = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        if has_ctl(p) || has_ctl(&dir) {
+            self.say(t("La ruta tiene caracteres de control: no se escribe en el terminal").into(), true);
+            return;
+        }
         let line = format!(
             "{}'{}'\r",
             shell_quote(&dir).trim_end_matches('\r').to_string() + " && ",
@@ -8046,6 +8100,9 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
+        if !matches!(self.dlg, Dlg::Batch(_)) && !self.batch_names.is_empty() {
+            self.batch_names.clear();
+        }
         // cerrar con tareas en curso: se pide confirmación
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && (self.op.is_some() || !self.queue.is_empty()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -8431,7 +8488,7 @@ impl App {
                 // por fila: ¿tiene problema? (vacío, repetido, con barra o ya existente)
                 let mut bad: Vec<bool> = Vec::with_capacity(new.len());
                 for (o, n) in d.names.iter().zip(&new) {
-                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && self.cwd.join(n).exists());
+                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && d.dir.join(n).exists());
                     bad.push(b);
                 }
                 let conflict = bad.iter().any(|b| *b) || bad_re;
@@ -8440,7 +8497,7 @@ impl App {
                 let mut open = true;
                 // nombres nuevos en la vista de carpeta mientras «Vista previa» esté activa
                 self.batch_names.clear();
-                if d.preview {
+                if d.preview && self.cwd == d.dir {
                     for (o, n) in d.names.iter().zip(&new) {
                         if o != n {
                             self.batch_names.insert(o.clone(), n.clone());
@@ -8560,7 +8617,7 @@ impl App {
                 if !open {
                     act = 2;
                 }
-                if act == 1 && self.remote_ro(&self.cwd.clone()) {
+                if act == 1 && self.remote_ro(&d.dir.clone()) {
                     act = 2;
                 }
                 if act == 1 {
@@ -8572,7 +8629,7 @@ impl App {
                     let tmpn = |i: usize| format!(".fbtmp-{pid}-{i}");
                     let mut staged = 0;
                     for (i, (o, _)) in pairs.iter().enumerate() {
-                        if let Err(e) = std::fs::rename(self.cwd.join(o), self.cwd.join(tmpn(i))) {
+                        if let Err(e) = std::fs::rename(d.dir.join(o), d.dir.join(tmpn(i))) {
                             err = Some(format!("{o}: {e}"));
                             break;
                         }
@@ -8582,12 +8639,12 @@ impl App {
                     let mut done = Vec::new();
                     if err.is_none() {
                         for i in 0..staged {
-                            let dst = self.cwd.join(&pairs[i].1);
+                            let dst = d.dir.join(&pairs[i].1);
                             // nunca sobrescribir algo que haya aparecido entre la vista previa y ahora
                             let r = if dst.symlink_metadata().is_ok() {
                                 Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("ya existe")))
                             } else {
-                                std::fs::rename(self.cwd.join(tmpn(i)), &dst)
+                                std::fs::rename(d.dir.join(tmpn(i)), &dst)
                             };
                             match r {
                                 Ok(()) => done.push(i),
@@ -8600,14 +8657,14 @@ impl App {
                     }
                     if err.is_some() {
                         for &i in &done {
-                            let _ = std::fs::rename(self.cwd.join(&pairs[i].1), self.cwd.join(tmpn(i)));
+                            let _ = std::fs::rename(d.dir.join(&pairs[i].1), d.dir.join(tmpn(i)));
                         }
                         for i in 0..staged {
-                            let back = self.cwd.join(&pairs[i].0);
-                            let tmp = self.cwd.join(tmpn(i));
+                            let back = d.dir.join(&pairs[i].0);
+                            let tmp = d.dir.join(tmpn(i));
                             if std::fs::rename(&tmp, &back).is_err() && back.symlink_metadata().is_err() {
                                 // último recurso: dejarlo con un nombre reconocible, nunca «.fbtmp»
-                                let _ = std::fs::rename(&tmp, self.cwd.join(format!("{} (recuperado)", pairs[i].0)));
+                                let _ = std::fs::rename(&tmp, d.dir.join(format!("{} (recuperado)", pairs[i].0)));
                             }
                         }
                     }
@@ -8615,12 +8672,14 @@ impl App {
                         Some(e) => self.say(tf("Error al renombrar: {e}", &[&e]), true),
                         None => {
                             self.say(tf("{} elementos renombrados", &[&pairs.len()]), false);
-                            let mv = pairs.iter().map(|(o, n)| (self.cwd.join(o), self.cwd.join(n))).collect();
+                            let mv = pairs.iter().map(|(o, n)| (d.dir.join(o), d.dir.join(n))).collect();
                             self.push_undo(Undo::Moved(mv), true);
                         }
                     }
-                    self.pending_select = pairs.into_iter().map(|(_, n)| n).collect();
-                    self.refresh();
+                    if self.cwd == d.dir {
+                        self.pending_select = pairs.into_iter().map(|(_, n)| n).collect();
+                        self.refresh();
+                    }
                 }
                 keep = act == 0;
                 if !keep {
@@ -9410,7 +9469,7 @@ impl eframe::App for App {
         }
         self.tick_theme();
         if self.cfg.index_enabled {
-            index::tick(tools::all_roots(), &ctx);
+            index::tick(self.index_roots.clone(), &ctx);
             if matches!(index::status(), index::Status::Building(_)) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
@@ -9437,8 +9496,12 @@ impl eframe::App for App {
         self.poll_op();
         if self.net_check.elapsed() > Duration::from_secs(5) {
             self.net_check = Instant::now();
-            self.drives = list_drives();
+            self.refresh_drives();
             self.refresh_network();
+        }
+        if let Some((d, r)) = self.drives_slot.lock().unwrap().take() {
+            self.drives = d;
+            self.index_roots = r;
         }
         if let Some(v) = self.net_list.lock().unwrap().take() {
             self.network = v;

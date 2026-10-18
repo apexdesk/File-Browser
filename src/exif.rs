@@ -364,6 +364,11 @@ fn jpeg_end(b: &[u8]) -> Option<usize> {
 
 pub fn read_range(path: &Path, off: u64, len: usize) -> Option<Vec<u8>> {
     let mut f = std::fs::File::open(path).ok()?;
+    // el tamaño viene de la cabecera del archivo: se comprueba contra el real y se acota
+    let flen = f.metadata().ok()?.len();
+    if len > 64 << 20 || off.checked_add(len as u64)? > flen {
+        return None;
+    }
     f.seek(SeekFrom::Start(off)).ok()?;
     let mut v = vec![0u8; len];
     f.read_exact(&mut v).ok()?;

@@ -90,7 +90,17 @@ impl Terminal {
         for e in events {
             match e {
                 egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
-                egui::Event::Paste(t) => out.extend_from_slice(t.as_bytes()),
+                egui::Event::Paste(t) => {
+                    // con «bracketed paste» el shell no ejecuta lo pegado hasta que el usuario pulse Intro
+                    let bp = self.parser.lock().unwrap().screen().bracketed_paste();
+                    if bp {
+                        out.extend_from_slice(b"\x1b[200~");
+                    }
+                    out.extend_from_slice(t.as_bytes());
+                    if bp {
+                        out.extend_from_slice(b"\x1b[201~");
+                    }
+                }
                 egui::Event::Copy => out.push(0x03),
                 egui::Event::Cut => out.push(0x18),
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {

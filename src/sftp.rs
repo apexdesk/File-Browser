@@ -303,7 +303,11 @@ impl Client {
     pub fn download(&mut self, remote: &str, local: &Path, size: u64, cancel: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<(), String> {
         use std::io::{Seek, SeekFrom};
         let h = self.open(T_OPEN, remote)?;
-        let tmp = local.with_extension("fb_part");
+        let tmp = {
+            let mut n = local.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            n.push(".fb_part");
+            local.with_file_name(n)
+        };
         let res = (|| -> Result<(), String> {
             let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             let mut pending: HashMap<u32, (u64, u32)> = HashMap::new();
