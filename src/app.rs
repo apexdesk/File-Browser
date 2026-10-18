@@ -138,6 +138,8 @@ struct BatchDlg {
     number: bool,
     start: u32,
     case: u8,
+    /// ¿se muestra la lista de nombres nuevos en la ventana?
+    preview: bool,
     /// Plantilla del nombre (vacía = se parte del nombre original): {nombre} {n} {n:3} {fecha} {padre}.
     template: String,
     regex: bool,
@@ -7511,6 +7513,7 @@ impl App {
             number: false,
             start: 1,
             case: 0,
+            preview: true,
         });
     }
 
@@ -8426,9 +8429,18 @@ impl App {
                 let changes = d.names.iter().zip(&new).filter(|(o, n)| o != n).count();
                 let mut act = 0;
                 let mut open = true;
-                let width = 560.0f32.min(ctx.content_rect().width() - 56.0).max(260.0);
-                let fw = (width - 150.0).max(120.0);
-                theme::card_window(ctx, &pal, t("Renombrar en lote"), 560.0, &mut open, |ui| {
+                // ventana aparte y movible, como la vista previa (en Android egui la incrusta)
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("batch_window"),
+                    egui::ViewportBuilder::default().with_title(t("Renombrar en lote")).with_inner_size([620.0, 600.0]).with_min_inner_size([420.0, 360.0]),
+                    |ui, _class| {
+                        let c = ui.ctx().clone();
+                        if c.input(|i| i.viewport().close_requested()) || c.input(|i| i.key_pressed(egui::Key::Escape) && c.memory(|m| m.focused().is_none())) {
+                            open = false;
+                            return;
+                        }
+                        let fw = (ui.available_width() - 150.0).max(120.0);
+                        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::same(16))).show_inside(ui, |ui| {
                     egui::Grid::new("batch").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                         ui.label(t("Plantilla"));
                         ui.add(egui::TextEdit::singleline(&mut d.template).hint_text("{nombre} {n:3} {fecha} {padre}").desired_width(fw));
@@ -8463,20 +8475,13 @@ impl App {
                         });
                         ui.end_row();
                     });
-                    theme::section(ui, &pal, t("Vista previa"));
-                    egui::ScrollArea::vertical().id_salt("batch_prev").min_scrolled_height(180.0).max_height(180.0).auto_shrink([false, false]).show(ui, |ui| {
-                        for ((o, n), b) in d.names.iter().zip(&new).zip(&bad).take(300) {
-                            let col = if *b { Color32::from_rgb(235, 100, 100) } else if o == n { pal.subtle } else { pal.text };
-                            ui.add(egui::Label::new(egui::RichText::new(format!("{o}  ->  {n}")).size(12.5).color(col)).truncate());
-                        }
-                    });
                     if bad_re {
                         ui.colored_label(Color32::from_rgb(235, 100, 100), t("Expresión regular no válida."));
                     } else if conflict {
                         ui.colored_label(Color32::from_rgb(235, 100, 100), t("Hay nombres vacíos, repetidos o que ya existen."));
                     }
-                    ui.add_space(12.0);
-                    ui.allocate_ui_with_layout(vec2(width - 32.0, 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    ui.allocate_ui_with_layout(vec2(ui.available_width(), 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         ui.add_enabled_ui(!conflict && changes > 0, |ui| {
                             if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Renombrar")).clicked() {
@@ -8487,7 +8492,23 @@ impl App {
                             act = 2;
                         }
                     });
-                });
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut d.preview, t("Vista previa"));
+                    if d.preview {
+                        ui.add_space(4.0);
+                        // la lista llena el resto de la ventana y se desplaza sola (virtualizada)
+                        let row_h = 20.0;
+                        egui::ScrollArea::vertical().id_salt("batch_prev").auto_shrink([false, false]).show_rows(ui, row_h, d.names.len(), |ui, range| {
+                            for k in range {
+                                let (o, n, b) = (&d.names[k], &new[k], bad[k]);
+                                let col = if b { Color32::from_rgb(235, 100, 100) } else if o == n { pal.subtle } else { pal.text };
+                                ui.add(egui::Label::new(egui::RichText::new(format!("{o}  ->  {n}")).size(12.5).color(col)).truncate());
+                            }
+                        });
+                    }
+                        });
+                    },
+                );
                 if !open {
                     act = 2;
                 }
@@ -9065,6 +9086,8 @@ impl App {
     /// Autotest opcional: FB_SHOT=ruta.png [FB_PREVIEW=n] [FB_WAIT=ms] [FB_SCROLL=filas]
     fn selftest(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("FB_SHOT") else { return };
+        // las ventanas aparte se incrustan para que salgan en la captura
+        ctx.set_embed_viewports(true);
         let wait: u128 = std::env::var("FB_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(2500);
         let t0 = *self.start.get_or_insert_with(Instant::now);
         let el = t0.elapsed().as_millis();
