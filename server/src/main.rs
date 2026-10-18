@@ -10,6 +10,7 @@ mod stream;
 mod tls;
 mod timefmt;
 mod walk;
+mod webui;
 mod zipstream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
