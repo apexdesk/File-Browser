@@ -1,6 +1,6 @@
 //! Las peticiones a `filebrowser-server`, síncronas. La página vive en `/s/<token>/app/`, así que
 //! las direcciones relativas (`../api/...`) quedan dentro del token.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use web_sys::XmlHttpRequest;
 
@@ -36,6 +36,8 @@ fn xhr(method: &str, url: &str) -> io::Result<XmlHttpRequest> {
     // los bytes llegan como texto con un solo carácter por byte (no se puede pedir un búfer en una
     // petición síncrona de la página principal)
     x.override_mime_type("text/plain; charset=x-user-defined").map_err(|_| io::Error::other("sin red"))?;
+    // el servidor exige esta cabecera a las peticiones que modifican (una página ajena no puede ponerla)
+    x.set_request_header("X-FB", "1").map_err(|_| io::Error::other("sin red"))?;
     Ok(x)
 }
 
@@ -108,4 +110,62 @@ pub fn op(name: &str, from: &str, to: Option<&str>) -> io::Result<()> {
     }
     let x = xhr("POST", &url)?;
     finish(&x, None).map(|_| ())
+}
+
+thread_local! {
+    /// Archivos que el usuario ha soltado en la página o elegido con «Subir…», ya leídos.
+    static UPLOADS: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Los archivos recibidos desde el último fotograma: (nombre, contenido).
+pub fn take_uploads() -> Vec<(String, Vec<u8>)> {
+    UPLOADS.with_borrow_mut(std::mem::take)
+}
+
+/// Lee un archivo soltado en la página (el navegador solo deja leerlo de forma asíncrona).
+pub fn read_dropped(f: std::sync::Arc<dyn egui::DroppedFile>, ctx: egui::Context) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let name = f.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match f.bytes_async().await {
+            Ok(b) if !name.is_empty() => {
+                UPLOADS.with_borrow_mut(|u| u.push((name, b)));
+                ctx.request_repaint();
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Abre el selector de archivos del navegador; lo elegido llega por `take_uploads`.
+pub fn pick_files(ctx: egui::Context) {
+    use wasm_bindgen::JsCast;
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
+    let Ok(el) = doc.create_element("input") else { return };
+    let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() else { return };
+    input.set_type("file");
+    input.set_multiple(true);
+    let inp = input.clone();
+    let on_change = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let Some(files) = inp.files() else { return };
+        for i in 0..files.length() {
+            let Some(file) = files.get(i) else { continue };
+            let ctx = ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let name = file.name();
+                if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                    UPLOADS.with_borrow_mut(|u| u.push((name, js_sys::Uint8Array::new(&buf).to_vec())));
+                    ctx.request_repaint();
+                }
+            });
+        }
+    });
+    input.set_onchange(Some(on_change.unchecked_ref()));
+    input.click();
+}
+
+/// Abre un archivo del servidor en una pestaña nueva (el navegador lo muestra o lo descarga).
+pub fn open_path(path: &str) {
+    if let Some(w) = web_sys::window() {
+        let _ = w.open_with_url_and_target(&format!("../{}", url_path(path)), "_blank");
+    }
 }

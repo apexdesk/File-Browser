@@ -8,12 +8,27 @@ const MAX_HEAD: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const HEAD_DEADLINE: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Method {
+    Get,
+    Head,
+    Put,
+    Post,
+}
+
 pub struct Req {
+    pub method: Method,
     pub head: bool,
     pub path: String,
     pub query: String,
     pub range: Option<String>,
     pub inm: Option<String>,
+    /// Solo PUT/POST: tamaño del cuerpo, cabeceras para el control de origen y lo ya leído del cuerpo.
+    pub content_length: u64,
+    pub origin: Option<String>,
+    pub host: Option<String>,
+    pub xfb: bool,
+    pub leftover: Vec<u8>,
 }
 
 /// Lee y valida una petición. El `Err` es el código de estado con el que responder.
@@ -44,7 +59,9 @@ fn read_head(s: &mut Stream) -> Result<Req, u16> {
     if end > MAX_HEAD {
         return Err(431);
     }
-    parse(&buf[..end])
+    let mut req = parse(&buf[..end])?;
+    req.leftover = buf[(end + 4).min(buf.len())..].to_vec();
+    Ok(req)
 }
 
 pub fn parse(head: &[u8]) -> Result<Req, u16> {
@@ -56,16 +73,19 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
     if p.next().is_some() || !(version == "HTTP/1.1" || version == "HTTP/1.0") {
         return Err(400);
     }
-    let head_only = match method {
-        "GET" => false,
-        "HEAD" => true,
+    let method = match method {
+        "GET" => Method::Get,
+        "HEAD" => Method::Head,
+        "PUT" => Method::Put,
+        "POST" => Method::Post,
         _ => return Err(405),
     };
+    let head_only = method == Method::Head;
     if !target.starts_with('/') || target.contains('#') || target.bytes().any(|b| b < 0x21 || b == 0x7f) {
         return Err(400);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut req = Req { head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None };
+    let mut req = Req { method, head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None, content_length: 0, origin: None, host: None, xfb: false, leftover: Vec::new() };
     let mut n = 0;
     for l in lines {
         n += 1;
@@ -81,7 +101,16 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
             "range" => req.range = Some(v.to_string()),
             "if-none-match" => req.inm = Some(v.to_string()),
             "transfer-encoding" => return Err(400),
-            "content-length" if v != "0" => return Err(400),
+            "content-length" => {
+                req.content_length = v.parse::<u64>().map_err(|_| 400u16)?;
+                // un GET con cuerpo no tiene sentido aquí
+                if req.content_length != 0 && matches!(method, Method::Get | Method::Head) {
+                    return Err(400);
+                }
+            }
+            "origin" => req.origin = Some(v.to_string()),
+            "host" => req.host = Some(v.to_string()),
+            "x-fb" => req.xfb = v == "1",
             _ => {}
         }
     }
@@ -95,13 +124,19 @@ pub fn reason(code: u16) -> &'static str {
         301 => "Moved Permanently",
         304 => "Not Modified",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Payload Too Large",
         416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Error",
     }
 }
@@ -139,7 +174,7 @@ pub fn send(w: &mut impl Write, code: u16, ctype: &str, body: &[u8], head_only: 
 
 /// Error simple de texto.
 pub fn error(w: &mut impl Write, code: u16, head_only: bool) -> io::Result<()> {
-    let extra = if code == 405 { vec![("Allow", "GET, HEAD".to_string())] } else { Vec::new() };
+    let extra = if code == 405 { vec![("Allow", "GET, HEAD, PUT, POST".to_string())] } else { Vec::new() };
     send(w, code, "text/plain; charset=utf-8", format!("{code} {}\n", reason(code)).as_bytes(), head_only, &extra)
 }
 
@@ -195,7 +230,9 @@ mod tests {
     fn peticiones_validas_e_invalidas() {
         let r = req("GET /s/abc/?x=1 HTTP/1.1\r\nHost: a\r\nRange: bytes=0-9").unwrap();
         assert_eq!((r.path.as_str(), r.query.as_str(), r.range.as_deref()), ("/s/abc/", "x=1", Some("bytes=0-9")));
-        assert_eq!(req("POST / HTTP/1.1").err(), Some(405));
+        assert_eq!(req("DELETE / HTTP/1.1").err(), Some(405));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: 5\r\nOrigin: http://a\r\nX-FB: 1").map(|r| (r.method, r.content_length, r.xfb)).ok(), Some((Method::Put, 5, true)));
+        assert_eq!(req("PUT /x HTTP/1.1\r\nContent-Length: -1").err(), Some(400));
         assert_eq!(req("GET / HTTP/2").err(), Some(400));
         assert_eq!(req("GET http://x/ HTTP/1.1").err(), Some(400));
         assert_eq!(req("GET /a b HTTP/1.1").err(), Some(400));
