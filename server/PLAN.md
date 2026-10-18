@@ -13,8 +13,8 @@ con el menor tamaño y la menor superficie de ataque posibles. Sin cuentas, sin 
 sin panel de administración.
 
 ## No objetivos (v1)
-- Subir, borrar, renombrar o editar archivos (solo lectura).
-- Usuarios y permisos múltiples.
+- Subir, borrar, renombrar o editar archivos por defecto (solo lectura; la escritura es opt-in con `--write`, ver M4).
+- Usuarios y permisos múltiples (hay un único usuario opcional, `--user`).
 - Exposición directa a internet (se recomienda túnel: Tailscale, WireGuard, Cloudflare Tunnel).
 - Streaming con transcodificación, WebDAV, SMB.
 
@@ -22,7 +22,7 @@ sin panel de administración.
 ```
 filebrowser-server ~/Documentos ~/Fotos        # comparte esas carpetas
 filebrowser-server --port 8080 --bind 0.0.0.0  # por defecto: 127.0.0.1 y puerto aleatorio
-filebrowser-server --ttl 2h --read-only        # caduca; solo lectura (único modo en v1)
+filebrowser-server --ttl 2h --read-only        # caduca; solo lectura (modo por defecto)
 ```
 Al arrancar imprime una URL con token: `http://192.168.1.20:41873/s/<token>/` y un QR en terminal.
 Ctrl+C la invalida. El token no se guarda en disco.
@@ -96,6 +96,22 @@ Ctrl+C la invalida. El token no se guarda en disco.
   **Aceptado y documentado:** lectura muy lenta con token puede retener hilos (tope de 8 por IP); el bloqueo por IP afecta a clientes tras
   un mismo NAT/túnel; un ZIP que supera los topes o con archivos ilegibles se cierra válido pero incompleto; el PDF inline no lleva `sandbox`
   (el visor del navegador lo ejecuta aislado; `?dl=1` lo fuerza a descarga); sin HSTS con `--tls`.
+
+- **M4 (hecho)** **Interfaz web = el propio gestor compilado a WebAssembly** (`/s/<token>/app/`, `server/build-web.sh`), no una
+  reimplementación. La capa `src/vfs/` del gestor sustituye `std::fs`/`std::thread` en wasm: archivos por XHR síncrono al servidor
+  (listados con caché de 3 s, lecturas por rangos de 512 KiB), hilos ejecutados en línea, zona local en memoria para temporales,
+  configuración en `localStorage`. Sin terminal, 3D por GPU, audio, RAR/7z ni papelera (el borrado es definitivo).
+- **M5 (hecho)** `--write` (+ `--max-upload`): `PUT /s/<tok>/<ruta>` (escribe a `.fbtmp-*` y renombra; reemplaza archivos, no carpetas)
+  y `POST /s/<tok>/api/op?op=mkdir|mkdirs|rm|rmdir|rmrf|mv|cp`. Cada petición que modifica exige `X-FB: 1` y `Origin` igual a `Host`
+  (frente a CSRF desde otras webs), pasa por la misma jaula que la lectura, rechaza nombres ocultos, no toca nunca las raíces ni sigue
+  enlaces que salgan de ellas, limita `mv`/`cp` a la misma raíz, aplica el tope de tamaño y plazo por lectura (30 s) y deja un registro
+  `[escritura]` en stderr. Tests de extremo a extremo en `write.rs`.
+- **M6 (hecho)** `--user` (+ `FB_PASSWORD` o `--password-file`, mínimo 8 caracteres): HTTP Basic además del token; comparación en tiempo
+  constante y los fallos cuentan para el bloqueo por IP. **Aceptado:** sin `--tls` (o túnel) la contraseña viaja sin cifrar (aviso al
+  arrancar); un solo usuario, sin cierre de sesión. No se permite compartir `/` entero.
+- **Limitaciones aceptadas de la interfaz web:** cada consulta de metadatos es una petición síncrona (carpetas enormes van lentas);
+  la búsqueda de contenido se hace en el hilo de la interfaz con tope de 3000 archivos; los duplicados y el cálculo de hashes bloquean
+  la página mientras duran; las miniaturas solo se decodifican para imágenes ≤ 4 MiB; copiar/mover entre raíces distintas no es posible.
 
 ## Decisiones abiertas
 - ~~`tiny_http` o servidor propio~~: resuelto, servidor propio sobre `std::net` (sin dependencias de red, ~400 líneas de HTTP/enrutado a auditar).
