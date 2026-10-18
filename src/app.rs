@@ -267,6 +267,7 @@ struct CompressDlg {
 }
 
 /// Datos para conectar con un recurso de red (la contraseña solo vive en memoria).
+#[derive(Clone)]
 struct NetLogin {
     uri: String,
     user: String,
@@ -560,6 +561,11 @@ pub struct App {
     trash_rows: Arc<std::sync::Mutex<Vec<extras::TrashRow>>>,
     trash_job: Option<std::sync::mpsc::Receiver<Result<(bool, usize), String>>>,
     confirm_purge: Option<PurgeReq>,
+    /// Programa que se ejecutaría con doble clic o Enter: antes se pregunta.
+    confirm_run: Option<PathBuf>,
+    /// Clave de un servidor SSH nuevo y los datos con los que se intentaba conectar.
+    host_key: Option<(crate::sftp::PendingKey, NetLogin)>,
+    net_last: Option<NetLogin>,
     quit_ok: bool,
     /// descripción de la operación en curso
     op_desc: String,
@@ -1267,6 +1273,9 @@ impl App {
             trash_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
             trash_job: None,
             confirm_purge: None,
+            confirm_run: None,
+            host_key: None,
+            net_last: None,
             quit_ok: false,
             op_desc: String::new(),
             theme_anim: None,
@@ -2080,7 +2089,8 @@ impl App {
             self.note_recent(&p);
             self.open_archive(p);
         } else if is_program(&p) {
-            self.run_program(&p);
+            // ejecutar un archivo es una decisión explícita: se pregunta (el menú contextual «Ejecutar» no)
+            self.confirm_run = Some(p);
         } else if self.touch && matches!(e.kind, Kind::Image | Kind::Text | Kind::Doc | Kind::Audio | Kind::Video) {
             self.note_recent(&p);
             self.open_preview_at(i);
@@ -4111,6 +4121,7 @@ impl App {
 
     /// Monta con `gio mount`; si la dirección no indica recurso, monta cada recurso compartido.
     fn start_mount(&mut self, l: &NetLogin) {
+        self.net_last = Some(l.clone());
         #[cfg(target_os = "linux")]
         {
             let uri = l.uri.trim().to_string();
@@ -7898,6 +7909,99 @@ impl App {
         }
     }
 
+    /// Pregunta antes de ejecutar un programa abierto con doble clic o Enter.
+    fn run_dialog(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.confirm_run else { return };
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        let mut decision: Option<bool> = None;
+        let pal = self.pal;
+        theme::modal_card(
+            ctx,
+            &pal,
+            theme::Tone::Warn,
+            t("¿Ejecutar este programa?"),
+            420.0,
+            |ui| {
+                ui.label(egui::RichText::new(name).strong());
+                ui.label(egui::RichText::new(dir).color(pal.subtle).size(12.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(t("Es un programa: se ejecutará con tus permisos. Ejecútalo solo si confías en su origen.")).color(pal.subtle));
+            },
+            |ui| {
+                if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Ejecutar")).clicked() {
+                    decision = Some(true);
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                    decision = Some(false);
+                }
+            },
+        );
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            decision = Some(false);
+        }
+        match decision {
+            Some(true) => {
+                if let Some(p) = self.confirm_run.take() {
+                    self.run_program(&p);
+                }
+            }
+            Some(false) => self.confirm_run = None,
+            None => {}
+        }
+    }
+
+    /// Muestra la huella de un servidor SSH nuevo y deja que el usuario decida si confía en él.
+    fn host_key_dialog(&mut self, ctx: &egui::Context) {
+        let Some((k, _)) = &self.host_key else { return };
+        let host = match k.port {
+            Some(p) if p != 22 => format!("{}:{p}", k.host),
+            _ => k.host.clone(),
+        };
+        let prints = k.fingerprints.clone();
+        let mut decision: Option<bool> = None;
+        let pal = self.pal;
+        theme::modal_card(
+            ctx,
+            &pal,
+            theme::Tone::Warn,
+            t("Servidor desconocido"),
+            520.0,
+            |ui| {
+                ui.label(egui::RichText::new(host).strong());
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(t("Es la primera vez que te conectas. Comprueba que esta huella coincide con la del servidor antes de continuar; si no, alguien podría estar suplantándolo.")).color(pal.subtle));
+                ui.add_space(6.0);
+                for p in &prints {
+                    ui.add(egui::Label::new(egui::RichText::new(p).monospace().size(12.0)).wrap());
+                }
+            },
+            |ui| {
+                if theme::dialog_button(ui, &pal, theme::Btn::Primary, t("Confiar y conectar")).clicked() {
+                    decision = Some(true);
+                }
+                if theme::dialog_button(ui, &pal, theme::Btn::Plain, t("Cancelar")).clicked() {
+                    decision = Some(false);
+                }
+            },
+        );
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            decision = Some(false);
+        }
+        match decision {
+            Some(true) => {
+                if let Some((k, l)) = self.host_key.take() {
+                    match crate::sftp::trust_host(&k) {
+                        Ok(()) => self.start_mount(&l),
+                        Err(e) => self.say(tf("No se pudo conectar: {}", &[&e]), true),
+                    }
+                }
+            }
+            Some(false) => self.host_key = None,
+            None => {}
+        }
+    }
+
     fn conflict_dialog(&mut self, ctx: &egui::Context) {
         let Some(c) = self.conflict.take() else { return };
         let mut choice: Option<Option<Policy>> = None; // Some(None) = cancelar
@@ -9398,6 +9502,11 @@ impl App {
                         }
                     }
                 }
+                "run" => self.confirm_run = Some(self.cwd.join("programa")),
+                "hostkey" => {
+                    let k = crate::sftp::PendingKey::sample();
+                    self.host_key = Some((k, NetLogin { uri: "sftp://servidor".into(), user: String::new(), domain: String::new(), pass: String::new(), anon: false }));
+                }
                 "batch" => {
                     self.select_range(0, 3, false);
                     self.open_batch();
@@ -9638,7 +9747,14 @@ impl eframe::App for App {
         }
         let nerr = self.net_err.lock().unwrap().take();
         if let Some(m) = nerr {
-            self.say(tf("No se pudo conectar: {}", &[&m]), true);
+            match (m == crate::sftp::HOSTKEY, crate::sftp::take_pending_key(), self.net_last.clone()) {
+                // servidor SSH nuevo: el usuario comprueba la huella antes de confiar en él
+                (true, Some(k), Some(l)) => {
+                    self.msg = None;
+                    self.host_key = Some((k, l));
+                }
+                _ => self.say(tf("No se pudo conectar: {}", &[&m]), true),
+            }
         }
         let shares = self.net_shares.lock().unwrap().take();
         if let Some(sh) = shares {
@@ -9716,7 +9832,7 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(1500));
 
-        let modal = !matches!(self.dlg, Dlg::None) || self.confirm_delete.is_some() || self.confirm_purge.is_some() || self.conflict.is_some() || self.quit_ask;
+        let modal = !matches!(self.dlg, Dlg::None) || self.confirm_delete.is_some() || self.confirm_purge.is_some() || self.conflict.is_some() || self.quit_ask || self.confirm_run.is_some() || self.host_key.is_some();
         if !modal {
             self.handle_keys(&ctx);
         }
@@ -9960,6 +10076,8 @@ impl eframe::App for App {
         self.palette_window(&ctx);
         self.confirm_dialog(&ctx);
         self.purge_dialog(&ctx);
+        self.run_dialog(&ctx);
+        self.host_key_dialog(&ctx);
         self.trash_poll();
         self.conflict_dialog(&ctx);
         self.dialogs(&ctx);

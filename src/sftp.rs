@@ -402,8 +402,9 @@ pub struct Conn {
 pub fn askpass_main() {
     if let Ok(pw) = std::env::var("FB_ASKPASS_PW") {
         let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
+        // la clave del servidor solo la acepta el usuario desde el diálogo, nunca esta respuesta automática
         if prompt.contains("(yes/no") || prompt.contains("continue connecting") {
-            println!("yes");
+            println!("no");
         } else {
             println!("{pw}");
         }
@@ -414,7 +415,7 @@ pub fn askpass_main() {
 fn spawn_ssh(c: &Conn) -> Result<Client, String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new("ssh");
-    cmd.args(["-s", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20", "-o", "NumberOfPasswordPrompts=1"]);
+    cmd.args(["-s", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20", "-o", "NumberOfPasswordPrompts=1"]);
     if let Some(p) = c.port {
         cmd.arg("-p").arg(p.to_string());
     }
@@ -580,8 +581,132 @@ impl Session {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Clave del servidor (known_hosts): se muestra la huella y el usuario decide
+// ---------------------------------------------------------------------------
+
+/// Texto de error con el que `connect` avisa de que falta confirmar la clave del servidor.
+pub const HOSTKEY: &str = "HOSTKEY";
+
+/// Clave de un servidor nuevo, a la espera de que el usuario compruebe la huella.
+#[derive(Clone)]
+pub struct PendingKey {
+    pub host: String,
+    pub port: Option<u16>,
+    /// Huellas legibles («256 SHA256:… (ED25519)»).
+    pub fingerprints: Vec<String>,
+    /// Líneas de `known_hosts` que se guardan si el usuario confía.
+    scan: String,
+}
+
+impl PendingKey {
+    /// Datos de ejemplo para las capturas de prueba.
+    pub fn sample() -> PendingKey {
+        PendingKey {
+            host: "servidor.ejemplo.org".into(),
+            port: Some(2222),
+            fingerprints: vec!["256 SHA256:RCgIfsoyy+AtpGpjF4bsr9HfIc1MMo0N26m101FB8hc (ED25519)".into(), "3072 SHA256:u2kXr0p9mYvC1nQeLzTb5aVhWd8JsGfN4oRiE7yKcXA (RSA)".into()],
+            scan: String::new(),
+        }
+    }
+}
+
+static PENDING: Mutex<Option<PendingKey>> = Mutex::new(None);
+
+pub fn take_pending_key() -> Option<PendingKey> {
+    PENDING.lock().ok()?.take()
+}
+
+fn hide_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let _ = cmd;
+}
+
+fn known_hosts_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".ssh").join("known_hosts"))
+}
+
+/// ¿Está ya el servidor en `known_hosts`? Si no, deja su clave pendiente y devuelve `HOSTKEY`.
+fn check_host(conn: &Conn) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let entry = match conn.port {
+        Some(p) if p != 22 => format!("[{}]:{p}", conn.host),
+        _ => conn.host.clone(),
+    };
+    let mut c = Command::new("ssh-keygen");
+    c.args(["-F", &entry]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    hide_console(&mut c);
+    if let Ok(o) = c.output() {
+        if o.status.success() && !o.stdout.is_empty() {
+            return Ok(());
+        }
+    }
+    // servidor nuevo: se pide su clave pública y se calcula la huella para enseñársela al usuario
+    let mut k = Command::new("ssh-keyscan");
+    k.args(["-T", "10"]);
+    if let Some(p) = conn.port {
+        k.arg("-p").arg(p.to_string());
+    }
+    k.arg("--").arg(&conn.host).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    hide_console(&mut k);
+    let scan = k.output().map_err(|e| format!("ssh-keyscan: {e}"))?;
+    let scan = String::from_utf8_lossy(&scan.stdout).lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+    if scan.trim().is_empty() {
+        return Err("no se pudo obtener la clave del servidor".into());
+    }
+    let mut f = Command::new("ssh-keygen");
+    f.args(["-l", "-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    hide_console(&mut f);
+    let mut child = f.spawn().map_err(|e| format!("ssh-keygen: {e}"))?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(scan.as_bytes());
+        let _ = si.write_all(b"\n");
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let fingerprints: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            // «256 SHA256:abc host (ED25519)» -> sin el nombre del host
+            let mut p: Vec<&str> = l.split_whitespace().collect();
+            if p.len() >= 4 {
+                p.remove(2);
+            }
+            p.join(" ")
+        })
+        .filter(|l| !l.is_empty())
+        .take(6)
+        .collect();
+    if fingerprints.is_empty() {
+        return Err("no se pudo calcular la huella del servidor".into());
+    }
+    *PENDING.lock().unwrap() = Some(PendingKey { host: conn.host.clone(), port: conn.port, fingerprints, scan });
+    Err(HOSTKEY.into())
+}
+
+/// El usuario ha comprobado la huella: se guarda la clave en `known_hosts`.
+pub fn trust_host(k: &PendingKey) -> Result<(), String> {
+    use std::io::Write;
+    let path = known_hosts_path().ok_or("no se encontró la carpeta personal")?;
+    if let Some(d) = path.parent() {
+        crate::fsys::private_dir(d);
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+    // si el archivo no acaba en salto de línea, se añade para no pegar la clave a la anterior
+    let needs_nl = std::fs::read(&path).map(|b| !b.is_empty() && b.last() != Some(&b'\n')).unwrap_or(false);
+    if needs_nl {
+        f.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    f.write_all(k.scan.as_bytes()).and_then(|_| f.write_all(b"\n")).map_err(|e| e.to_string())
+}
+
 /// Conecta con un servidor y devuelve la carpeta local que refleja su carpeta personal (o `path`).
 pub fn connect(conn: Conn, path: &str) -> Result<PathBuf, String> {
+    check_host(&conn)?;
     let key = format!("{}@{}{}", if conn.user.is_empty() { "_" } else { &conn.user }, conn.host, conn.port.map(|p| format!("_{p}")).unwrap_or_default());
     let root = cache_root().join(local_name(&key));
     let sess = {
