@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn AMediaExtractor_seekTo(e: *mut c_void, us: i64, mode: c_int) -> Status;
 
     fn AMediaFormat_delete(f: *mut c_void) -> Status;
+    fn AMediaFormat_setInt32(f: *mut c_void, name: *const std::ffi::c_char, v: i32);
     fn AMediaFormat_getInt32(f: *mut c_void, name: *const std::ffi::c_char, out: *mut i32) -> bool;
     fn AMediaFormat_getInt64(f: *mut c_void, name: *const std::ffi::c_char, out: *mut i64) -> bool;
     fn AMediaFormat_getString(f: *mut c_void, name: *const std::ffi::c_char, out: *mut *const std::ffi::c_char) -> bool;
@@ -310,6 +311,18 @@ unsafe fn image_to_rgba(img: *mut c_void, max_w: usize) -> Option<(usize, usize,
             }
             *p = (d, l.max(0) as usize, rs.max(0) as usize, ps.max(1) as usize);
         }
+        convert(pl, w, h, max_w)
+    }
+}
+
+type Plane = (*mut u8, usize, usize, usize); // datos, longitud, bytes por fila, bytes por píxel
+
+/// YUV 4:2:0 (tres planos) a RGBA, reduciendo a como mucho `max_w` de ancho.
+unsafe fn convert(pl: [Plane; 3], w: usize, h: usize, max_w: usize) -> Option<(usize, usize, Vec<u8>)> {
+    unsafe {
+        if w < 2 || h < 2 {
+            return None;
+        }
         // que ningún acceso se salga del búfer
         let (cw, ch) = (w / 2, h / 2);
         let need = |p: usize, rows: usize, cols: usize| (rows - 1) * pl[p].2 + (cols - 1) * pl[p].3 < pl[p].1;
@@ -340,6 +353,42 @@ unsafe fn image_to_rgba(img: *mut c_void, max_w: usize) -> Option<(usize, usize,
     }
 }
 
+/// Fotograma en un búfer de salida del códec (sin superficie): NV12 o I420 con el stride y las
+/// alturas que declara el formato de salida.
+unsafe fn buffer_to_rgba(p: *mut u8, len: usize, f: &Fmt, max_w: usize) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+    unsafe {
+        let w = f.i32(c"width").unwrap_or(0).max(0) as usize;
+        let h = f.i32(c"height").unwrap_or(0).max(0) as usize;
+        let stride = f.i32(c"stride").unwrap_or(w as i32).max(w as i32) as usize;
+        let sh = f.i32(c"slice-height").unwrap_or(h as i32).max(h as i32) as usize;
+        let cf = f.i32(c"color-format").unwrap_or(21);
+        let (left, top) = (f.i32(c"crop-left").unwrap_or(0).max(0) as usize, f.i32(c"crop-top").unwrap_or(0).max(0) as usize);
+        let cw = f.i32(c"crop-right").map(|r| r as usize + 1).unwrap_or(w).saturating_sub(left);
+        let chh = f.i32(c"crop-bottom").map(|r| r as usize + 1).unwrap_or(h).saturating_sub(top);
+        if w == 0 || h == 0 || p.is_null() || len < stride * sh {
+            return Ok(None);
+        }
+        let ybase = stride * sh;
+        let y: Plane = (p.add(top * stride + left), len - (top * stride + left), stride, 1);
+        let (u, v): (Plane, Plane) = match cf {
+            // semiplanar (NV12): UVUV…; 0x7F420888 («flexible») casi siempre llega así
+            21 | 0x7F42_0888 => {
+                let (off, rs) = (ybase + (top / 2) * stride + (left / 2) * 2, stride);
+                ((p.add(off), len.saturating_sub(off), rs, 2), (p.add(off + 1), len.saturating_sub(off + 1), rs, 2))
+            }
+            // planar (I420)
+            19 => {
+                let cs = stride / 2;
+                let uoff = ybase + (top / 2) * cs + left / 2;
+                let voff = ybase + cs * (sh / 2) + (top / 2) * cs + left / 2;
+                ((p.add(uoff), len.saturating_sub(uoff), cs, 1), (p.add(voff), len.saturating_sub(voff), cs, 1))
+            }
+            other => return Err(format!("formato de color de vídeo no admitido ({other:#x})")),
+        };
+        Ok(convert([y, u, v], cw, chh, max_w))
+    }
+}
+
 /// Gira un RGBA `deg` grados (90, 180, 270) en sentido horario.
 fn rotate(w: usize, h: usize, px: Vec<u8>, deg: i32) -> (usize, usize, Vec<u8>) {
     let mut out = vec![0u8; px.len()];
@@ -364,7 +413,12 @@ pub struct Opts {
     /// al ritmo del reloj (reproductor) o lo más rápido posible (miniatura)
     pub realtime: bool,
     pub max_w: usize,
+    /// salida en búfer en vez de superficie (respaldo si la superficie no entrega imágenes)
+    pub bytes: bool,
 }
+
+/// Error que pide repetir con `Opts::bytes`.
+pub const NO_SURFACE: &str = "sin imágenes de la superficie";
 
 /// Decodifica `path` desde `start_us`. Cada fotograma pasa a `on_frame` (devuelve `false` para parar).
 /// `Ok(true)` si se llegó al final del archivo.
@@ -385,17 +439,23 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
                 return Err("tamaño de vídeo no válido".into());
             }
-            let mut r = std::ptr::null_mut();
-            if AImageReader_new(w, h, YUV_420_888, 3, &mut r) != 0 || r.is_null() {
-                return Err("no se pudo crear el lector de imágenes".into());
+            if o.bytes {
+                // salida en búfer: se pide un formato plano/semiplano de 8 bits
+                AMediaFormat_setInt32(v.fmt.0, c"color-format".as_ptr(), 0x7F42_0888);
+                vcodec = Some(make_codec(v, std::ptr::null_mut())?);
+            } else {
+                let mut r = std::ptr::null_mut();
+                if AImageReader_new(w, h, YUV_420_888, 3, &mut r) != 0 || r.is_null() {
+                    return Err("no se pudo crear el lector de imágenes".into());
+                }
+                let r = Reader(r);
+                let mut win = std::ptr::null_mut();
+                if AImageReader_getWindow(r.0, &mut win) != 0 || win.is_null() {
+                    return Err("sin superficie de salida".into());
+                }
+                vcodec = Some(make_codec(v, win)?);
+                reader = Some(r);
             }
-            let r = Reader(r);
-            let mut win = std::ptr::null_mut();
-            if AImageReader_getWindow(r.0, &mut win) != 0 || win.is_null() {
-                return Err("sin superficie de salida".into());
-            }
-            vcodec = Some(make_codec(v, win)?);
-            reader = Some(r);
         }
         let mut acodec = None;
         if let Some(a) = &audio {
@@ -417,9 +477,10 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
         let (mut file_end, mut v_eos, mut a_eos) = (false, false, false);
         let (mut v_done, mut a_done) = (video.is_none(), audio.is_none());
         let mut audio_off = false;
-        let mut pending: Option<(usize, i64)> = None; // fotograma de vídeo a la espera de su hora
+        let mut pending: Option<(usize, i64, BufInfo)> = None; // fotograma de vídeo a la espera de su hora
         let mut anchor: Option<(Instant, i64)> = None; // reloj sin audio: (instante, pts)
         let mut shown_any = false;
+        let mut released = 0u32;
         let mut idle_rounds = 0u32;
 
         let clock = |sink: &Option<Sink>, anchor: &Option<(Instant, i64)>| -> i64 {
@@ -560,7 +621,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             }
 
             // --- salida de vídeo
-            if let (Some(c), Some(r)) = (&vcodec, &reader) {
+            if let Some(c) = &vcodec {
                 if !v_done {
                     if pending.is_none() {
                         let mut info = BufInfo::default();
@@ -573,39 +634,55 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                             } else if info.pts < start_us - 20_000 {
                                 AMediaCodec_releaseOutputBuffer(c.0, i as usize, false); // antes del punto pedido
                             } else {
-                                pending = Some((i as usize, info.pts));
+                                pending = Some((i as usize, info.pts, info));
                             }
                         } else if i != TRY_AGAIN && i != FORMAT_CHANGED && i != -3 {
                             return Err(format!("error del decodificador de vídeo ({i})"));
                         }
                     }
-                    if let Some((i, pts)) = pending {
+                    if let Some((i, pts, info)) = pending {
                         let due = !o.realtime || (sink.is_none() && anchor.is_none()) || pts <= clock(&sink, &anchor) + 8_000;
                         // sin audio todavía en marcha, el primer fotograma sale de inmediato
                         if due {
-                            AMediaCodec_releaseOutputBuffer(c.0, i, true);
                             pending = None;
                             busy = true;
                             if !shown_any && sink.is_none() {
                                 anchor = Some((Instant::now(), pts));
                             }
-                            // el fotograma tarda un instante en llegar al lector
-                            let mut img = std::ptr::null_mut();
-                            for _ in 0..25 {
-                                if AImageReader_acquireLatestImage(r.0, &mut img) == 0 && !img.is_null() {
-                                    break;
-                                }
-                                img = std::ptr::null_mut();
-                                std::thread::sleep(Duration::from_millis(2));
-                            }
-                            if !img.is_null() {
-                                let frame = image_to_rgba(img, o.max_w).map(|(w, h, px)| if matches!(rot, 90 | 180 | 270) { rotate(w, h, px, rot) } else { (w, h, px) });
-                                AImage_delete(img);
-                                if let Some((w, h, px)) = frame {
-                                    shown_any = true;
-                                    if !on_frame(w, h, px) {
-                                        return Ok(false);
+                            let mut frame = None;
+                            if let Some(r) = &reader {
+                                AMediaCodec_releaseOutputBuffer(c.0, i, true);
+                                released += 1;
+                                // el fotograma tarda un instante en llegar al lector
+                                let mut img = std::ptr::null_mut();
+                                for _ in 0..40 {
+                                    if AImageReader_acquireLatestImage(r.0, &mut img) == 0 && !img.is_null() {
+                                        break;
                                     }
+                                    img = std::ptr::null_mut();
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                                if !img.is_null() {
+                                    frame = image_to_rgba(img, o.max_w);
+                                    AImage_delete(img);
+                                }
+                                if !shown_any && frame.is_none() && released >= 8 {
+                                    return Err(NO_SURFACE.into());
+                                }
+                            } else {
+                                let mut cap = 0usize;
+                                let p = AMediaCodec_getOutputBuffer(c.0, i, &mut cap);
+                                let (off, sz) = (info.offset.max(0) as usize, info.size.max(0) as usize);
+                                let f = Fmt(AMediaCodec_getOutputFormat(c.0));
+                                let r = if p.is_null() || f.0.is_null() || off + sz > cap { Ok(None) } else { buffer_to_rgba(p.add(off), sz, &f, o.max_w) };
+                                AMediaCodec_releaseOutputBuffer(c.0, i, false);
+                                frame = r?;
+                            }
+                            if let Some((w, h, px)) = frame {
+                                let (w, h, px) = if matches!(rot, 90 | 180 | 270) { rotate(w, h, px, rot) } else { (w, h, px) };
+                                shown_any = true;
+                                if !on_frame(w, h, px) {
+                                    return Ok(false);
                                 }
                             }
                         }
@@ -644,8 +721,8 @@ pub fn frame(path: &Path, max: u32) -> Option<crate::thumbs::Decoded> {
     if !info.has_video {
         return None;
     }
-    let o = Opts { audio: false, realtime: false, max_w: max.max(64) as usize };
-    let grab = |start_us: i64| -> Option<crate::thumbs::Decoded> {
+    let grab = |start_us: i64, bytes: bool| -> Option<crate::thumbs::Decoded> {
+        let o = Opts { audio: false, realtime: false, max_w: max.max(64) as usize, bytes };
         let mut got = None;
         let t0 = Instant::now();
         let alive = || t0.elapsed() < Duration::from_secs(20);
@@ -656,5 +733,5 @@ pub fn frame(path: &Path, max: u32) -> Option<crate::thumbs::Decoded> {
         got
     };
     let start = ((info.duration * 0.1).min(30.0) * 1e6) as i64;
-    grab(start).or_else(|| if start > 0 { grab(0) } else { None })
+    grab(start, false).or_else(|| grab(start, true)).or_else(|| if start > 0 { grab(0, true) } else { None })
 }

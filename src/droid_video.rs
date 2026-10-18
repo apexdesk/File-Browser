@@ -68,7 +68,7 @@ impl Player {
         let (shared, ctx, path) = (self.shared.clone(), self.ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
             let alive = || shared.epoch.load(Ordering::SeqCst) == g;
-            let o = crate::droid::Opts { audio: true, realtime: true, max_w: 1280 };
+            let mut o = crate::droid::Opts { audio: true, realtime: true, max_w: 1280, bytes: false };
             let mut on_frame = |w: usize, h: usize, px: Vec<u8>| {
                 if !alive() {
                     return false;
@@ -77,7 +77,13 @@ impl Player {
                 ctx.request_repaint();
                 true
             };
-            match crate::droid::run(&path, (pos * 1e6) as i64, &o, &alive, &mut on_frame) {
+            let mut res = crate::droid::run(&path, (pos * 1e6) as i64, &o, &alive, &mut on_frame);
+            if matches!(&res, Err(e) if e == crate::droid::NO_SURFACE) && alive() {
+                // la superficie no entrega imágenes en este móvil: se repite leyendo los búferes del códec
+                o.bytes = true;
+                res = crate::droid::run(&path, (pos * 1e6) as i64, &o, &alive, &mut on_frame);
+            }
+            match res {
                 Ok(_) => {}
                 Err(e) => *shared.error.lock().unwrap() = Some(e),
             }
