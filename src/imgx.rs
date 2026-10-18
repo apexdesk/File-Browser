@@ -68,6 +68,10 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
     if w == 0 || h == 0 || w * h > 100_000_000 || !matches!(depth, 8 | 16) || channels == 0 || channels > 5 {
         return None;
     }
+    // memoria real: planos de todos los canales a su profundidad (16 bits duplica)
+    if w.checked_mul(h).and_then(|p| p.checked_mul(channels.min(4) * (depth / 8))).map(|b| b > 256 << 20).unwrap_or(true) {
+        return None;
+    }
     // saltar color mode data, image resources y layer/mask info
     let mut p = 26;
     let n = be32(data.get(p..p + 4)?);

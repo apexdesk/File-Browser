@@ -10,7 +10,7 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
-    <application android:label="File Browser" android:icon="@mipmap/ic_launcher" android:hasCode="false" android:requestLegacyExternalStorage="true"
+    <application android:label="File Browser" android:icon="@mipmap/ic_launcher" android:hasCode="false" android:allowBackup="false" android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
         <activity
             android:name="android.app.NativeActivity"

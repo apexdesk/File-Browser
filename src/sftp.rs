@@ -342,6 +342,10 @@ impl Client {
                     T_DATA => {
                         let mut r = Rd { b: &b[4..], i: 0 };
                         let data = r.bytes()?;
+                        // un servidor hostil no puede enviar más de lo pedido ni vaciar el bloque para repetirlo sin fin
+                        if data.len() as u64 > len as u64 || (data.is_empty() && off < size) {
+                            return Err("respuesta no válida del servidor".into());
+                        }
                         f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
                         f.write_all(data).map_err(|e| e.to_string())?;
                         got += data.len() as u64;

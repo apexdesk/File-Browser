@@ -152,6 +152,17 @@ impl Index {
         if (0..n).any(|i| off[i] as usize + len[i] as usize > alen || (parent[i] != NO_PARENT && parent[i] as usize >= n)) {
             return None;
         }
+        // los padres no pueden formar ciclos: un índice manipulado colgaría las búsquedas
+        for i in 0..n {
+            let (mut cur, mut hops) = (i, 0u32);
+            while parent[cur] != NO_PARENT {
+                hops += 1;
+                if hops > 4096 {
+                    return None;
+                }
+                cur = parent[cur] as usize;
+            }
+        }
         Some(Index { arena, off, len, parent, dir, built })
     }
 }

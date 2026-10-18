@@ -85,7 +85,7 @@ fn open_rar(path: &Path, only_first: bool) -> Result<Comic, String> {
     }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join(format!("comic-{}-{stamp}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|_| fail())?;
+    crate::fsys::private_dir(&dir);
     let keep: Vec<String> = if only_first { names[..1].to_vec() } else { names.clone() };
     let mut cur = unrar::Archive::new(path).open_for_processing().map_err(|_| fail())?;
     let mut total = 0u64;

@@ -185,9 +185,26 @@ fn launch_registry_cmd(line: &str, path: &Path) {
     };
     let q = format!("\"{}\"", path.display());
     // si el comando ya entrecomilla «%1», no se duplican las comillas
-    let mut args = rest.clone();
-    for tok in ["%1", "%L", "%l", "%*", "%0"] {
-        args = args.replace(&format!("\"{tok}\""), &q).replace(tok, &q);
+    // una sola pasada: la ruta ya insertada no se vuelve a interpretar (un nombre con «%L» inyectaría argumentos)
+    let mut args = String::with_capacity(rest.len() + q.len());
+    let mut i = 0;
+    'scan: while i < rest.len() {
+        for tok in ["%1", "%L", "%l", "%*", "%0"] {
+            let quoted = format!("\"{tok}\"");
+            if rest[i..].starts_with(&quoted) {
+                args.push_str(&q);
+                i += quoted.len();
+                continue 'scan;
+            }
+            if rest[i..].starts_with(tok) {
+                args.push_str(&q);
+                i += tok.len();
+                continue 'scan;
+            }
+        }
+        let c = rest[i..].chars().next().unwrap();
+        args.push(c);
+        i += c.len_utf8();
     }
     if !rest.contains('%') {
         args.push(' ');

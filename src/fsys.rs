@@ -512,7 +512,9 @@ pub(crate) fn size_of_tree(p: &Path) -> u64 {
 
 /// Nombre temporal junto al destino para copiar antes de reemplazar.
 fn continue_with_tmp(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!(".fbrep-{}-{name}", std::process::id()))
+    // nombre impredecible: nadie puede dejar ahí un enlace simbólico a la espera
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    dir.join(format!(".fbrep-{}-{n:x}-{name}", std::process::id()))
 }
 
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {

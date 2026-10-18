@@ -459,6 +459,10 @@ fn load_ply(f: std::fs::File) -> Result<Mesh, String> {
                 }
             }
             if name == "vertex" {
+                // tope global: elementos sin propiedades agotarían la memoria sin leer ni un byte
+                if verts.len() >= 10_000_000 {
+                    return Err("demasiados vértices".into());
+                }
                 verts.push(xyz);
             } else if name == "face" {
                 for w in 1..idx.len().saturating_sub(1) {
@@ -718,7 +722,8 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
         return Err("compresión Draco no admitida".into());
     }
     let dir = path.parent().unwrap_or(Path::new("."));
-    let mut buffers = Vec::new();
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    let mut budget: usize = 512 << 20;
     for (i, b) in json.get("buffers").map(|b| b.arr()).unwrap_or(&[]).iter().enumerate() {
         buffers.push(match b.get("uri").and_then(|u| u.str()) {
             Some(u) if u.starts_with("data:") => b64(u.split_once(',').map(|x| x.1).unwrap_or("")),
@@ -734,6 +739,9 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
                     Ok(m) if m.is_file() && m.len() <= 512 << 20 => {}
                     _ => return Err("buffer no válido".into()),
                 }
+                // presupuesto total: el mismo archivo grande repetido en cientos de buffers no se lee cientos de veces
+                let sz = std::fs::metadata(&bp).map(|m| m.len() as usize).unwrap_or(0);
+                budget = budget.checked_sub(sz).ok_or("buffers demasiado grandes")?;
                 std::fs::read(bp).map_err(|e| e.to_string())?
             }
             None if i == 0 => glb_bin.clone().ok_or("sin datos binarios")?,
@@ -812,7 +820,8 @@ impl Gltf {
         let buf = self.buffers.get(view.get("buffer")?.num()? as usize)?;
         let off = view.get("byteOffset").and_then(|x| x.num()).unwrap_or(0.0) as usize;
         let len = view.get("byteLength")?.num()? as usize;
-        buf.get(off..off + len).map(|b| b.to_vec())
+        // off y len salen de un f64 saturado: la suma sin comprobar abortaría la app
+        buf.get(off..off.checked_add(len)?).map(|b| b.to_vec())
     }
 
     fn decode_image(bytes: &[u8]) -> Option<crate::pbr::Image> {

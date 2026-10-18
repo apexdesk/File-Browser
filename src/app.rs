@@ -7441,6 +7441,9 @@ impl App {
         if busy {
             return;
         }
+        if let Some(par) = root.parent() {
+            fsys::private_dir(par);
+        }
         let _ = std::fs::remove_dir_all(&root);
         self.start_op(Op::Unzip { src: p.clone(), dst: root.clone(), pass: None }, OpMeta::OpenArchive { archive: p, root });
     }

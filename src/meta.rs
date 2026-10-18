@@ -238,7 +238,7 @@ fn mp4(path: &Path, v: &mut Vid) -> bool {
     // el índice (moov) puede estar al principio o al final: se salta mdat sin leerlo
     let mut moov = None;
     for _ in 0..64 {
-        if pos + 8 > len || f.seek(SeekFrom::Start(pos)).is_err() {
+        if pos.saturating_add(8) > len || f.seek(SeekFrom::Start(pos)).is_err() {
             break;
         }
         let mut h = [0u8; 16];

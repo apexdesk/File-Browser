@@ -78,6 +78,10 @@ impl Db {
             return None;
         }
         let usable = page - h[20] as usize;
+        // la especificación exige al menos 480: con menos las restas de las celdas desbordarían
+        if usable < 480 {
+            return None;
+        }
         let len = f.metadata().ok()?.len();
         Some(Db { f, visits: 0, page, usable, pages: len / page as u64, enc: u32::from_be_bytes([h[56], h[57], h[58], h[59]]) })
     }
