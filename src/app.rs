@@ -6019,6 +6019,11 @@ impl App {
                 self.terminal_here();
                 ui.close();
             }
+            #[cfg(not(target_os = "android"))]
+            if ui.button(t("Compartir esta carpeta…")).clicked() {
+                self.share_folder();
+                ui.close();
+            }
             if ui.button(t("Propiedades de la carpeta")).clicked() {
                 self.open_props();
                 ui.close();
@@ -6261,6 +6266,17 @@ fn is_program(_: &Path) -> bool {
 }
 
 /// ¿Lleva la ruta caracteres de control? Teclearla en el terminal permitiría inyectar órdenes.
+/// `filebrowser-server` junto al ejecutable del gestor o en el PATH.
+#[cfg(not(target_os = "android"))]
+fn server_exe() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "filebrowser-server.exe" } else { "filebrowser-server" };
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name)));
+    if let Some(p) = beside.filter(|p| p.is_file()) {
+        return Some(p);
+    }
+    std::env::var_os("PATH").and_then(|v| std::env::split_paths(&v).map(|d| d.join(name)).find(|p| p.is_file()))
+}
+
 fn has_ctl(p: &Path) -> bool {
     p.to_string_lossy().chars().any(|c| c.is_control())
 }
@@ -6686,6 +6702,47 @@ impl App {
         self.cfg.save();
     }
 
+    /// Lanza `filebrowser-server` (proyecto aparte, solo lectura) sobre la carpeta actual.
+    /// Se ejecuta a la vista, en el terminal integrado (en Windows, en una consola nueva), donde imprime el enlace y el QR.
+    #[cfg(not(target_os = "android"))]
+    fn share_folder(&mut self) {
+        let Some(exe) = server_exe() else {
+            self.say(t("filebrowser-server no está instalado junto al gestor ni en el PATH").into(), true);
+            return;
+        };
+        let dir = self.cwd.clone();
+        if has_ctl(&exe) || has_ctl(&dir) {
+            self.say(t("La ruta tiene caracteres de control: no se escribe en el terminal").into(), true);
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let bad = ['&', '|', '^', '%', '<', '>', '(', ')', '!', '"'];
+            if exe.to_string_lossy().contains(bad) || dir.to_string_lossy().contains(bad) {
+                self.say(t("La ruta tiene caracteres de control: no se escribe en el terminal").into(), true);
+                return;
+            }
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", "cmd", "/K"])
+                .arg(&exe)
+                .args(["--bind", "0.0.0.0", "--ttl", "2h"])
+                .arg(&dir)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let sq = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+            self.cfg.term_open = true;
+            self.ensure_term();
+            let line = format!("{} --bind 0.0.0.0 --ttl 2h {}\r", sq(&exe), sq(&dir));
+            if let Some(t) = &mut self.term {
+                t.send(line.as_bytes());
+                self.term_focus = true;
+            }
+            self.cfg.save();
+        }
+    }
+
     fn terminal_panel(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal;
         if self.term.as_ref().map(|t| !t.alive()).unwrap_or(true) {
@@ -6941,6 +6998,10 @@ impl App {
                 ui.separator();
                 if mi(ui, t("Abrir terminal aquí"), "", true) {
                     self.terminal_here();
+                }
+                #[cfg(not(target_os = "android"))]
+                if mi(ui, t("Compartir esta carpeta…"), "", true) {
+                    self.share_folder();
                 }
                 if mi(ui, t("Calcular tamaño / Propiedades"), "Alt+Enter", true) {
                     self.open_props();

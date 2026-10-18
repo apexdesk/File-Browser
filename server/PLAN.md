@@ -84,10 +84,18 @@ Ctrl+C la invalida. El token no se guarda en disco.
 - **M2 (hecho)** previsualización inline de lista cerrada (imágenes, vídeo, audio, PDF, texto), búsqueda por nombre
   (tope de 300 resultados, 3 s y 200 000 entradas) y vista previa perezosa de imágenes ≤ 1 MiB en el listado.
   Sin miniaturas generadas en el servidor: decodificar imágenes ajenas aquí añadiría superficie de ataque; las decodifica el navegador.
-- **M3 (hecho, salvo lo indicado)** `--tls`: HTTPS con certificado autofirmado de 30 días generado al arrancar (rustls + rcgen, característica
+- **M3 (hecho)** `--tls`: HTTPS con certificado autofirmado de 30 días generado al arrancar (rustls + rcgen, característica
   `tls` activa por defecto; `--no-default-features` da un binario de ~0,6 MB sin TLS) y huella SHA-256 impresa.
-  **No hecho a propósito:** entrada «Compartir» en el gestor (rompe la regla de no tocar el gestor; el servidor se lanza desde la terminal)
-  y auditoría de seguridad dedicada con agentes (pendiente de que se pida).
+  Entrada **«Compartir esta carpeta…»** en el gestor (menú contextual y menú principal; no en Android): solo busca
+  `filebrowser-server` junto al gestor o en el PATH y lo ejecuta a la vista en el terminal integrado (consola nueva en Windows) con
+  `--bind 0.0.0.0 --ttl 2h`. El gestor no enlaza código de red; sin el servidor instalado muestra un aviso.
+- **Auditoría (hecha, 3 agentes a ciegas: rutas/HTTP, DoS/ZIP/TLS, HTML/cabeceras).** Sin lectura fuera de la raíz ni caídas.
+  Corregido: plazo total para handshake TLS y cabeceras (antes un byte cada pocos segundos retenía el hilo), IPv6 agrupada por /64 en
+  los límites, `O_NOFOLLOW` al abrir archivos y ZIP (carrera con enlaces), rechazo de marcas bidi/ancho cero en nombres, cabeceras con
+  espacio antes de `:` (400), nombres reservados de Windows con espacio final y `COM¹²³`.
+  **Aceptado y documentado:** lectura muy lenta con token puede retener hilos (tope de 8 por IP); el bloqueo por IP afecta a clientes tras
+  un mismo NAT/túnel; un ZIP que supera los topes o con archivos ilegibles se cierra válido pero incompleto; el PDF inline no lleva `sandbox`
+  (el visor del navegador lo ejecuta aislado; `?dl=1` lo fuerza a descarga); sin HSTS con `--tls`.
 
 ## Decisiones abiertas
 - ~~`tiny_http` o servidor propio~~: resuelto, servidor propio sobre `std::net` (sin dependencias de red, ~400 líneas de HTTP/enrutado a auditar).

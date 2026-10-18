@@ -34,5 +34,13 @@ en memoria mientras el programa corre; sin él, todo responde 404.
   10 s para recibirlas, límite de conexiones simultáneas (global y 8 por IP) y de intentos fallidos por IP.
 - Cabeceras `nosniff`, `Content-Security-Policy` restrictiva, `Referrer-Policy: no-referrer`.
 - Se niega a ejecutarse como root/administrador sin `--i-know`.
-- Limitación conocida: entre la comprobación de la ruta y la apertura del archivo hay una ventana
-  mínima (TOCTOU) si alguien con acceso local cambia un enlace en ese instante.
+- Los archivos se abren con `O_NOFOLLOW` (Unix) para cerrar la carrera con enlaces simbólicos; un directorio
+  intermedio cambiado en ese instante por alguien con acceso local sigue siendo una ventana mínima.
+- Plazo total de 10 s para handshake TLS y cabeceras; las IPv6 se limitan por /64.
+- Limitaciones: la lectura muy lenta con el enlace en la mano puede retener hilos (8 por IP); tras un NAT
+  o túnel todos los clientes comparten IP y por tanto el bloqueo por intentos fallidos; un ZIP que supera
+  los topes (200 000 entradas) se cierra válido pero incompleto.
+
+## Desde el gestor
+«Compartir esta carpeta…» (menú contextual de la carpeta y menú principal) lanza este programa, si está
+junto al gestor o en el PATH, sobre la carpeta actual y lo muestra en el terminal integrado.
