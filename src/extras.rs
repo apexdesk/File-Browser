@@ -626,6 +626,7 @@ pub fn spawn_hash(path: PathBuf, ctx: egui::Context) -> Arc<HashJob> {
     let j = job.clone();
     std::thread::spawn(move || {
         let res = (|| -> Result<[String; 3], String> {
+            crate::sftp::ensure_local_with(&path, &j.cancel, &mut |_| {})?;
             let mut f = File::open(&path).map_err(|e| e.to_string())?;
             j.total.store(f.metadata().map(|m| m.len()).unwrap_or(0).max(1), Ordering::Relaxed);
             let (mut m, mut s1, mut s2) = (md5::Md5::new(), sha1::Sha1::new(), sha2::Sha256::new());
@@ -691,6 +692,7 @@ fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, j: &DupJob, ctx: &egui
 
 fn quick_hash(p: &Path, full: bool) -> Option<[u8; 32]> {
     use sha2::Digest as _;
+    crate::sftp::ensure_local(p).ok()?;
     let mut f = File::open(p).ok()?;
     let mut h = sha2::Sha256::new();
     let mut buf = vec![0u8; if full { 1 << 20 } else { 64 * 1024 }];

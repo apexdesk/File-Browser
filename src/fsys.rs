@@ -725,7 +725,8 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     if mv && src.parent() == Some(dst.as_path()) {
                         continue;
                     }
-                    if src.is_dir() && dst.starts_with(&src) {
+                    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                    if src.is_dir() && canon(&dst).starts_with(canon(&src)) {
                         p.errors.lock().unwrap().push(tf("{name}: no se puede copiar dentro de sí misma", &[&name]));
                         continue;
                     }
@@ -744,10 +745,19 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                         Policy::Replace => {
                             let t = dst.join(&name);
                             if fs::symlink_metadata(&t).is_ok() {
+                                // nunca reemplazar el propio origen ni una carpeta que lo contiene
+                                if canon(&src).starts_with(canon(&t)) {
+                                    p.errors.lock().unwrap().push(tf("{name}: no se puede reemplazar el propio origen o una carpeta que lo contiene", &[&name]));
+                                    continue;
+                                }
                                 // El elemento reemplazado va a la papelera para poder recuperarlo.
                                 if let Err(e) = crate::extras::trash_delete(&t) {
-                                    p.errors.lock().unwrap().push(format!("{name}: {e}"));
-                                    continue;
+                                    // sin papelera (Android…): se sobrescribe, que es lo que pide «Reemplazar»
+                                    let gone = if t.is_dir() && !t.is_symlink() { fs::remove_dir_all(&t) } else { fs::remove_file(&t) };
+                                    if let Err(e2) = gone {
+                                        p.errors.lock().unwrap().push(format!("{name}: {e} ({e2})"));
+                                        continue;
+                                    }
                                 }
                             }
                             t
@@ -763,7 +773,9 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                             // otro sistema de archivos: se copia y, sólo si todo salió bien, se borra el origen
                             Err(_) => copy_tree(&src, &target, &p, &mut buf).and_then(|failed| {
                                 if failed > 0 {
-                                    Ok(())
+                                    // copia incompleta: se conserva el origen y se avisa del fallo
+                                    let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+                                    Err(std::io::Error::other(t("la copia no se completó")))
                                 } else if src.is_dir() {
                                     fs::remove_dir_all(&src)
                                 } else {

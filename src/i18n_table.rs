@@ -532,4 +532,7 @@ pub const TABLE: &[[&str; 10]] = &[
     ["quedan {}", "{} left", "{} restantes", "noch {}", "faltam {}", "mancano {}", "осталось {}", "剩余 {}", "残り {}", "{} 남음"],
     ["{} de {}", "{} of {}", "{} sur {}", "{} von {}", "{} de {}", "{} di {}", "{} из {}", "{} / {}", "{} / {}", "{} / {}"],
     ["Errores: {}", "Errors: {}", "Erreurs : {}", "Fehler: {}", "Erros: {}", "Errori: {}", "Ошибки: {}", "错误：{}", "エラー: {}", "오류: {}"],
+    ["Nombre no válido", "Invalid name", "Nom non valide", "Ungültiger Name", "Nome inválido", "Nome non valido", "Недопустимое имя", "名称无效", "無効な名前", "잘못된 이름"],
+    ["la copia no se completó", "the copy did not complete", "la copie n'a pas abouti", "Kopie nicht abgeschlossen", "a cópia não foi concluída", "copia non completata", "копирование не завершено", "复制未完成", "コピーが完了しませんでした", "복사가 완료되지 않았습니다"],
+    ["{name}: no se puede reemplazar el propio origen o una carpeta que lo contiene", "{name}: cannot replace the source itself or a folder containing it", "{name} : impossible de remplacer la source ou un dossier qui la contient", "{name}: Quelle oder übergeordneter Ordner kann nicht ersetzt werden", "{name}: não é possível substituir a própria origem ou uma pasta que a contém", "{name}: impossibile sostituire l'origine o una cartella che la contiene", "{name}: нельзя заменить сам источник или содержащую его папку", "{name}：无法替换源本身或包含它的文件夹", "{name}: 元のアイテムやそれを含むフォルダーは置き換えられません", "{name}: 원본 자체나 이를 포함한 폴더는 바꿀 수 없습니다"],
 ];
