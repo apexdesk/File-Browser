@@ -159,6 +159,8 @@ pub fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.hovered.bg_stroke = Stroke::NONE;
     ctx.set_visuals(v);
+    // una muesca de la rueda mueve más y no se suaviza de más (el resto de listas y visores)
+    ctx.options_mut(|o| o.input_options.line_scroll_speed = 64.0);
     ctx.global_style_mut(|s| {
         s.animation_time = 0.0;
         s.spacing.item_spacing = vec2(8.0, 6.0);

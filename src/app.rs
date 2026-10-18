@@ -456,6 +456,9 @@ pub struct App {
     /// Inercia de desplazamiento: offset actual, velocidad (px/s) y muestras recientes (t, dy).
     kin_off: f32,
     kin_vel: f32,
+    /// fricción de la inercia actual (1/s) y hasta cuándo se atiende la rueda del ratón
+    kin_k: f32,
+    kin_wheel_until: f64,
     kin_hist: Vec<(f64, f32)>,
     /// Tema del sistema detectado fuera de winit: 0 = desconocido, 1 = claro, 2 = oscuro.
     sys_theme: Arc<std::sync::atomic::AtomicU8>,
@@ -1158,6 +1161,8 @@ impl App {
             sel_mode: false,
             kin_off: 0.0,
             kin_vel: 0.0,
+            kin_k: 1.4,
+            kin_wheel_until: 0.0,
             kin_hist: Vec::new(),
             sys_theme: sys_theme.clone(),
             load_err: None,
@@ -5437,38 +5442,66 @@ impl App {
             let modal = !matches!(self.dlg, Dlg::None) || self.preview.is_some() || egui::Popup::is_any_open(ui.ctx());
             self.tap_block = self.kin_vel != 0.0 || modal;
         }
-        let (now, dt, pdelta, down, key, pad) = ui.input(|i| {
+        let (now, dt, pdelta, down, key, pad, notch) = ui.input(|i| {
             let mut pad = 0.0f32;
+            let mut notch = 0.0f32;
             let mut wheel = false;
             let mut key = false;
             for e in &i.events {
                 match e {
                     egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. } => pad -= delta.y,
+                    // rueda del ratón: cada muesca da un impulso (ver más abajo)
+                    egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.any() => {
+                        notch -= delta.y * if matches!(unit, egui::MouseWheelUnit::Line) { 64.0 } else { area.height() * 0.9 }
+                    }
                     egui::Event::MouseWheel { .. } => wheel = true,
                     egui::Event::Key { pressed: true, .. } => key = true,
                     _ => {}
                 }
             }
-            (i.time, i.unstable_dt.min(0.05), i.pointer.delta(), i.pointer.any_down(), key || wheel, pad)
+            (i.time, i.unstable_dt.min(0.05), i.pointer.delta(), i.pointer.any_down(), key || wheel, pad, notch)
         });
+        // Rueda del ratón con inercia: cada muesca suma velocidad (giros seguidos aceleran) y la
+        // lista se desliza con rozamiento fuerte; así responde al instante y no «arrastra».
+        let over = ui.input(|i| i.pointer.hover_pos()).is_some_and(|q| area.contains(q));
+        if !self.touch && over {
+            if notch != 0.0 {
+                self.kin_wheel_until = now + 0.5;
+                let base = if self.kin_vel * notch > 0.0 { self.kin_vel } else { 0.0 };
+                self.kin_vel = (base + notch * 13.0).clamp(-8000.0, 8000.0);
+                self.kin_k = 7.0;
+                self.kin_hist.clear();
+            }
+            if now < self.kin_wheel_until {
+                // la rueda ya la gestionamos nosotros: que el ScrollArea no la aplique también
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+        }
         // velocidad media de la última fracción de gesto, medida hasta `end` (instante de referencia)
         let fling = |hist: &[(f64, f32)], end: f64| -> f32 {
             let w = 0.12;
             let sum: f32 = hist.iter().filter(|(t, _)| end - t <= w).map(|(_, d)| d).sum();
-            let v = (sum / w as f32 * 1.5).clamp(-9000.0, 9000.0);
+            let v = (sum / w as f32 * 1.8).clamp(-12000.0, 12000.0);
             if v.abs() < 60.0 { 0.0 } else { v }
         };
         if self.touch {
             let r = ui.interact(area, egui::Id::new(("kin_drag", self.live_side)), Sense::drag());
             if r.dragged() {
                 self.kin_vel = 0.0;
+                // el primer fotograma incluye el recorrido del umbral de arrastre, que si no se perdería
+                let dy = if r.drag_started() {
+                    ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(a, b)| b.y - a.y)).unwrap_or(pdelta.y)
+                } else {
+                    pdelta.y
+                };
                 self.kin_hist.retain(|(t, _)| now - t <= 0.1);
-                self.kin_hist.push((now, -pdelta.y * 1.25));
-                self.kin_off = (self.kin_off - pdelta.y * 1.25).clamp(0.0, max);
+                self.kin_hist.push((now, -dy * 1.25));
+                self.kin_off = (self.kin_off - dy * 1.25).clamp(0.0, max);
                 return Some(self.kin_off);
             }
             if r.drag_stopped() {
                 self.kin_vel = fling(&self.kin_hist, now);
+                self.kin_k = 1.4;
                 self.kin_hist.clear();
             }
         }
@@ -5480,6 +5513,7 @@ impl App {
         } else if let Some(&(t, _)) = self.kin_hist.last() {
             if now - t > 0.05 {
                 self.kin_vel = fling(&self.kin_hist, t);
+                self.kin_k = 1.4;
                 self.kin_hist.clear();
             } else {
                 self.ctx.request_repaint_after(Duration::from_millis(60));
@@ -5495,7 +5529,7 @@ impl App {
             if clamped != off {
                 self.kin_vel = 0.0;
             }
-            self.kin_vel *= (-1.7 * dt).exp();
+            self.kin_vel *= (-self.kin_k * dt).exp();
             if self.kin_vel.abs() < 10.0 {
                 self.kin_vel = 0.0;
             }
