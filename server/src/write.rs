@@ -243,3 +243,144 @@ fn copy(ctx: &Ctx, from: &[String], to: &[String]) -> Result<(), u16> {
         status_of(&e)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::jail::Root;
+    use crate::server::{serve, Ctx};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct Srv {
+        port: u16,
+        dir: PathBuf,
+    }
+
+    fn start(write: bool, max_upload: u64) -> Srv {
+        let dir = std::env::temp_dir().join(format!("fbs_w_{}_{}", std::process::id(), crate::write::rand_hex()));
+        std::fs::create_dir_all(dir.join("raiz/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("fuera")).unwrap();
+        std::fs::write(dir.join("fuera/secreto.txt"), "no").unwrap();
+        std::fs::write(dir.join("raiz/a.txt"), "hola").unwrap();
+        std::fs::write(dir.join("raiz/.oculto"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("fuera"), dir.join("raiz/enlace")).unwrap();
+        let root = Root { name: "raiz".into(), path: std::fs::canonicalize(dir.join("raiz")).unwrap() };
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let ctx = Ctx::new(vec![root], "tok".into(), false, write, max_upload, None);
+        std::thread::spawn(move || serve(l, Arc::new(ctx), 16));
+        Srv { port, dir }
+    }
+
+    /// Petición cruda; devuelve (código, cuerpo).
+    fn req(s: &Srv, method: &str, path: &str, headers: &[(&str, String)], body: &[u8]) -> (u16, String) {
+        let mut t = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        let mut h = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", s.port);
+        for (k, v) in headers {
+            h.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if method == "PUT" || method == "POST" {
+            h.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        h.push_str("\r\n");
+        t.write_all(h.as_bytes()).unwrap();
+        t.write_all(body).unwrap();
+        let mut out = Vec::new();
+        let _ = t.read_to_end(&mut out);
+        let txt = String::from_utf8_lossy(&out).into_owned();
+        let code = txt.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let body = txt.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (code, body)
+    }
+
+    fn good(s: &Srv) -> Vec<(&'static str, String)> {
+        vec![("X-FB", "1".into()), ("Origin", format!("http://127.0.0.1:{}", s.port))]
+    }
+
+    fn put(s: &Srv, p: &str, body: &[u8]) -> u16 {
+        req(s, "PUT", &format!("/s/tok/raiz/{p}"), &good(s), body).0
+    }
+
+    fn op(s: &Srv, q: &str) -> u16 {
+        req(s, "POST", &format!("/s/tok/api/op?{q}"), &good(s), b"").0
+    }
+
+    #[test]
+    fn solo_lectura_por_defecto() {
+        let s = start(false, 1 << 20);
+        assert_eq!(put(&s, "n.txt", b"x"), 405);
+        assert_eq!(op(&s, "op=mkdir&p=raiz/d"), 405);
+        assert!(!s.dir.join("raiz/n.txt").exists());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn exige_cabeceras_de_origen() {
+        let s = start(true, 1 << 20);
+        assert_eq!(req(&s, "PUT", "/s/tok/raiz/n.txt", &[], b"x").0, 403);
+        assert_eq!(req(&s, "PUT", "/s/tok/raiz/n.txt", &[("X-FB", "1".into())], b"x").0, 403);
+        let ajeno = vec![("X-FB", "1".into()), ("Origin", "http://evil.example".into())];
+        assert_eq!(req(&s, "PUT", "/s/tok/raiz/n.txt", &ajeno, b"x").0, 403);
+        assert!(!s.dir.join("raiz/n.txt").exists());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn subir_crear_mover_copiar_borrar() {
+        let s = start(true, 1 << 20);
+        assert_eq!(put(&s, "n.txt", b"contenido"), 200);
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/n.txt")).unwrap(), "contenido");
+        // un archivo existente se reemplaza de golpe (sin temporales); una carpeta no
+        assert_eq!(put(&s, "n.txt", b"otro"), 200);
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/n.txt")).unwrap(), "otro");
+        assert_eq!(put(&s, "sub", b"x"), 409);
+        assert_eq!(put(&s, "n.txt", b"contenido"), 200);
+        assert!(std::fs::read_dir(s.dir.join("raiz")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".fbtmp")));
+        assert_eq!(op(&s, "op=mkdir&p=raiz/nueva"), 200);
+        assert!(s.dir.join("raiz/nueva").is_dir());
+        assert_eq!(op(&s, "op=mv&p=raiz/n.txt&to=raiz/nueva/m.txt"), 200);
+        assert!(s.dir.join("raiz/nueva/m.txt").is_file() && !s.dir.join("raiz/n.txt").exists());
+        assert_eq!(op(&s, "op=cp&p=raiz/nueva/m.txt&to=raiz/c.txt"), 200);
+        assert_eq!(std::fs::read_to_string(s.dir.join("raiz/c.txt")).unwrap(), "contenido");
+        assert_eq!(op(&s, "op=rm&p=raiz/c.txt"), 200);
+        assert_eq!(op(&s, "op=rmrf&p=raiz/nueva"), 200);
+        assert!(!s.dir.join("raiz/nueva").exists());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn no_sale_de_la_carpeta_compartida() {
+        let s = start(true, 1 << 20);
+        assert_ne!(put(&s, "../fuera/x.txt", b"x"), 200);
+        assert_ne!(put(&s, "%2e%2e/fuera/x.txt", b"x"), 200);
+        assert_ne!(op(&s, "op=mv&p=raiz/a.txt&to=raiz/../../fuera/a.txt"), 200);
+        assert!(!s.dir.join("fuera/x.txt").exists() && !s.dir.join("fuera/a.txt").exists());
+        // nombres ocultos
+        assert_eq!(put(&s, ".nuevo", b"x"), 403);
+        assert_eq!(op(&s, "op=rm&p=raiz/.oculto"), 403);
+        assert!(s.dir.join("raiz/.oculto").exists());
+        // la raíz misma no se toca
+        assert_ne!(op(&s, "op=rmrf&p=raiz"), 200);
+        assert!(s.dir.join("raiz").is_dir());
+        // un enlace que sale de la raíz no deja escribir fuera
+        #[cfg(unix)]
+        {
+            assert_ne!(put(&s, "enlace/x.txt", b"x"), 200);
+            assert!(!s.dir.join("fuera/x.txt").exists());
+            assert_eq!(std::fs::read_to_string(s.dir.join("fuera/secreto.txt")).unwrap(), "no");
+        }
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn respeta_el_tope_de_subida() {
+        let s = start(true, 10);
+        assert_eq!(put(&s, "grande.bin", &[0u8; 64]), 413);
+        assert!(!s.dir.join("raiz/grande.bin").exists());
+        assert_eq!(put(&s, "ok.bin", &[0u8; 8]), 200);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+}
