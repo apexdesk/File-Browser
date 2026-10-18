@@ -40,7 +40,7 @@ fn image(path: &Path) -> Rows {
     let mut rows = Rows::new();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if !crate::imgx::handles(&ext) && ext != "svg" {
-        if let Ok(r) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+        if let Ok(r) = crate::thumbs::open_image(path) {
             if let Ok((w, h)) = r.into_dimensions() {
                 push(&mut rows, t("Dimensiones"), format!("{w} × {h}"));
             }
