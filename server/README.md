@@ -45,11 +45,9 @@ en memoria mientras el programa corre; sin él, todo responde 404.
 «Compartir esta carpeta…» (menú contextual de la carpeta y menú principal) lanza este programa, si está
 junto al gestor o en el PATH, sobre la carpeta actual y lo muestra en el terminal integrado.
 
-## Interfaz web (cliente egui en WebAssembly)
-`/s/<token>/app/` abre una interfaz con el mismo aspecto que el gestor de escritorio (comparte `src/theme.rs`):
-barra de herramientas, ruta, filtro, barra lateral con las carpetas compartidas, iconos o lista, historial,
-miniaturas de imágenes pequeñas (las decodifica el navegador) y apertura de archivos en pestaña nueva.
-El código está en `web/`; `web/build.sh` lo compila a wasm y lo deja en `server/webui/`, y el servidor lo
-embebe al compilar (sin esos ficheros el servidor funciona igual, solo con los listados HTML). Hoy es de
-**solo lectura**; las operaciones de escritura (copiar, mover, borrar, subir) requieren un modo explícito
-y su propia revisión de seguridad.
+## Interfaz web (el propio gestor en WebAssembly)
+`/s/<token>/app/` abre **la misma aplicación** del gestor compilada a wasm32 y dibujada en un canvas; no es una
+reimplementación. Los archivos se leen del servidor por XHR (capa `src/vfs/`). `server/build-web.sh` la compila y
+deja el resultado en `server/webui/`, y el servidor lo embebe al compilar (sin esos ficheros funciona igual, solo
+con los listados HTML). Es de **solo lectura** salvo que se arranque con `--write` (tope de subida: `--max-upload`
+en MiB); cada petición que modifica exige la cabecera `X-FB: 1` y un `Origin` igual al `Host`.

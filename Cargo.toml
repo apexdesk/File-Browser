@@ -5,7 +5,7 @@ edition = "2024"
 license = "PolyForm-Strict-1.0.0"
 
 [workspace]
-members = ["server", "web"]
+members = ["server"]
 # `cargo build --release` sigue compilando solo el gestor; el servidor: `-p filebrowser-server`
 default-members = ["."]
 
