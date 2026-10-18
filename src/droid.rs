@@ -1,13 +1,16 @@
 //! Audio y vídeo en Android sin bibliotecas añadidas: los códecs del sistema (`AMediaExtractor` +
 //! `AMediaCodec`, con hardware si el móvil lo tiene) y la salida de sonido `AAudio`. Todo viene en
 //! el NDK (`libmediandk`, `libaaudio`), así que el APK no crece.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void, CStr};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::{Instant};
 
 type Status = c_int;
 
@@ -233,7 +236,7 @@ struct Track {
     fmt: Fmt,
 }
 
-fn open_extractor(file: &std::fs::File) -> Result<(Extractor, Option<Track>, Option<Track>, i64), String> {
+fn open_extractor(file: &crate::vfs::fs::File) -> Result<(Extractor, Option<Track>, Option<Track>, i64), String> {
     let len = file.metadata().map_err(|e| e.to_string())?.len() as i64;
     unsafe {
         let ex = Extractor(AMediaExtractor_new());
@@ -270,7 +273,7 @@ pub struct Info {
 
 /// Duración y pistas, sin decodificar nada.
 pub fn probe(path: &Path) -> Option<Info> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::vfs::fs::File::open(path).ok()?;
     let (_ex, v, a, d) = open_extractor(&file).ok()?;
     Some(Info { duration: d as f64 / 1e6, has_video: v.is_some(), has_audio: a.is_some() })
 }
@@ -425,7 +428,7 @@ pub const NO_SURFACE: &str = "sin imágenes de la superficie";
 /// Decodifica `path` desde `start_us`. Cada fotograma pasa a `on_frame` (devuelve `false` para parar).
 /// `Ok(true)` si se llegó al final del archivo.
 pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_frame: &mut dyn FnMut(usize, usize, Vec<u8>) -> bool) -> Result<bool, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
     let (ex, video, audio, _dur) = open_extractor(&file)?;
     let audio = if o.audio { audio } else { None };
     if video.is_none() && audio.is_none() {
@@ -662,7 +665,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                                         break;
                                     }
                                     img = std::ptr::null_mut();
-                                    std::thread::sleep(Duration::from_millis(2));
+                                    crate::vfs::thread::sleep(Duration::from_millis(2));
                                 }
                                 if !img.is_null() {
                                     frame = image_to_rgba(img, o.max_w);
@@ -703,7 +706,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             if v_done && a_done {
                 // deja sonar lo que queda en cola
                 while alive() && ring.lock().map(|q| !q.is_empty()).unwrap_or(false) && o.realtime {
-                    std::thread::sleep(Duration::from_millis(20));
+                    crate::vfs::thread::sleep(Duration::from_millis(20));
                 }
                 break;
             }
@@ -714,7 +717,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                 if !o.realtime && idle_rounds > 1500 {
                     return Err("tiempo agotado decodificando".into());
                 }
-                std::thread::sleep(Duration::from_millis(3));
+                crate::vfs::thread::sleep(Duration::from_millis(3));
             }
         }
         Ok(alive())

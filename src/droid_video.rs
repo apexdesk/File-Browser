@@ -1,10 +1,12 @@
 //! Reproductor de vídeo en Android: decodifica con los códecs del sistema (`droid`) en un hilo y
 //! dibuja el último fotograma como textura. Misma interfaz que el reproductor de escritorio.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use egui::ColorImage;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 /// En Android el sistema ya trae los códecs: siempre hay reproducción (si el formato no se admite,
 /// el reproductor lo dice al intentarlo y queda «Abrir con…»).
@@ -70,7 +72,7 @@ impl Player {
         self.error = None;
         let g = self.shared.epoch.load(Ordering::SeqCst);
         let (shared, ctx, path) = (self.shared.clone(), self.ctx.clone(), self.path.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let alive = || shared.epoch.load(Ordering::SeqCst) == g;
             let mut o = crate::droid::Opts { audio: true, realtime: true, max_w: 1280, bytes: false };
             let mut on_frame = |w: usize, h: usize, px: Vec<u8>| {

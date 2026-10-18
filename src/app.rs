@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 #[cfg(target_os = "android")]
 use crate::trash;
 use crate::config::Config;
@@ -19,7 +21,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration};
+use web_time::{Instant, SystemTime};
 
 struct Place {
     name: String,
@@ -534,7 +537,7 @@ pub struct App {
     /// ejecutarse en el hilo de la interfaz al terminar.
     io_done: Arc<std::sync::Mutex<Vec<Box<dyn FnOnce(&mut App) + Send>>>>,
     /// Vigilancia de cambios del directorio, consultada en un hilo (un `stat` en red puede bloquear).
-    watch_res: Arc<std::sync::Mutex<Vec<(PathBuf, Option<std::time::SystemTime>)>>>,
+    watch_res: Arc<std::sync::Mutex<Vec<(PathBuf, Option<web_time::SystemTime>)>>>,
     watch_busy: Arc<AtomicBool>,
     net_users: HashMap<String, String>,
     side_drop: Option<PathBuf>,
@@ -635,7 +638,7 @@ fn standard_places() -> Vec<Place> {
     let mut v = Vec::new();
     let mut add = |name: &str, p: Option<PathBuf>, g: Glyph, sys: &'static str| {
         if let Some(p) = p {
-            if p.is_dir() {
+            if p.v_is_dir() {
                 v.push(Place { name: name.to_string(), path: p, glyph: g, sys });
             }
         }
@@ -729,7 +732,7 @@ fn uri_to_gvfs(uri: &str) -> Option<PathBuf> {
     let host = host.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(host);
     let host = pct_decode(host).to_lowercase();
     let share = pct_decode(rest.split('/').nth(1).unwrap_or("")).to_lowercase();
-    for e in std::fs::read_dir(base).ok()?.flatten() {
+    for e in crate::vfs::fs::read_dir(base).ok()?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let Some((sch, props)) = n.split_once(':') else { continue };
         if sch.to_lowercase() != want {
@@ -760,7 +763,7 @@ fn gio_local_path(uri: &str) -> Option<PathBuf> {
     String::from_utf8_lossy(&o.stdout)
         .lines()
         .find_map(|l| l.trim().strip_prefix("local path:").map(|p| PathBuf::from(p.trim())))
-        .filter(|p| p.exists())
+        .filter(|p| p.v_exists())
 }
 
 /// Texto en minúsculas de `gio mount -l` (montajes conocidos por gvfs), para saber si merece consultar.
@@ -807,12 +810,12 @@ fn detect_system_dark() -> Option<bool> {
     }
     let home = dirs::home_dir()?;
     let cfg = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
-    if let Ok(txt) = std::fs::read_to_string(cfg.join("kdeglobals")) {
+    if let Ok(txt) = crate::vfs::fs::read_to_string(cfg.join("kdeglobals")) {
         if let Some(l) = txt.lines().find(|l| l.starts_with("ColorScheme=")) {
             return Some(l.to_lowercase().contains("dark"));
         }
     }
-    if let Ok(txt) = std::fs::read_to_string(cfg.join("gtk-3.0/settings.ini")) {
+    if let Ok(txt) = crate::vfs::fs::read_to_string(cfg.join("gtk-3.0/settings.ini")) {
         for l in txt.lines() {
             let l = l.trim();
             if let Some(v) = l.strip_prefix("gtk-application-prefer-dark-theme=") {
@@ -860,7 +863,7 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
     ];
     for mut src in outs.into_iter().flatten() {
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let mut b = [0u8; 512];
             while let Ok(n) = src.read(&mut b) {
                 if n == 0 || tx.send(b[..n].to_vec()).is_err() {
@@ -929,7 +932,7 @@ fn list_network() -> Vec<NetPlace> {
     #[cfg(target_os = "linux")]
     {
         // montajes de red del sistema (cifs, nfs, sshfs…)
-        if let Ok(txt) = std::fs::read_to_string("/proc/self/mounts") {
+        if let Ok(txt) = crate::vfs::fs::read_to_string("/proc/self/mounts") {
             for l in txt.lines() {
                 let mut it = l.split_whitespace();
                 let (Some(dev), Some(mp), Some(fs)) = (it.next(), it.next(), it.next()) else { continue };
@@ -943,7 +946,7 @@ fn list_network() -> Vec<NetPlace> {
         let mut mounted: Vec<PathBuf> = Vec::new();
         let gio_text = gio_mounts_text();
         if let Some(g) = gvfs_dir() {
-            if let Ok(rd) = std::fs::read_dir(&g) {
+            if let Ok(rd) = crate::vfs::fs::read_dir(&g) {
                 for e in rd.flatten() {
                     let n = e.file_name().to_string_lossy().into_owned();
                     mounted.push(e.path());
@@ -968,7 +971,7 @@ fn list_network() -> Vec<NetPlace> {
         }
         // sitios conocidos: marcadores GTK con direcciones de red
         if let Some(h) = dirs::home_dir() {
-            if let Ok(txt) = std::fs::read_to_string(h.join(".config/gtk-3.0/bookmarks")) {
+            if let Ok(txt) = crate::vfs::fs::read_to_string(h.join(".config/gtk-3.0/bookmarks")) {
                 for l in txt.lines() {
                     let (uri, label) = l.split_once(' ').map(|(a, b)| (a, Some(b))).unwrap_or((l, None));
                     let Some((scheme, _)) = uri.split_once("://") else { continue };
@@ -996,7 +999,7 @@ fn list_network() -> Vec<NetPlace> {
         if let Some(a) = dirs::config_dir() {
             // «Entorno de red»: accesos a recursos compartidos que el usuario ha abierto
             let d = a.join("Microsoft").join("Windows").join("Network Shortcuts");
-            if let Ok(rd) = std::fs::read_dir(d) {
+            if let Ok(rd) = crate::vfs::fs::read_dir(d) {
                 for e in rd.flatten() {
                     v.push(NetPlace { name: e.file_name().to_string_lossy().into_owned(), path: Some(e.path()), uri: None });
                 }
@@ -1011,14 +1014,14 @@ fn list_drives() -> Vec<Place> {
     #[cfg(windows)]
     for c in b'A'..=b'Z' {
         let p = PathBuf::from(format!("{}:\\", c as char));
-        if p.exists() {
+        if p.v_exists() {
             v.push(Place { name: tf("Disco ({}:)", &[&(c as char)]), path: p, glyph: Glyph::Drive, sys: "drive" });
         }
     }
     #[cfg(target_os = "linux")]
     {
         v.push(Place { name: t("Sistema").into(), path: PathBuf::from("/"), glyph: Glyph::Drive, sys: "drive" });
-        if let Ok(txt) = std::fs::read_to_string("/proc/self/mounts") {
+        if let Ok(txt) = crate::vfs::fs::read_to_string("/proc/self/mounts") {
             for l in txt.lines() {
                 let mut it = l.split_whitespace();
                 let (Some(dev), Some(mp)) = (it.next(), it.next()) else { continue };
@@ -1035,7 +1038,7 @@ fn list_drives() -> Vec<Place> {
     #[cfg(target_os = "macos")]
     {
         v.push(Place { name: "Macintosh HD".into(), path: PathBuf::from("/"), glyph: Glyph::Drive, sys: "drive" });
-        if let Ok(rd) = std::fs::read_dir("/Volumes") {
+        if let Ok(rd) = crate::vfs::fs::read_dir("/Volumes") {
             for e in rd.flatten() {
                 let p = e.path();
                 if p != Path::new("/Volumes/Macintosh HD") {
@@ -1074,12 +1077,12 @@ impl App {
             // la detección lanza procesos (gdbus, gsettings): fuera del arranque; mientras tanto se
             // usa el último tema guardado y, si el sistema ha cambiado, se ajusta con la animación
             let (st, c) = (sys_theme.clone(), ctx.clone());
-            std::thread::spawn(move || loop {
+            crate::vfs::thread::spawn(move || loop {
                 let v = detect_system_dark().map(|d| if d { 2 } else { 1 }).unwrap_or(0);
                 if st.swap(v, Ordering::Relaxed) != v {
                     c.request_repaint();
                 }
-                std::thread::sleep(Duration::from_secs(3));
+                crate::vfs::thread::sleep(Duration::from_secs(3));
             });
         }
         if cfg.theme_mode == 0 {
@@ -1102,12 +1105,12 @@ impl App {
         let mut cli_dirs: Vec<PathBuf> = Vec::new();
         let mut cli_select: Vec<String> = Vec::new();
         for p in system::initial_targets() {
-            if p.is_dir() {
+            if p.v_is_dir() {
                 if !cli_dirs.contains(&p) {
                     cli_dirs.push(p);
                 }
             } else if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
-                if p.exists() && parent.is_dir() {
+                if p.v_exists() && parent.v_is_dir() {
                     if cli_dirs.is_empty() {
                         cli_select.push(name.to_string_lossy().into_owned());
                     }
@@ -1122,7 +1125,7 @@ impl App {
         let mut start = cli_dir
             .clone()
             .or_else(|| cfg.last_dir.clone())
-            .filter(|p| p.is_dir())
+            .filter(|p| p.v_is_dir())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut tabs_init: Vec<TabState> = Vec::new();
@@ -1132,11 +1135,11 @@ impl App {
         }
         if cli_dir.is_none() && cfg.restore_tabs && (cfg.tabs.len() > 1 || !cfg.tabs2.is_empty()) {
             for (n, p) in cfg.tabs.iter().enumerate() {
-                if !p.is_dir() {
+                if !p.v_is_dir() {
                     continue;
                 }
                 let mut t = TabState::new(p.clone());
-                if let Some((_, p2)) = cfg.tabs2.iter().find(|(i, p2)| *i == n && p2.is_dir()) {
+                if let Some((_, p2)) = cfg.tabs2.iter().find(|(i, p2)| *i == n && p2.v_is_dir()) {
                     t.split = Some(Box::new(TabState::new(p2.clone())));
                 }
                 tabs_init.push(t);
@@ -1333,7 +1336,7 @@ impl App {
             palette: None,
             rebinding: None,
         };
-        std::thread::spawn(clean_archive_cache);
+        crate::vfs::thread::spawn(clean_archive_cache);
         if std::env::var_os("FB_COLS").is_some() {
             app.cfg.col_view = true;
         }
@@ -1344,9 +1347,9 @@ impl App {
         system::hook_open_files(app.inbox.clone(), move || ctx_for_mac.request_repaint());
         app.load(start, false);
         let split_dir = if std::env::var_os("FB_SPLIT").is_some() {
-            Some(std::env::var_os("FB_SPLIT").map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| app.cwd.clone()))
+            Some(std::env::var_os("FB_SPLIT").map(PathBuf::from).filter(|p| p.v_is_dir()).unwrap_or_else(|| app.cwd.clone()))
         } else if app.cfg.split && !app.cfg.col_view {
-            Some(app.cfg.split_dir.clone().filter(|p| p.is_dir()).unwrap_or_else(|| app.cwd.clone()))
+            Some(app.cfg.split_dir.clone().filter(|p| p.v_is_dir()).unwrap_or_else(|| app.cwd.clone()))
         } else {
             None
         };
@@ -1568,7 +1571,7 @@ impl App {
         self.traced_first = false;
         self.load_err = None;
         self.dir_hash = hash_str(0, &path.to_string_lossy());
-        self.dir_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.dir_mtime = crate::vfs::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if self.live_side == self.active_side && virt_mode(&path).is_none() {
             self.cfg.last_dir = Some(path.clone());
         }
@@ -1583,7 +1586,7 @@ impl App {
             VMode::Recent => {
                 let list = self.cfg.recent.clone();
                 let (tx, generation, ctx) = (self.load_tx.clone(), self.generation, self.ctx.clone());
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     let ents: Vec<fsys::Entry> =
                         list.iter().filter_map(|p| fsys::entry_from_path(p, p.to_string_lossy().into_owned())).collect();
                     let _ = tx.send(fsys::LoadMsg::Chunk(generation, ents));
@@ -1594,7 +1597,7 @@ impl App {
             VMode::Trash => {
                 let (tx, generation, cur, ctx) = (self.load_tx.clone(), self.generation, self.gen_shared.clone(), self.ctx.clone());
                 let slot = self.trash_rows.clone();
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     match extras::trash_list() {
                         Ok(rows) => {
                             let ents: Vec<fsys::Entry> = rows
@@ -1711,8 +1714,8 @@ impl App {
             self.scroll_to_top();
             return;
         }
-        if !path.is_dir() {
-            if path.exists() {
+        if !path.v_is_dir() {
+            if path.v_exists() {
                 fsys::open_external(&path);
             } else {
                 self.say(tf("No existe: {}", &[&path.display()]), true);
@@ -1802,7 +1805,7 @@ impl App {
             show_hidden: self.cfg.show_hidden,
             filter: self.filter.clone(),
         };
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let order = fsys::build_order(&entries, &spec);
             let _ = tx.send((seq, order));
             ctx.request_repaint();
@@ -2192,11 +2195,11 @@ impl App {
                 move || {
                     // `rename` sobrescribe el destino en silencio: no se pisa un elemento que ya existe
                     // en un sistema que distingue mayúsculas, «foo» y «Foo» pueden ser archivos distintos
-                    let same_file = case_only && matches!((std::fs::canonicalize(&f), std::fs::canonicalize(&t2)), (Ok(a), Ok(b)) if a == b);
-                    if !same_file && std::fs::symlink_metadata(&t2).is_ok() {
+                    let same_file = case_only && matches!((crate::vfs::fs::canonicalize(&f), crate::vfs::fs::canonicalize(&t2)), (Ok(a), Ok(b)) if a == b);
+                    if !same_file && crate::vfs::fs::symlink_metadata(&t2).is_ok() {
                         return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("Ya existe un elemento con ese nombre")));
                     }
-                    std::fs::rename(&f, &t2)
+                    crate::vfs::fs::rename(&f, &t2)
                 }
             },
             move |a, r| match r {
@@ -2220,7 +2223,7 @@ impl App {
         self.spawn_io(
             move || {
                 let p = fsys::unique_path(&cwd, &name);
-                std::fs::create_dir(&p).map(|_| p)
+                crate::vfs::fs::create_dir(&p).map(|_| p)
             },
             |a, r| match r {
                 Ok(p) => {
@@ -2297,7 +2300,7 @@ impl App {
                     .filter(|s| s.parent() != Some(dst.as_path()))
                     .filter_map(|s| {
                         let n = s.file_name()?;
-                        std::fs::symlink_metadata(dst.join(n)).ok().map(|_| n.to_string_lossy().into_owned())
+                        crate::vfs::fs::symlink_metadata(dst.join(n)).ok().map(|_| n.to_string_lossy().into_owned())
                     })
                     .collect();
                 (srcs, dst, names)
@@ -2337,11 +2340,11 @@ impl App {
     }
 
     fn rename_checked(a: &Path, b: &Path) -> Result<(), String> {
-        let same = matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
-        if !same && std::fs::symlink_metadata(b).is_ok() {
+        let same = matches!((crate::vfs::fs::canonicalize(a), crate::vfs::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
+        if !same && crate::vfs::fs::symlink_metadata(b).is_ok() {
             return Err(tf("{}: ya existe", &[&b.display()]));
         }
-        std::fs::rename(a, b).map_err(|e| format!("{}: {e}", a.display()))
+        crate::vfs::fs::rename(a, b).map_err(|e| format!("{}: {e}", a.display()))
     }
 
     fn apply_history(&mut self, u: Undo, is_redo: bool) {
@@ -2373,7 +2376,7 @@ impl App {
             Undo::Created(items) => {
                 if is_redo {
                     for (p, dir) in items {
-                        let r = if *dir { std::fs::create_dir_all(p) } else { std::fs::OpenOptions::new().write(true).create_new(true).open(p).map(|_| ()) };
+                        let r = if *dir { crate::vfs::fs::create_dir_all(p) } else { crate::vfs::fs::OpenOptions::new().write(true).create_new(true).open(p).map(|_| ()) };
                         if let Err(e) = r {
                             err = Some(format!("{}: {e}", p.display()));
                             break;
@@ -2445,7 +2448,7 @@ impl App {
             let meta = std::mem::replace(&mut self.op_meta, OpMeta::Other);
             // comprimido protegido: se pide la contraseña y se repite la extracción
             if let (Some(e), Some((src, dst))) = (errs.first().filter(|e| *e == crate::archive::NEED_PASS || *e == crate::archive::BAD_PASS), self.op_unzip.take()) {
-                let _ = std::fs::remove_dir_all(&dst);
+                let _ = crate::vfs::fs::remove_dir_all(&dst);
                 self.dlg = Dlg::ArchPass(ArchPass { src, dst, meta, pass: String::new(), show: false, wrong: e == crate::archive::BAD_PASS, focus: true });
                 return;
             }
@@ -2453,13 +2456,13 @@ impl App {
             match meta {
                 OpMeta::OpenArchive { archive, root } => {
                     if errs.is_empty() && !op.cancelled() {
-                        let _ = std::fs::write(archive_marker(&root), b"");
+                        let _ = crate::vfs::fs::write(archive_marker(&root), b"");
                         if !self.arch.iter().any(|(r, _)| *r == root) {
                             self.arch.push((root.clone(), archive));
                         }
                         enter = Some(root);
                     } else {
-                        let _ = std::fs::remove_dir_all(&root);
+                        let _ = crate::vfs::fs::remove_dir_all(&root);
                     }
                 }
                 OpMeta::Copy { mv, replay } if !pairs.is_empty() => {
@@ -3770,11 +3773,11 @@ impl App {
             if self.addr_cache.0 != dir_s {
                 let mut names: Vec<String> = Vec::new();
                 if !dir_s.is_empty() {
-                    if let Ok(rd) = std::fs::read_dir(&dir_s) {
+                    if let Ok(rd) = crate::vfs::fs::read_dir(&dir_s) {
                         for e in rd.flatten() {
                             let ft = e.file_type();
-                            if ft.as_ref().map(|t| t.is_dir()).unwrap_or(false)
-                                || (ft.map(|t| t.is_symlink()).unwrap_or(false) && std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false))
+                            if ft.as_ref().map(|t| t.v_is_dir()).unwrap_or(false)
+                                || (ft.map(|t| t.v_is_symlink()).unwrap_or(false) && crate::vfs::fs::metadata(e.path()).map(|m| m.v_is_dir()).unwrap_or(false))
                             {
                                 names.push(e.file_name().to_string_lossy().into_owned());
                             }
@@ -4005,7 +4008,7 @@ impl App {
     /// ejecuta `done` con su resultado en el hilo de la interfaz.
     fn spawn_io<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(&mut App, T) + Send + 'static) {
         let (q, ctx) = (self.io_done.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let r = work();
             q.lock().unwrap().push(Box::new(move |a: &mut App| done(a, r)));
             ctx.request_repaint();
@@ -4086,7 +4089,7 @@ impl App {
             return;
         }
         let (slot, flag, ctx) = (self.drives_slot.clone(), self.drives_busy.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let v = (list_drives(), tools::all_roots());
             *slot.lock().unwrap() = Some(v);
             flag.store(false, Ordering::Relaxed);
@@ -4100,7 +4103,7 @@ impl App {
             return;
         }
         let (slot, flag, ctx) = (self.net_list.clone(), self.net_refreshing.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let v = list_network();
             *slot.lock().unwrap() = Some(v);
             flag.store(false, Ordering::Relaxed);
@@ -4135,7 +4138,7 @@ impl App {
             let (slot, err_slot, busy, ctx) = (self.net_nav.clone(), self.net_err.clone(), self.net_busy.clone(), self.ctx.clone());
             let shares_slot = self.net_shares.clone();
             let login = NetLogin { uri: uri.clone(), user: l.user.clone(), domain: l.domain.clone(), pass: l.pass.clone(), anon: l.anon };
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let res = (|| -> Result<Option<PathBuf>, String> {
                     // ya montado (por otra aplicación o sesión anterior): sin volver a autenticar
                     let server_only = uri.starts_with("smb://") && uri.trim_end_matches('/').split('/').nth(3).is_none();
@@ -4198,7 +4201,7 @@ impl App {
             self.say(tf("Conectando con {}…", &[&uri]), false);
             let (slot, err_slot, busy, ctx) = (self.net_nav.clone(), self.net_err.clone(), self.net_busy.clone(), self.ctx.clone());
             let login = crate::netmount::Login { uri, user: l.user.clone(), domain: l.domain.clone(), pass: l.pass.clone(), anon: l.anon };
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 match crate::netmount::connect(&login) {
                     Ok(p) => *slot.lock().unwrap() = Some(p),
                     Err(m) => *err_slot.lock().unwrap() = Some(m),
@@ -4512,13 +4515,13 @@ impl App {
                     let d = d.clone();
                     move || {
                         let mut rows: Vec<(String, bool)> = Vec::new();
-                        if let Ok(rd) = std::fs::read_dir(&d) {
+                        if let Ok(rd) = crate::vfs::fs::read_dir(&d) {
                             for e in rd.flatten().take(20_000) {
                                 let n = e.file_name().to_string_lossy().into_owned();
                                 if !hidden && n.starts_with('.') {
                                     continue;
                                 }
-                                let dir = e.file_type().map(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir())).unwrap_or(false);
+                                let dir = e.file_type().map(|t| t.v_is_dir() || (t.v_is_symlink() && e.path().v_is_dir())).unwrap_or(false);
                                 rows.push((n, dir));
                             }
                         }
@@ -5327,7 +5330,7 @@ impl App {
                     self.drag_items = false;
                     let mut added = 0;
                     for p in self.selected_paths() {
-                        if p.is_dir() && !self.cfg.bookmarks.contains(&p) {
+                        if p.v_is_dir() && !self.cfg.bookmarks.contains(&p) {
                             self.cfg.bookmarks.push(p);
                             added += 1;
                         }
@@ -5475,7 +5478,7 @@ impl App {
                             // en un hilo: owner/elementos pueden tocar la red o NSS; la celda sale vacía hasta que llegue
                             self.extra_pending.insert(key.clone());
                             let (tx, k, d, c) = (self.extra_tx.clone(), key.clone(), e.is_dir(), self.ctx.clone());
-                            std::thread::spawn(move || {
+                            crate::vfs::thread::spawn(move || {
                                 let m = fsys::extra_meta(&k, d);
                                 let _ = tx.send((k, m));
                                 c.request_repaint();
@@ -6068,10 +6071,10 @@ fn mi_check(ui: &mut egui::Ui, label: &str, shortcut: &str, on: bool) -> bool {
     c
 }
 
-fn mtime_secs(md: &std::fs::Metadata) -> i64 {
+fn mtime_secs(md: &crate::vfs::fs::Metadata) -> i64 {
     md.modified()
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| t.duration_since(web_time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
@@ -6149,13 +6152,13 @@ fn batch_name(old: &str, d: &BatchDlg, i: usize, re: Option<&regex::Regex>) -> S
 }
 
 #[cfg(unix)]
-fn perm_bits(md: &std::fs::Metadata) -> u32 {
+fn perm_bits(md: &crate::vfs::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     md.permissions().mode() & 0o777
 }
 
 #[cfg(not(unix))]
-fn perm_bits(md: &std::fs::Metadata) -> u32 {
+fn perm_bits(md: &crate::vfs::fs::Metadata) -> u32 {
     if md.permissions().readonly() { 0o444 } else { 0o666 }
 }
 
@@ -6164,34 +6167,34 @@ fn perm_bits(md: &std::fs::Metadata) -> u32 {
 #[cfg(unix)]
 fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let md = std::fs::symlink_metadata(p)?;
-    if md.file_type().is_symlink() {
+    let md = crate::vfs::fs::symlink_metadata(p)?;
+    if md.file_type().v_is_symlink() {
         return Ok(());
     }
     let old = md.permissions().mode();
-    let new = if md.is_dir() { (old & !0o777) | bits } else { (old & !0o777) | bits };
+    let new = if md.v_is_dir() { (old & !0o777) | bits } else { (old & !0o777) | bits };
     // si la carpeta pierde lectura/ejecución, primero se recorre el contenido y la carpeta se cambia al final
-    let last = recursive && md.is_dir() && new & 0o500 != 0o500;
+    let last = recursive && md.v_is_dir() && new & 0o500 != 0o500;
     if !last {
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(new))?;
+        crate::vfs::fs::set_permissions(p, crate::vfs::fs::Permissions::from_mode(new))?;
     }
-    if recursive && md.is_dir() {
-        for e in std::fs::read_dir(p)? {
+    if recursive && md.v_is_dir() {
+        for e in crate::vfs::fs::read_dir(p)? {
             let e = e?;
             let path = e.path();
-            let child = std::fs::symlink_metadata(&path)?;
-            if child.is_dir() {
+            let child = crate::vfs::fs::symlink_metadata(&path)?;
+            if child.v_is_dir() {
                 set_perms(&path, bits, true)?;
-            } else if !child.file_type().is_symlink() {
+            } else if !child.file_type().v_is_symlink() {
                 // archivos: se cambian lectura/escritura, la ejecución se queda como estaba
                 let cm = child.permissions().mode();
                 let nb = (cm & !0o666) | (bits & 0o666);
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(nb))?;
+                crate::vfs::fs::set_permissions(&path, crate::vfs::fs::Permissions::from_mode(nb))?;
             }
         }
     }
     if last {
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(new))?;
+        crate::vfs::fs::set_permissions(p, crate::vfs::fs::Permissions::from_mode(new))?;
     }
     Ok(())
 }
@@ -6199,15 +6202,15 @@ fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
     // en Windows sólo existe el atributo de sólo lectura (bit de escritura del propietario)
-    let md = std::fs::symlink_metadata(p)?;
-    if md.file_type().is_symlink() {
+    let md = crate::vfs::fs::symlink_metadata(p)?;
+    if md.file_type().v_is_symlink() {
         return Ok(());
     }
     let mut perm = md.permissions();
     perm.set_readonly(bits & 0o200 == 0);
-    std::fs::set_permissions(p, perm)?;
-    if recursive && md.is_dir() {
-        for e in std::fs::read_dir(p)? {
+    crate::vfs::fs::set_permissions(p, perm)?;
+    if recursive && md.v_is_dir() {
+        for e in crate::vfs::fs::read_dir(p)? {
             set_perms(&e?.path(), bits, true)?;
         }
     }
@@ -6215,7 +6218,7 @@ fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn mode_string(md: &std::fs::Metadata) -> String {
+fn mode_string(md: &crate::vfs::fs::Metadata) -> String {
     use std::os::unix::fs::PermissionsExt;
     let m = md.permissions().mode();
     let mut s = String::new();
@@ -6229,7 +6232,7 @@ fn mode_string(md: &std::fs::Metadata) -> String {
 }
 
 #[cfg(not(unix))]
-fn mode_string(md: &std::fs::Metadata) -> String {
+fn mode_string(md: &crate::vfs::fs::Metadata) -> String {
     if md.permissions().readonly() { t("Sólo lectura").into() } else { t("Lectura y escritura").into() }
 }
 
@@ -6238,12 +6241,12 @@ fn mode_string(md: &std::fs::Metadata) -> String {
 fn is_program(p: &Path) -> bool {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
-    let Ok(md) = std::fs::metadata(p) else { return false };
-    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
+    let Ok(md) = crate::vfs::fs::metadata(p) else { return false };
+    if !md.v_is_file() || md.permissions().mode() & 0o111 == 0 {
         return false;
     }
     let mut head = [0u8; 4];
-    let Ok(n) = std::fs::File::open(p).and_then(|mut f| f.read(&mut head)) else { return false };
+    let Ok(n) = crate::vfs::fs::File::open(p).and_then(|mut f| f.read(&mut head)) else { return false };
     n >= 2
         && (head[..2] == *b"#!"
             || head == [0x7f, b'E', b'L', b'F']
@@ -6257,7 +6260,7 @@ fn is_program(p: &Path) -> bool {
 #[cfg(windows)]
 fn is_program(p: &Path) -> bool {
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "exe" | "bat" | "cmd" | "com") && p.is_file()
+    matches!(ext.as_str(), "exe" | "bat" | "cmd" | "com") && p.v_is_file()
 }
 
 #[cfg(not(any(windows, all(unix, not(target_os = "android")))))]
@@ -6271,10 +6274,10 @@ fn is_program(_: &Path) -> bool {
 fn server_exe() -> Option<PathBuf> {
     let name = if cfg!(windows) { "filebrowser-server.exe" } else { "filebrowser-server" };
     let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name)));
-    if let Some(p) = beside.filter(|p| p.is_file()) {
+    if let Some(p) = beside.filter(|p| p.v_is_file()) {
         return Some(p);
     }
-    std::env::var_os("PATH").and_then(|v| std::env::split_paths(&v).map(|d| d.join(name)).find(|p| p.is_file()))
+    std::env::var_os("PATH").and_then(|v| crate::vfs::split_paths(&v).map(|d| d.join(name)).find(|p| p.v_is_file()))
 }
 
 fn has_ctl(p: &Path) -> bool {
@@ -6417,7 +6420,7 @@ impl App {
                 cmd.env("FB_POS", p);
             }
             if let Ok(mut ch) = cmd.spawn() {
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     let _ = ch.wait();
                 });
             }
@@ -6473,7 +6476,7 @@ impl App {
             return;
         }
         for p in items {
-            if p.is_dir() {
+            if p.v_is_dir() {
                 self.new_tab(p);
             } else if let (Some(parent), Some(name)) = (p.parent().map(|x| x.to_path_buf()), p.file_name()) {
                 let name = name.to_string_lossy().into_owned();
@@ -7500,7 +7503,7 @@ impl App {
             fsys::open_external(&p);
             return;
         };
-        if archive_marker(&root).exists() && root.is_dir() {
+        if archive_marker(&root).v_exists() && root.v_is_dir() {
             if !self.arch.iter().any(|(r, _)| *r == root) {
                 self.arch.push((root.clone(), p));
             }
@@ -7516,7 +7519,7 @@ impl App {
         if let Some(par) = root.parent() {
             fsys::private_dir(par);
         }
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = crate::vfs::fs::remove_dir_all(&root);
         self.start_op(Op::Unzip { src: p.clone(), dst: root.clone(), pass: None }, OpMeta::OpenArchive { archive: p, root });
     }
 
@@ -7594,7 +7597,7 @@ impl App {
             return;
         }
         let single = paths.len() == 1;
-        let md = std::fs::symlink_metadata(&paths[0]).ok();
+        let md = crate::vfs::fs::symlink_metadata(&paths[0]).ok();
         let title = if single {
             paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| paths[0].display().to_string())
         } else {
@@ -7603,8 +7606,8 @@ impl App {
         let location = paths[0].parent().map(|p| p.display().to_string()).unwrap_or_default();
         let kind = if single {
             match &md {
-                Some(m) if m.is_dir() => t("Carpeta").to_string(),
-                Some(m) if m.file_type().is_symlink() => t("Enlace simbólico").to_string(),
+                Some(m) if m.v_is_dir() => t("Carpeta").to_string(),
+                Some(m) if m.file_type().v_is_symlink() => t("Enlace simbólico").to_string(),
                 _ => {
                     let e = paths[0].extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
                     if e.is_empty() { t("Archivo").to_string() } else { tf("Archivo {e}", &[&e]) }
@@ -7627,7 +7630,7 @@ impl App {
             perm: md.as_ref().map(perm_bits).unwrap_or(0),
             perm_orig: md.as_ref().map(perm_bits).unwrap_or(0),
             recursive: false,
-            has_dir: paths.iter().any(|p| p.is_dir()),
+            has_dir: paths.iter().any(|p| p.v_is_dir()),
             readonly: md.as_ref().map(|m| m.permissions().readonly()).unwrap_or(false),
             err: String::new(),
             ok: false,
@@ -7651,7 +7654,7 @@ impl App {
             d.perm_orig = d.perm;
             d.mode.clear();
             if d.paths.len() == 1 {
-                if let Ok(md) = std::fs::symlink_metadata(&d.paths[0]) {
+                if let Ok(md) = crate::vfs::fs::symlink_metadata(&d.paths[0]) {
                     d.mode = mode_string(&md);
                 }
             }
@@ -7682,13 +7685,13 @@ impl App {
             let src = d.paths[0].clone();
             let dst = src.with_file_name(&new);
             let case_only = new.to_lowercase() == d.name_orig.to_lowercase()
-                && dst.symlink_metadata().is_ok()
-                && matches!((std::fs::canonicalize(&src), std::fs::canonicalize(&dst)), (Ok(a), Ok(b)) if a == b);
-            if !case_only && dst.symlink_metadata().is_ok() {
+                && dst.v_symlink_metadata().is_ok()
+                && matches!((crate::vfs::fs::canonicalize(&src), crate::vfs::fs::canonicalize(&dst)), (Ok(a), Ok(b)) if a == b);
+            if !case_only && dst.v_symlink_metadata().is_ok() {
                 d.err = t("Ya existe un elemento con ese nombre").to_string();
                 return;
             }
-            if let Err(e) = std::fs::rename(&src, &dst) {
+            if let Err(e) = crate::vfs::fs::rename(&src, &dst) {
                 d.err = format!("{}: {e}", t("No se pudo renombrar"));
                 return;
             }
@@ -7742,7 +7745,7 @@ impl App {
 
     fn open_with(&mut self) {
         let Some(path) = self.selected_paths().into_iter().next() else { return };
-        if path.is_dir() {
+        if path.v_is_dir() {
             return;
         }
         let apps = extras::apps_for(&path);
@@ -7759,7 +7762,7 @@ impl App {
         match c.spawn() {
             // se recoge el hijo al terminar: sin wait quedaría como zombi
             Ok(mut ch) => {
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     let _ = ch.wait();
                 });
             }
@@ -7852,7 +7855,7 @@ impl App {
 
     fn open_hash(&mut self) {
         let Some(path) = self.selected_paths().into_iter().next() else { return };
-        if path.is_dir() {
+        if path.v_is_dir() {
             return;
         }
         let job = extras::spawn_hash(path.clone(), self.ctx.clone());
@@ -7891,7 +7894,7 @@ impl App {
     fn trash_run(&mut self, restore: bool, rows: Option<Vec<extras::TrashRow>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let res = (|| -> Result<(bool, usize), String> {
                 let rows = match rows {
                     Some(r) => r,
@@ -8734,7 +8737,7 @@ impl App {
                                 // create_new: si aparece un archivo con ese nombre entre medias, no se vacía
                                 let mut p = fsys::unique_path(&cwd, &n);
                                 for _ in 0..8 {
-                                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                                    match crate::vfs::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
                                         Ok(_) => return Ok(p),
                                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => p = fsys::unique_path(&cwd, &n),
                                         Err(e) => return Err(e),
@@ -8776,7 +8779,7 @@ impl App {
                 let mut bad: Vec<bool> = Vec::with_capacity(new.len());
                 let (dir, exists) = (&d.dir, &mut d.exists);
                 for (o, n) in d.names.iter().zip(&new) {
-                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && *exists.entry(n.clone()).or_insert_with(|| dir.join(n).symlink_metadata().is_ok()));
+                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && *exists.entry(n.clone()).or_insert_with(|| dir.join(n).v_symlink_metadata().is_ok()));
                     bad.push(b);
                 }
                 let conflict = bad.iter().any(|b| *b) || bad_re;
@@ -8913,16 +8916,16 @@ impl App {
                         d.names.iter().cloned().zip(new.iter().cloned()).filter(|(o, n)| o != n).collect();
                     let mut err = None;
                     // fase 1: nombres temporales (permite intercambios y cadenas)
-                    let pid = std::process::id();
+                    let pid = crate::vfs::pid();
                     let tmpn = |i: usize| format!(".fbtmp-{pid}-{i}");
                     let mut staged = 0;
                     for (i, (o, _)) in pairs.iter().enumerate() {
                         // rename sobrescribe: un temporal viejo con el mismo nombre se perdería sin aviso
                         let tmp = d.dir.join(tmpn(i));
-                        let r = if tmp.symlink_metadata().is_ok() {
+                        let r = if tmp.v_symlink_metadata().is_ok() {
                             Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("ya existe")))
                         } else {
-                            std::fs::rename(d.dir.join(o), &tmp)
+                            crate::vfs::fs::rename(d.dir.join(o), &tmp)
                         };
                         if let Err(e) = r {
                             err = Some(format!("{o}: {e}"));
@@ -8936,10 +8939,10 @@ impl App {
                         for i in 0..staged {
                             let dst = d.dir.join(&pairs[i].1);
                             // nunca sobrescribir algo que haya aparecido entre la vista previa y ahora
-                            let r = if dst.symlink_metadata().is_ok() {
+                            let r = if dst.v_symlink_metadata().is_ok() {
                                 Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("ya existe")))
                             } else {
-                                std::fs::rename(d.dir.join(tmpn(i)), &dst)
+                                crate::vfs::fs::rename(d.dir.join(tmpn(i)), &dst)
                             };
                             match r {
                                 Ok(()) => done.push(i),
@@ -8952,14 +8955,14 @@ impl App {
                     }
                     if err.is_some() {
                         for &i in &done {
-                            let _ = std::fs::rename(d.dir.join(&pairs[i].1), d.dir.join(tmpn(i)));
+                            let _ = crate::vfs::fs::rename(d.dir.join(&pairs[i].1), d.dir.join(tmpn(i)));
                         }
                         for i in 0..staged {
                             let back = d.dir.join(&pairs[i].0);
                             let tmp = d.dir.join(tmpn(i));
                             // si el original ya está ocupado no se sobrescribe: se deja con un nombre reconocible
-                            if back.symlink_metadata().is_ok() || std::fs::rename(&tmp, &back).is_err() {
-                                let _ = std::fs::rename(&tmp, fsys::unique_path(&d.dir, &format!("{} (recuperado)", pairs[i].0)));
+                            if back.v_symlink_metadata().is_ok() || crate::vfs::fs::rename(&tmp, &back).is_err() {
+                                let _ = crate::vfs::fs::rename(&tmp, fsys::unique_path(&d.dir, &format!("{} (recuperado)", pairs[i].0)));
                             }
                         }
                     }
@@ -9518,7 +9521,7 @@ impl App {
             // prueba del centro de tareas: tres copias seguidas de la carpeta actual
             self.shot_prev = true;
             let dst = PathBuf::from(std::env::var("FB_TASKS").unwrap_or_default());
-            let _ = std::fs::create_dir_all(&dst);
+            let _ = crate::vfs::fs::create_dir_all(&dst);
             let srcs: Vec<PathBuf> = self.entries.iter().map(|e| self.cwd.join(&*e.name)).collect();
             for _ in 0..3 {
                 self.start_op(Op::Copy { srcs: srcs.clone(), dst: dst.clone(), mv: false, policy: Policy::Rename }, OpMeta::Other);
@@ -9612,9 +9615,9 @@ impl App {
                 "conflict" => {
                     let a = self.cwd.join("a.txt");
                     let sub = self.cwd.join("sub");
-                    let _ = std::fs::create_dir_all(&sub);
-                    let _ = std::fs::write(sub.join("a.txt"), b"x");
-                    let _ = std::fs::write(sub.join("b.txt"), b"x");
+                    let _ = crate::vfs::fs::create_dir_all(&sub);
+                    let _ = crate::vfs::fs::write(sub.join("a.txt"), b"x");
+                    let _ = crate::vfs::fs::write(sub.join("b.txt"), b"x");
                     self.start_copy(vec![a, self.cwd.join("b.txt")], sub, false);
                 }
                 "hash" | "openwith" | "dups" | "trash" => {
@@ -9642,16 +9645,16 @@ impl App {
                 "undotest" => {
                     let a = self.cwd.join("ut_a.txt");
                     let b = self.cwd.join("ut_b.txt");
-                    let _ = std::fs::write(&a, b"x");
-                    let ok = std::fs::rename(&a, &b).is_ok();
+                    let _ = crate::vfs::fs::write(&a, b"x");
+                    let ok = crate::vfs::fs::rename(&a, &b).is_ok();
                     self.push_undo(Undo::Rename { from: a.clone(), to: b.clone() }, true);
                     eprintln!("[test] renamed={ok}");
                     self.undo();
                     eprintln!("[test] after undo: a={} b={}", a.exists(), b.exists());
                     self.redo();
                     eprintln!("[test] after redo: a={} b={}", a.exists(), b.exists());
-                    let _ = std::fs::remove_file(&a);
-                    let _ = std::fs::remove_file(&b);
+                    let _ = crate::vfs::fs::remove_file(&a);
+                    let _ = crate::vfs::fs::remove_file(&b);
                 }
                 "gear" => {
                     if let Some(id) = self.gear_id {
@@ -9683,7 +9686,7 @@ impl App {
                 }
                 "tab" => {
                     let c = self.cwd.join("Documentos");
-                    self.new_tab(if c.is_dir() { c } else { self.cwd.clone() });
+                    self.new_tab(if c.v_is_dir() { c } else { self.cwd.clone() });
                 }
                 _ => self.open_search(),
             }
@@ -9699,7 +9702,7 @@ impl App {
             })
         });
         if let Some(img) = img {
-            if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+            if let Ok(st) = crate::vfs::fs::read_to_string("/proc/self/status") {
                 for l in st.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM") || l.starts_with("Threads")) {
                     eprintln!("[trace] {l}");
                 }
@@ -9862,9 +9865,9 @@ impl eframe::App for App {
                 paths.push(o.cwd.clone());
             }
             let (slot, busy, ctx2) = (self.watch_res.clone(), self.watch_busy.clone(), ctx.clone());
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let r: Vec<_> = paths.into_iter().map(|p| {
-                    let m = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+                    let m = crate::vfs::fs::metadata(&p).and_then(|m| m.modified()).ok();
                     (p, m)
                 }).collect();
                 *slot.lock().unwrap() = r;
@@ -10177,10 +10180,10 @@ mod gvfs_tests {
 
     #[test]
     fn uri_matches_gvfs_names() {
-        let d = std::env::temp_dir().join(format!("fbgvfs{}", std::process::id()));
+        let d = crate::vfs::temp_dir().join(format!("fbgvfs{}", crate::vfs::pid()));
         let g = d.join("gvfs");
         for n in ["smb-share:server=NAS,share=My Share", "sftp:host=pi.local,user=pi", "dav:host=cloud.x.org,ssl=true,prefix=%2Fremote.php"] {
-            std::fs::create_dir_all(g.join(n)).unwrap();
+            crate::vfs::fs::create_dir_all(g.join(n)).unwrap();
         }
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", &d) };
         assert!(uri_to_gvfs("smb://nas/My%20Share").is_some());
@@ -10190,14 +10193,14 @@ mod gvfs_tests {
         assert!(uri_to_gvfs("ssh://pi@pi.local:22/home").is_some());
         assert!(uri_to_gvfs("davs://cloud.x.org/remote.php").is_some());
         assert!(uri_to_gvfs("sftp://otro").is_none());
-        let _ = std::fs::remove_dir_all(d);
+        let _ = crate::vfs::fs::remove_dir_all(d);
     }
 }
 
 /// Carpeta de caché donde se extrae un comprimido para navegar dentro (única por ruta, tamaño y fecha).
 fn archive_cache_dir(p: &Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
-    let md = std::fs::metadata(p).ok()?;
+    let md = crate::vfs::fs::metadata(p).ok()?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     p.hash(&mut h);
     md.len().hash(&mut h);
@@ -10216,27 +10219,27 @@ fn archive_marker(root: &Path) -> PathBuf {
 /// (`inner-*`) de la vista previa que dejó un cierre brusco.
 pub fn clean_archive_cache() {
     if let Some(dir) = dirs::cache_dir().map(|d| d.join("filebrowser")) {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
+        if let Ok(rd) = crate::vfs::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let stale = e.file_name().to_string_lossy().starts_with("inner-")
                     && e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|a| a > Duration::from_secs(3600)).unwrap_or(false);
                 if stale {
-                    let _ = std::fs::remove_dir_all(e.path());
+                    let _ = crate::vfs::fs::remove_dir_all(e.path());
                 }
             }
         }
     }
     let Some(dir) = dirs::cache_dir().map(|d| d.join("filebrowser-rs").join("archives")) else { return };
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = crate::vfs::fs::read_dir(&dir) else { return };
     let limit = Duration::from_secs(24 * 3600);
     for e in rd.flatten() {
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|a| a > limit).unwrap_or(false);
         if old {
             let p = e.path();
-            if p.is_dir() {
-                let _ = std::fs::remove_dir_all(&p);
+            if p.v_is_dir() {
+                let _ = crate::vfs::fs::remove_dir_all(&p);
             } else {
-                let _ = std::fs::remove_file(&p);
+                let _ = crate::vfs::fs::remove_file(&p);
             }
         }
     }

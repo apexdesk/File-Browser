@@ -1,7 +1,9 @@
 //! Cómics en CBZ (zip) y CBR (rar): una página por imagen, en orden natural de nombre.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::docview::Pages;
 use crate::thumbs::{decode_jpeg_from, Decoded};
-use std::fs::File;
+use crate::vfs::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -34,7 +36,7 @@ pub struct Comic {
 impl Drop for Comic {
     fn drop(&mut self) {
         if let Src::Dir(d) = &self.src {
-            let _ = std::fs::remove_dir_all(d);
+            let _ = crate::vfs::fs::remove_dir_all(d);
         }
     }
 }
@@ -64,12 +66,12 @@ fn open_inner(path: &Path, only_first: bool) -> Result<Comic, String> {
     Ok(Comic { src: Src::Zip(ar), names })
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_arch = "wasm32"))]
 fn open_rar(_: &Path, _: bool) -> Result<Comic, String> {
     Err(crate::i18n::t("No se pudo mostrar el documento").into())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn open_rar(path: &Path, only_first: bool) -> Result<Comic, String> {
     let fail = || crate::i18n::t("No se pudo mostrar el documento").to_string();
     let mut names: Vec<String> = unrar::Archive::new(path)
@@ -83,8 +85,8 @@ fn open_rar(path: &Path, only_first: bool) -> Result<Comic, String> {
     if names.is_empty() {
         return Err(fail());
     }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join(format!("comic-{}-{stamp}", std::process::id()));
+    let stamp = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = dirs::cache_dir().unwrap_or_else(crate::vfs::temp_dir).join("filebrowser").join(format!("comic-{}-{stamp}", crate::vfs::pid()));
     crate::fsys::private_dir(&dir);
     let keep: Vec<String> = if only_first { names[..1].to_vec() } else { names.clone() };
     let mut cur = unrar::Archive::new(path).open_for_processing().map_err(|_| fail())?;
@@ -105,11 +107,11 @@ fn open_rar(path: &Path, only_first: bool) -> Result<Comic, String> {
             let (data, next) = h.read().map_err(|_| fail())?;
             total += data.len() as u64;
             if total > 1 << 30 {
-                let _ = std::fs::remove_dir_all(&dir);
+                let _ = crate::vfs::fs::remove_dir_all(&dir);
                 return Err(fail());
             }
             let k = names.iter().position(|n| *n == keep[i]).unwrap_or(i);
-            let _ = std::fs::write(dir.join(k.to_string()), data);
+            let _ = crate::vfs::fs::write(dir.join(k.to_string()), data);
             cur = next;
             done += 1;
             if done == keep.len() {
@@ -136,7 +138,7 @@ impl Comic {
                 f.take(MAX_PAGE_BYTES).read_to_end(&mut v).map_err(|e| e.to_string())?;
                 Ok(v)
             }
-            Src::Dir(d) => std::fs::read(d.join(page.to_string())).map_err(|e| e.to_string()),
+            Src::Dir(d) => crate::vfs::fs::read(d.join(page.to_string())).map_err(|e| e.to_string()),
         }
     }
 }
@@ -167,7 +169,7 @@ impl Pages for Comic {
 
 /// Miniatura: la primera página.
 pub fn thumb(path: &Path, max: u32) -> Option<Decoded> {
-    if std::fs::metadata(path).ok()?.len() > 2 << 30 {
+    if crate::vfs::fs::metadata(path).ok()?.len() > 2 << 30 {
         return None;
     }
     let mut c = open_inner(path, true).ok()?;

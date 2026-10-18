@@ -1,5 +1,7 @@
 //! Muestra de una fuente (TTF/OTF/TTC/OTC) para la vista previa: nombre y texto de prueba
 //! dibujados con la propia fuente, más sus datos.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::i18n::t;
 use crate::thumbs::Decoded;
 use skrifa::instance::{LocationRef, Size};
@@ -95,10 +97,10 @@ fn wrap(font: &FontRef, text: &str, px: f32, max: f32) -> Vec<String> {
 
 pub fn specimen(path: &Path) -> Result<Decoded, String> {
     let fail = || t("No se pudo mostrar el documento").to_string();
-    if std::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
+    if crate::vfs::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
         return Err(t("El documento es demasiado grande para mostrarlo").into());
     }
-    let data = std::fs::read(path).map_err(|_| fail())?;
+    let data = crate::vfs::fs::read(path).map_err(|_| fail())?;
     let font = open(&data).ok_or_else(fail)?;
     let name = font.localized_strings(StringId::FULL_NAME).english_or_first().map(|s| s.to_string()).unwrap_or_default();
     let w = 1100.0f32;
@@ -136,10 +138,10 @@ pub fn specimen(path: &Path) -> Result<Decoded, String> {
 /// Datos de la fuente como pares (etiqueta, valor).
 pub fn info(path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if std::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
+    if crate::vfs::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
         return out;
     }
-    let Ok(data) = std::fs::read(path) else { return out };
+    let Ok(data) = crate::vfs::fs::read(path) else { return out };
     let Some(font) = open(&data) else { return out };
     let s = |id: StringId| font.localized_strings(id).english_or_first().map(|x| x.to_string()).filter(|x| !x.is_empty());
     for (label, id) in [

@@ -1,5 +1,7 @@
 //! Integración con el sistema: argumentos de línea de órdenes, instancia única y registro como
 //! gestor de archivos (escritorio).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -134,7 +136,7 @@ pub fn start() -> Cli {
 
 #[cfg(all(unix, not(target_os = "android")))]
 fn socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(std::env::temp_dir);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.v_is_dir()).unwrap_or_else(crate::vfs::temp_dir);
     let uid = unsafe { libc::getuid() };
     dir.join(format!("filebrowser-rs-{uid}.sock"))
 }
@@ -164,7 +166,7 @@ mod win_ipc {
     }
 
     pub fn forward(targets: &[PathBuf]) -> bool {
-        let Some(txt) = state_file().and_then(|f| std::fs::read_to_string(f).ok()) else { return false };
+        let Some(txt) = state_file().and_then(|f| crate::vfs::fs::read_to_string(f).ok()) else { return false };
         let mut it = txt.split_whitespace();
         let (Some(port), Some(token)) = (it.next().and_then(|p| p.parse::<u16>().ok()), it.next()) else { return false };
         let Ok(mut s) = TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(500))
@@ -184,7 +186,7 @@ mod win_ipc {
         let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
         let Some(file) = state_file() else { return inbox };
         // ¿otra instancia viva?
-        if let Ok(txt) = std::fs::read_to_string(&file) {
+        if let Ok(txt) = crate::vfs::fs::read_to_string(&file) {
             if let Some(port) = txt.split_whitespace().next().and_then(|p| p.parse::<u16>().ok()) {
                 if TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(300)).is_ok() {
                     return inbox;
@@ -195,11 +197,11 @@ mod win_ipc {
         let Ok(addr) = l.local_addr() else { return inbox };
         let token = format!("{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish());
         if let Some(d) = file.parent() {
-            let _ = std::fs::create_dir_all(d);
+            let _ = crate::vfs::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(&file, format!("{} {}", addr.port(), token));
+        let _ = crate::vfs::fs::write(&file, format!("{} {}", addr.port(), token));
         let q = inbox.clone();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             for c in l.incoming() {
                 let Ok(mut c) = c else { continue };
                 let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(2)));
@@ -247,15 +249,15 @@ pub fn listen(wake: impl Fn() + Send + Sync + 'static) -> Inbox {
     if UnixStream::connect(&path).is_ok() {
         return inbox;
     }
-    let _ = std::fs::remove_file(&path);
+    let _ = crate::vfs::fs::remove_file(&path);
     let Ok(l) = UnixListener::bind(&path) else { return inbox };
     #[cfg(target_os = "linux")]
     {
         let (q, w) = (inbox.clone(), wake.clone());
-        std::thread::spawn(move || dbus_service(q, w));
+        crate::vfs::thread::spawn(move || dbus_service(q, w));
     }
     let q = inbox.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut c) = c else { continue };
             let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(2)));
@@ -397,9 +399,9 @@ pub fn install() -> Result<String, String> {
     let data = dirs::data_dir().ok_or("no data directory")?;
     let apps = data.join("applications");
     let icons = data.join("icons/hicolor/256x256/apps");
-    std::fs::create_dir_all(&apps).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&icons).map_err(|e| e.to_string())?;
-    std::fs::write(icons.join("filebrowser-rs.png"), include_bytes!("../assets/icon-256.png")).map_err(|e| e.to_string())?;
+    crate::vfs::fs::create_dir_all(&apps).map_err(|e| e.to_string())?;
+    crate::vfs::fs::create_dir_all(&icons).map_err(|e| e.to_string())?;
+    crate::vfs::fs::write(icons.join("filebrowser-rs.png"), include_bytes!("../assets/icon-256.png")).map_err(|e| e.to_string())?;
     let exec = exe.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
     let desktop = format!(
         "[Desktop Entry]\nType=Application\nName=File Browser\nComment=Fast, lightweight file manager\n\
@@ -407,7 +409,7 @@ pub fn install() -> Result<String, String> {
          MimeType=inode/directory;\nStartupWMClass=filebrowser-rs\nKeywords=files;folders;explorer;\n"
     );
     let f = apps.join("filebrowser-rs.desktop");
-    std::fs::write(&f, desktop).map_err(|e| e.to_string())?;
+    crate::vfs::fs::write(&f, desktop).map_err(|e| e.to_string())?;
     let run = |prog: &str, args: &[&str]| {
         std::process::Command::new(prog)
             .args(args)
@@ -419,8 +421,8 @@ pub fn install() -> Result<String, String> {
     };
     // «Mostrar en la carpeta» de otras aplicaciones (D-Bus FileManager1)
     let svc = data.join("dbus-1/services");
-    if std::fs::create_dir_all(&svc).is_ok() {
-        let _ = std::fs::write(
+    if crate::vfs::fs::create_dir_all(&svc).is_ok() {
+        let _ = crate::vfs::fs::write(
             svc.join("org.freedesktop.FileManager1.service"),
             format!("[D-BUS Service]\nName=org.freedesktop.FileManager1\nExec=\"{exec}\"\n"),
         );
@@ -440,7 +442,7 @@ pub fn uninstall() -> Result<String, String> {
     let data = dirs::data_dir().ok_or("no data directory")?;
     let mut n = 0;
     for f in [data.join("applications/filebrowser-rs.desktop"), data.join("dbus-1/services/org.freedesktop.FileManager1.service"), data.join("icons/hicolor/256x256/apps/filebrowser-rs.png")] {
-        if std::fs::remove_file(&f).is_ok() {
+        if crate::vfs::fs::remove_file(&f).is_ok() {
             n += 1;
         }
     }

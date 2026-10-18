@@ -1,17 +1,19 @@
 //! Reproductor integrado. `ffmpeg -re` decodifica a PPM por tubería (ritmo de tiempo real) y se
 //! dibuja como textura; el audio lo reproduce `ffplay` sincronizado al arrancar. Sin ffmpeg no hay
 //! reproducción (la vista previa sigue mostrando el fotograma).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use egui::ColorImage;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use web_time::Instant;
 
 fn which(bin: &str) -> bool {
     let exe = if cfg!(windows) { format!("{bin}.exe") } else { bin.to_string() };
-    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file())).unwrap_or(false)
+    std::env::var_os("PATH").map(|p| crate::vfs::split_paths(&p).any(|d| d.join(&exe).v_is_file())).unwrap_or(false)
 }
 
 pub fn have_ffmpeg() -> bool {
@@ -82,7 +84,7 @@ impl Player {
             duration_bits: {
                 let bits = Arc::new(AtomicU64::new(0f64.to_bits()));
                 let (b, p, c) = (bits.clone(), path.to_path_buf(), ctx.clone());
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     b.store(probe_duration(&p).to_bits(), Ordering::Relaxed);
                     c.request_repaint();
                 });
@@ -113,7 +115,7 @@ impl Player {
         for c in [self.video.take(), self.audio.take()].into_iter().flatten() {
             let mut c = c;
             let _ = c.kill();
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let _ = c.wait();
             });
         }
@@ -140,7 +142,7 @@ impl Player {
         let Some(out) = child.stdout.take() else { return };
         self.video = Some(child);
         let (shared, ctx) = (self.shared.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let mut r = BufReader::with_capacity(1 << 20, out);
             let mut line = String::new();
             loop {

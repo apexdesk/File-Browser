@@ -1,5 +1,7 @@
 //! Iconos del sistema: tema de iconos freedesktop en Linux, Shell (SHGetFileInfo / lista de imágenes)
 //! en Windows. En otras plataformas devuelve `None` y se usan los iconos vectoriales propios.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::thumbs::Decoded;
 use egui::{ColorImage, Context, TextureHandle, TextureId, TextureOptions};
 use std::collections::HashMap;
@@ -24,7 +26,7 @@ impl SysIcons {
             #[cfg(target_os = "linux")]
             lin_rx: {
                 let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
+                crate::vfs::thread::spawn(move || {
                     let _ = tx.send(linux::Lookup::new());
                 });
                 Some(rx)
@@ -153,6 +155,8 @@ impl SysIcons {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "linux")]
 mod linux {
+    #[allow(unused_imports)]
+    use crate::vfs::{KindV as _, PathV as _};
     use super::Decoded;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -190,7 +194,7 @@ mod linux {
         v.push(PathBuf::from("/usr/share/icons"));
         v.push(PathBuf::from("/usr/share/pixmaps"));
         v.dedup();
-        v.into_iter().filter(|p| p.is_dir()).collect()
+        v.into_iter().filter(|p| p.v_is_dir()).collect()
     }
 
     fn current_theme() -> String {
@@ -205,7 +209,7 @@ mod linux {
         }
         if let Some(c) = dirs::config_dir() {
             for f in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
-                if let Ok(t) = std::fs::read_to_string(c.join(f)) {
+                if let Ok(t) = crate::vfs::fs::read_to_string(c.join(f)) {
                     for l in t.lines() {
                         if let Some(v) = l.strip_prefix("gtk-icon-theme-name") {
                             let v = v.trim_start_matches([' ', '=']).trim().to_string();
@@ -228,7 +232,7 @@ mod linux {
             return None;
         }
         let root = base.join(name);
-        let txt = std::fs::read_to_string(root.join("index.theme")).ok()?;
+        let txt = crate::vfs::fs::read_to_string(root.join("index.theme")).ok()?;
         let mut inherits = Vec::new();
         let mut dirs_list: Vec<String> = Vec::new();
         let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
@@ -303,7 +307,7 @@ mod linux {
                 }
             }
             let mut globs = HashMap::new();
-            if let Ok(t) = std::fs::read_to_string("/usr/share/mime/globs2") {
+            if let Ok(t) = crate::vfs::fs::read_to_string("/usr/share/mime/globs2") {
                 for l in t.lines() {
                     let mut it = l.splitn(3, ':');
                     let (_w, Some(mime), Some(glob)) = (it.next(), it.next(), it.next()) else { continue };
@@ -315,7 +319,7 @@ mod linux {
                 }
             }
             let mut generic = HashMap::new();
-            if let Ok(t) = std::fs::read_to_string("/usr/share/mime/generic-icons") {
+            if let Ok(t) = crate::vfs::fs::read_to_string("/usr/share/mime/generic-icons") {
                 for l in t.lines() {
                     if let Some((m, i)) = l.split_once(':') {
                         generic.insert(m.to_string(), i.to_string());
@@ -371,7 +375,7 @@ mod linux {
                 for (_, d) in cands {
                     for ext in ["svg", "png"] {
                         let p = d.path.join(format!("{name}.{ext}"));
-                        if p.is_file() {
+                        if p.v_is_file() {
                             res = Some(p);
                             break 'themes;
                         }
@@ -382,7 +386,7 @@ mod linux {
                 for b in ["/usr/share/pixmaps"] {
                     for ext in ["svg", "png"] {
                         let p = PathBuf::from(b).join(format!("{name}.{ext}"));
-                        if p.is_file() {
+                        if p.v_is_file() {
                             res = Some(p);
                         }
                     }

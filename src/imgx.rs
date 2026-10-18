@@ -1,5 +1,7 @@
 //! Formatos de imagen que `image` no lee: RAW de cámara (vista previa JPEG incrustada), PSD
 //! (imagen compuesta) y miniatura guardada en los archivos .blend.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::thumbs::{decode_jpeg_from, Decoded};
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -52,11 +54,11 @@ fn be32(b: &[u8]) -> usize {
 }
 
 fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
-    let md = std::fs::metadata(path).ok()?;
+    let md = crate::vfs::fs::metadata(path).ok()?;
     if md.len() > 512 << 20 {
         return None;
     }
-    let data = std::fs::read(path).ok()?;
+    let data = crate::vfs::fs::read(path).ok()?;
     if data.len() < 30 || &data[..4] != b"8BPS" {
         return None;
     }
@@ -163,11 +165,11 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
 // ---------------------------------------------------------------------------
 
 fn blend_thumb(path: &Path) -> Option<Decoded> {
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = crate::vfs::fs::File::open(path).ok()?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).ok()?;
     drop(f);
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::vfs::fs::File::open(path).ok()?;
     let mut r: Box<dyn Read> = if magic[..2] == [0x1F, 0x8B] {
         Box::new(flate2::read::MultiGzDecoder::new(f))
     } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {

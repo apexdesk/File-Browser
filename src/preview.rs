@@ -1,5 +1,7 @@
 //! Vista rápida (Espacio): imágenes a pantalla casi completa con zoom/pan, texto virtualizado,
 //! carpetas y ficha de información. Un único hilo de fondo; sólo se atiende la última petición.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::fsys::{fmt_time, human_size, Kind};
 use crate::i18n::{t, tf};
 use crate::theme::{self, Glyph, Pal};
@@ -147,6 +149,9 @@ pub struct Worker {
     slot: Arc<(Mutex<Option<Job>>, Condvar)>,
     rx: Receiver<(u64, Raw)>,
     generation: u64,
+    /// sin hilos (navegador): el trabajo se hace al pedirlo
+    #[cfg(target_arch = "wasm32")]
+    tx: std::sync::mpsc::Sender<(u64, Raw)>,
 }
 
 impl Worker {
@@ -154,7 +159,12 @@ impl Worker {
         let slot: Arc<(Mutex<Option<Job>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
         let (tx, rx) = channel();
         let (s, ctx) = (slot.clone(), ctx.clone());
-        std::thread::spawn(move || loop {
+        #[cfg(target_arch = "wasm32")]
+        let _ = &ctx;
+        #[cfg(not(target_arch = "wasm32"))]
+        let tx2 = tx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::vfs::thread::spawn(move || loop {
             let job = {
                 let mut g = s.0.lock().unwrap();
                 loop {
@@ -165,18 +175,26 @@ impl Worker {
                 }
             };
             let raw = load(&job);
-            if tx.send((job.generation, raw)).is_err() {
+            if tx2.send((job.generation, raw)).is_err() {
                 return;
             }
             ctx.request_repaint();
         });
-        Worker { slot, rx, generation: 0 }
+        Worker { slot, rx, generation: 0, #[cfg(target_arch = "wasm32")] tx }
     }
 
     fn submit(&mut self, path: PathBuf, kind: Kind) -> u64 {
         self.generation += 1;
-        *self.slot.0.lock().unwrap() = Some(Job { generation: self.generation, path, kind });
-        self.slot.1.notify_one();
+        let job = Job { generation: self.generation, path, kind };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self.tx.send((job.generation, load(&job)));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *self.slot.0.lock().unwrap() = Some(job);
+            self.slot.1.notify_one();
+        }
         self.generation
     }
 }
@@ -225,7 +243,7 @@ fn draw_lines(ctx: &egui::Context, cp: &egui::Painter, content: Rect, in_content
 }
 
 fn read_limited(path: &std::path::Path, max: u64) -> Option<String> {
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::vfs::fs::File::open(path).ok()?;
     if f.metadata().ok()?.len() > max {
         return None;
     }
@@ -237,10 +255,10 @@ fn read_limited(path: &std::path::Path, max: u64) -> Option<String> {
 /// Primeras líneas de un archivo de texto.
 fn text_raw(path: &std::path::Path) -> Raw {
     // una tubería con nombre o un dispositivo bloquearían para siempre el hilo de vistas previas
-    if !std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+    if !crate::vfs::fs::metadata(path).map(|m| m.v_is_file()).unwrap_or(false) {
         return Raw::Err(t("No se pudo abrir").into());
     }
-    let Ok(f) = std::fs::File::open(path) else {
+    let Ok(f) = crate::vfs::fs::File::open(path) else {
         return Raw::Err(t("No se pudo abrir").into());
     };
     let mut buf = Vec::new();
@@ -299,7 +317,7 @@ fn load(job: &Job) -> Raw {
             }
             "sqlite" | "sqlite3" | "db" | "db3" => {
                 let mut m = [0u8; 16];
-                if std::fs::File::open(&job.path).and_then(|mut f| f.read_exact(&mut m)).is_ok() && &m == b"SQLite format 3\0" {
+                if crate::vfs::fs::File::open(&job.path).and_then(|mut f| f.read_exact(&mut m)).is_ok() && &m == b"SQLite format 3\0" {
                     return match crate::sqlite::read(&job.path) {
                         Ok(t) => Raw::Tables(t),
                         Err(e) => Raw::Err(e),
@@ -325,13 +343,13 @@ fn load(job: &Job) -> Raw {
     }
     // archivo de un servidor SFTP: se descarga sólo si es pequeño
     if !matches!(job.kind, Kind::Folder) && crate::sftp::is_remote(&job.path) {
-        let small = std::fs::metadata(&job.path).map(|m| m.len() <= 32 << 20).unwrap_or(false);
+        let small = crate::vfs::fs::metadata(&job.path).map(|m| m.len() <= 32 << 20).unwrap_or(false);
         if !small || crate::sftp::ensure_local(&job.path).is_err() {
             return Raw::Binary;
         }
     }
     match job.kind {
-        Kind::Folder => match std::fs::read_dir(&job.path) {
+        Kind::Folder => match crate::vfs::fs::read_dir(&job.path) {
             Ok(rd) => {
                 let mut n = 0usize;
                 let mut names = Vec::new();
@@ -367,7 +385,7 @@ impl Drop for Preview {
     fn drop(&mut self) {
         self.inner = None;
         if let Some(d) = self.tmp.take() {
-            let _ = std::fs::remove_dir_all(d);
+            let _ = crate::vfs::fs::remove_dir_all(d);
         }
     }
 }
@@ -474,7 +492,7 @@ impl Preview {
                         let base = name.rsplit('/').next().unwrap_or(&name).to_string();
                         let ext = base.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_default();
                         let kind = crate::fsys::kind_of_ext(&ext);
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let size = crate::vfs::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let mut iw = Worker::new(ctx);
                         let pv = Preview::open(&mut iw, path, base, kind, size, 0, String::new(), None);
                         self.inner = Some(Box::new((pv, iw)));
@@ -770,13 +788,13 @@ impl Preview {
     fn open_entry(&mut self, ctx: &egui::Context, name: String) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (src, ctx2, n) = (self.path.clone(), ctx.clone(), name.clone());
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join(format!("inner-{}-{stamp}", std::process::id()));
+        let stamp = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = dirs::cache_dir().unwrap_or_else(crate::vfs::temp_dir).join("filebrowser").join(format!("inner-{}-{stamp}", crate::vfs::pid()));
         if let Some(old) = self.tmp.replace(dir.clone()) {
-            let _ = std::fs::remove_dir_all(old);
+            let _ = crate::vfs::fs::remove_dir_all(old);
         }
         self.entry_err = None;
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let r = crate::archive::read_entry(&src, &n, &dir, 64 << 20);
             let _ = tx.send(r);
             ctx2.request_repaint();
@@ -808,7 +826,7 @@ impl Preview {
             self.meta_started = true;
             let (tx, rx) = std::sync::mpsc::channel();
             let (path, kind, size, ctx2) = (self.path.clone(), self.kind, self.size, ctx.clone());
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let _ = tx.send(crate::meta::collect(&path, kind, size));
                 ctx2.request_repaint();
             });
@@ -1226,7 +1244,7 @@ impl Preview {
             let (bg, base) = if dark { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [150, 185, 255]) } else { ([pal.bg.r(), pal.bg.g(), pal.bg.b()], [70, 110, 220]) };
             let (tx, rx) = std::sync::mpsc::channel();
             let (mesh, ctx2, yaw, pitch, zoom) = (mv.mesh.clone(), ctx.clone(), mv.yaw, mv.pitch, mv.zoom);
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let _ = tx.send(crate::mesh3d::render(&mesh, yaw, pitch, zoom, rw, rh, bg, base, full));
                 ctx2.request_repaint();
             });

@@ -1,10 +1,12 @@
 //! Reproductor de audio integrado: `symphonia` decodifica (MP3, WAV, OGG/Vorbis, FLAC, AAC/M4A, ALAC)
 //! en un hilo y `cpal` saca el sonido por el dispositivo predeterminado. Sin dependencias externas.
 //! En Android todavía no hay salida de sonido.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymErr;
@@ -29,7 +31,7 @@ struct Meta {
 }
 
 fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -74,7 +76,7 @@ fn cover_image(data: &[u8]) -> Option<egui::ColorImage> {
 
 fn read_meta(path: &Path) -> Meta {
     let mut m = Meta::default();
-    let Ok(file) = std::fs::File::open(path) else { return m };
+    let Ok(file) = crate::vfs::fs::File::open(path) else { return m };
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -149,7 +151,7 @@ impl AudioPlayer {
         let meta = Arc::new(Mutex::new(None));
         {
             let (meta, p, ctx) = (meta.clone(), path.to_path_buf(), ctx.clone());
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let m = read_meta(&p);
                 *meta.lock().unwrap() = Some(m);
                 ctx.request_repaint();
@@ -193,7 +195,7 @@ impl AudioPlayer {
         self.sess = sess.clone();
         let my = self.epoch.load(Ordering::SeqCst);
         let (epoch, path, ctx) = (self.epoch.clone(), self.path.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             if let Err(e) = run(&path, pos, &sess, &epoch, my) {
                 *sess.error.lock().unwrap() = Some(e);
             }
@@ -289,7 +291,7 @@ fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> R
         // mantiene `played` de la sesión al día con el contador del dispositivo
         sess.played.store(played.load(Ordering::Relaxed), Ordering::Relaxed);
         if ring.lock().map(|q| q.len()).unwrap_or(0) > high {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            crate::vfs::thread::sleep(std::time::Duration::from_millis(15));
             continue;
         }
         let packet = match format.next_packet() {
@@ -366,10 +368,10 @@ fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> R
     if eof {
         while alive() && ring.lock().map(|q| !q.is_empty()).unwrap_or(false) {
             sess.played.store(played.load(Ordering::Relaxed), Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            crate::vfs::thread::sleep(std::time::Duration::from_millis(20));
         }
         if alive() {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            crate::vfs::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
     sess.played.store(played.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -395,6 +397,11 @@ fn map_channel(f: &[f32], o: usize, ch_out: usize) -> f32 {
 
 /// Abre la salida de sonido (cpal en escritorio, AAudio en Android). El valor devuelto mantiene
 /// el flujo abierto mientras viva.
+#[cfg(target_arch = "wasm32")]
+fn open_out(_ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, _played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
+    Err("sin audio en la web".into())
+}
+
 #[cfg(target_os = "android")]
 fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
     let s = crate::droid::Sink::open(0, 2, ring.clone(), played.clone())?;
@@ -402,7 +409,7 @@ fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<Ato
     Ok((Box::new(s), r, c))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
     use cpal::traits::StreamTrait;
     let (dev, cfg) = output_device()?;
@@ -411,7 +418,7 @@ fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<Ato
     Ok((Box::new(stream), cfg.sample_rate().0, cfg.channels() as usize))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn output_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let dev = cpal::default_host().default_output_device().ok_or("no hay dispositivo de audio")?;
@@ -419,7 +426,7 @@ fn output_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig), String
     Ok((dev, cfg))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn build_stream(
     dev: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
@@ -438,7 +445,7 @@ fn build_stream(
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn build<T>(
     dev: &cpal::Device,
     conf: &cpal::StreamConfig,

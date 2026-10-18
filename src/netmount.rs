@@ -1,6 +1,8 @@
 //! Conexión a servidores de red en Windows y macOS usando lo que trae el sistema (sin dependencias):
 //! SMB y WebDAV. Windows: `WNetAddConnection2`; macOS: `mount volume` de AppleScript.
 //! En Linux se usa GVFS (`gio`), ver `app.rs`.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 #[cfg(any(windows, target_os = "macos"))]
 use std::path::PathBuf;
 
@@ -161,7 +163,7 @@ mod imp {
             Kind::Unsupported(sc) => return Err(format!("«{sc}» no está disponible en este sistema")),
         };
         // ya accesible (sesión previa): no hace falta reconectar
-        if std::fs::read_dir(&remote).is_ok() {
+        if crate::vfs::fs::read_dir(&remote).is_ok() {
             return Ok(PathBuf::from(remote));
         }
         let user = if l.anon {
@@ -220,7 +222,7 @@ mod imp {
     use std::process::{Command, Stdio};
 
     fn volumes() -> Vec<String> {
-        std::fs::read_dir("/Volumes")
+        crate::vfs::fs::read_dir("/Volumes")
             .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default()
     }

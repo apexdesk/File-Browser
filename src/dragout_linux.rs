@@ -1,4 +1,6 @@
 //! Arrastre hacia fuera en Linux: Wayland (wl_data_device) y X11 (XDND).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::dragout::{parse_uri_list, uri_list};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::path::PathBuf;
@@ -177,9 +179,9 @@ mod wl {
                             drop(wr);
                             let _ = conn.flush();
                             let (out, wake, conn) = (st.dropped.clone(), st.wake.clone(), conn.clone());
-                            std::thread::spawn(move || {
+                            crate::vfs::thread::spawn(move || {
                                 let mut buf = Vec::new();
-                                let _ = std::fs::File::from(rd).take(1 << 20).read_to_end(&mut buf);
+                                let _ = crate::vfs::fs::File::from(rd).take(1 << 20).read_to_end(&mut buf);
                                 out.lock().unwrap().extend(parse_uri_list(&buf));
                                 offer.finish();
                                 offer.destroy();
@@ -216,8 +218,8 @@ mod wl {
                 wl_data_source::Event::Send { mime_type, fd } => {
                     if mime_type == URI || mime_type.starts_with("text/plain") {
                         let data = st.payload.clone();
-                        std::thread::spawn(move || {
-                            let mut f = std::fs::File::from(fd);
+                        crate::vfs::thread::spawn(move || {
+                            let mut f = crate::vfs::fs::File::from(fd);
                             let _ = f.write_all(&data);
                         });
                     }
@@ -343,7 +345,7 @@ mod wl {
             if fd < 0 {
                 return None;
             }
-            let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            let file = crate::vfs::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
             (&file).write_all(&px).ok()?;
             let pool = shm.create_pool(file.as_fd(), px.len() as i32, &self.qh, ());
             let buf = pool.create_buffer(0, ICON, ICON, ICON * 4, wl_shm::Format::Argb8888, &self.qh, ());
@@ -390,7 +392,8 @@ mod x {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration};
+use web_time::{Instant};
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     use x11rb::protocol::Event;
@@ -436,7 +439,7 @@ mod x {
             let (busy, done, win) = (self.busy.clone(), self.done.clone(), self.win);
             let payload = uri_list(paths);
             busy.store(true, Ordering::Release);
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let _ = run(conn, screen, win, &payload);
                 busy.store(false, Ordering::Release);
                 done.store(true, Ordering::Release);
@@ -574,7 +577,7 @@ mod x {
                 if t.elapsed() > Duration::from_secs(8) {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                crate::vfs::thread::sleep(Duration::from_millis(10));
                 continue;
             }
             let q = c.query_pointer(root)?.reply()?;
@@ -614,7 +617,7 @@ mod x {
                 }
             }
             c.flush()?;
-            std::thread::sleep(Duration::from_millis(10));
+            crate::vfs::thread::sleep(Duration::from_millis(10));
         }
         let _ = c.destroy_window(src);
         let _ = c.flush();

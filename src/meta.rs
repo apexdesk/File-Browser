@@ -1,5 +1,7 @@
 //! Datos del archivo para el panel de información de la vista previa: foto (EXIF), audio (etiquetas
 //! y formato), vídeo (contenedor MP4/MKV) y fuentes.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::fsys::Kind;
 use crate::i18n::t;
 use std::io::{Read, Seek, SeekFrom};
@@ -55,7 +57,7 @@ fn audio(path: &Path, size: u64) -> Rows {
     use symphonia::core::meta::{MetadataOptions, StandardTagKey as K};
     use symphonia::core::probe::Hint;
     let mut rows = Rows::new();
-    let Ok(file) = std::fs::File::open(path) else { return rows };
+    let Ok(file) = crate::vfs::fs::File::open(path) else { return rows };
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -232,7 +234,7 @@ fn acodec_name(f: &[u8]) -> Option<&'static str> {
 }
 
 fn mp4(path: &Path, v: &mut Vid) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(mut f) = crate::vfs::fs::File::open(path) else { return false };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut pos = 0u64;
     // el índice (moov) puede estar al principio o al final: se salta mdat sin leerlo
@@ -397,7 +399,7 @@ fn mkv_codec(id: &str) -> String {
 }
 
 fn mkv(path: &Path, v: &mut Vid) -> bool {
-    let Ok(f) = std::fs::File::open(path) else { return false };
+    let Ok(f) = crate::vfs::fs::File::open(path) else { return false };
     let mut buf = Vec::new();
     if f.take(4 << 20).read_to_end(&mut buf).is_err() {
         return false;
