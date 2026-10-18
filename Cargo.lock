@@ -1391,9 +1391,11 @@ dependencies = [
  "egui",
  "flate2",
  "fsevent",
+ "getrandom 0.3.4",
  "image",
  "jni 0.21.1",
  "jpeg-decoder",
+ "js-sys",
  "libc",
  "log",
  "md-5",
@@ -1405,6 +1407,7 @@ dependencies = [
  "regex",
  "resvg",
  "ruzstd",
+ "serde_json",
  "sevenz-rust2",
  "sha1",
  "sha2",
@@ -1415,8 +1418,12 @@ dependencies = [
  "trash",
  "unrar",
  "vt100",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wayland-backend",
  "wayland-client",
+ "web-sys",
+ "web-time",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "x11rb",
@@ -1631,9 +1638,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]

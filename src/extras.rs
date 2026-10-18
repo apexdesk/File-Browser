@@ -1,6 +1,8 @@
 //! Utilidades extra: «Abrir con…», papelera, hashes y búsqueda de duplicados.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use crate::vfs::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -393,7 +395,12 @@ pub struct TrashRow {
 pub fn trash_delete(p: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     mac_trash::note(p);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = p;
+        Err("la papelera no está disponible en la web".into())
+    }
+    #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
     {
         trash::delete(p).map_err(|e| e.to_string())
     }
@@ -422,7 +429,7 @@ mod mac_trash {
         let _ = fs::create_dir_all(f.parent().unwrap());
         let line = format!(
             "{}\t{}\t{}\n",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             name.to_string_lossy().replace(['\t', '\n'], " "),
             abs.to_string_lossy().replace(['\t', '\n'], " ")
         );
@@ -493,8 +500,8 @@ mod mac_trash {
                 name: if hit.is_some() { base } else { name },
                 parent,
                 time: md.as_ref().map(|m| m.ctime()).unwrap_or(0),
-                size: md.as_ref().filter(|m| m.is_file()).map(|m| m.len()).unwrap_or(0),
-                dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                size: md.as_ref().filter(|m| m.v_is_file()).map(|m| m.len()).unwrap_or(0),
+                dir: md.as_ref().map(|m| m.v_is_dir()).unwrap_or(false),
                 path: e.path(),
             });
         }
@@ -531,7 +538,7 @@ mod mac_trash {
         let mut errs = Vec::new();
         for r in rows {
             let res = match fs::symlink_metadata(&r.path) {
-                Ok(m) if m.is_dir() => fs::remove_dir_all(&r.path),
+                Ok(m) if m.v_is_dir() => fs::remove_dir_all(&r.path),
                 Ok(_) => fs::remove_file(&r.path),
                 Err(e) => Err(e),
             };
@@ -645,7 +652,7 @@ pub fn spawn_hash(path: PathBuf, ctx: egui::Context) -> Arc<HashJob> {
     use md5::Digest as _;
     let job = Arc::new(HashJob::default());
     let j = job.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let res = (|| -> Result<[String; 3], String> {
             crate::sftp::ensure_local_with(&path, &j.cancel, &mut |_| {})?;
             let mut f = File::open(&path).map_err(|e| e.to_string())?;
@@ -696,9 +703,9 @@ fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, j: &DupJob, ctx: &egui
         }
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
-        if ft.is_dir() {
+        if ft.v_is_dir() {
             walk(&p, out, j, ctx);
-        } else if ft.is_file() {
+        } else if ft.v_is_file() {
             if let Ok(md) = e.metadata() {
                 if md.len() > 0 {
                     out.entry(md.len()).or_default().push(p);
@@ -733,7 +740,7 @@ fn quick_hash(p: &Path, full: bool) -> Option<[u8; 32]> {
 pub fn spawn_dups(root: PathBuf, ctx: egui::Context) -> Arc<DupJob> {
     let job = Arc::new(DupJob::default());
     let j = job.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
         walk(&root, &mut by_size, &j, &ctx);
         for (size, files) in by_size.into_iter().filter(|(_, v)| v.len() > 1) {

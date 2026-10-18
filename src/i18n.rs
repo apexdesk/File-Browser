@@ -1,4 +1,6 @@
 //! Traducciones: el texto en español es la clave; `t()` devuelve la cadena del idioma activo.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::i18n_table::TABLE;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -183,7 +185,7 @@ fn cjk_font(lang: &str) -> Option<(Vec<u8>, u32)> {
         }
     }
     for (p, idx) in cands {
-        if let Ok(b) = std::fs::read(&p) {
+        if let Ok(b) = crate::vfs::fs::read(&p) {
             return Some((b, idx));
         }
     }

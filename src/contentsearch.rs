@@ -1,7 +1,9 @@
 //! Búsqueda por contenido: texto plano y documentos (PDF, Office, OpenDocument…) que contienen una frase.
 //! No hay índice: se recorre la carpeta en el momento con varios hilos, así que no cuesta nada en reposo.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::tools::{pseudo_fs, Search, MAX_RESULTS};
-use std::fs;
+use crate::vfs::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AO;
@@ -17,16 +19,16 @@ const DOC_PAGES: usize = 300;
 pub fn spawn(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Context) -> Arc<Search> {
     let st = Arc::new(Search::default());
     let s = st.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let needle = needle.to_lowercase();
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 6);
+        let n = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 6);
         let (tx, rx) = sync_channel::<PathBuf>(256);
         let rx = Arc::new(Mutex::new(rx));
         let found = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = Vec::new();
         for _ in 0..n {
             let (rx, s, needle, found, ctx) = (rx.clone(), s.clone(), needle.clone(), found.clone(), ctx.clone());
-            workers.push(std::thread::spawn(move || loop {
+            workers.push(crate::vfs::thread::spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
                 if s.cancel.load(AO::Relaxed) || found.load(AO::Relaxed) >= MAX_RESULTS {
@@ -51,11 +53,11 @@ pub fn spawn(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Conte
                     continue;
                 }
                 let Ok(ft) = e.file_type() else { continue };
-                if ft.is_dir() {
+                if ft.v_is_dir() {
                     if !pseudo_fs(&e.path()) {
                         stack.push(e.path());
                     }
-                } else if ft.is_file() && tx.send(e.path()).is_err() {
+                } else if ft.v_is_file() && tx.send(e.path()).is_err() {
                     break 'walk;
                 }
             }
@@ -108,7 +110,7 @@ mod tests {
 
     #[test]
     fn finds_text_and_skips_binary() {
-        let d = std::env::temp_dir().join(format!("fb_cs_{}", std::process::id()));
+        let d = crate::vfs::temp_dir().join(format!("fb_cs_{}", crate::vfs::pid()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("a.txt"), "Hola Mundo cruel").unwrap();
@@ -117,7 +119,7 @@ mod tests {
         fs::write(d.join("d.txt"), "nada").unwrap();
         let st = spawn(vec![d.clone()], "MUNDO".into(), false, egui::Context::default());
         while !st.done.load(AO::Acquire) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::vfs::thread::sleep(std::time::Duration::from_millis(5));
         }
         let mut names: Vec<String> = st.results.lock().unwrap().iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         names.sort();

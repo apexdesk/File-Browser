@@ -1,4 +1,6 @@
 //! Uso de disco de una carpeta: árbol de tamaños (con límite de profundidad y de hijos) calculado en un hilo.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
 use std::sync::{Arc, Mutex};
@@ -39,7 +41,7 @@ struct Ctx {
     cancel: Arc<AtomicBool>,
     partial: Arc<AtomicBool>,
     /// (archivos, instante límite); `None` = sin límite
-    budget: Option<(u64, std::time::Instant)>,
+    budget: Option<(u64, web_time::Instant)>,
     egui: egui::Context,
     #[cfg(unix)]
     dev: u64,
@@ -60,19 +62,19 @@ pub fn start(path: PathBuf, ctx: &egui::Context, limited: bool) -> Scan {
         files: scan.files.clone(),
         cancel: scan.cancel.clone(),
         partial: scan.partial.clone(),
-        budget: limited.then(|| (200_000, std::time::Instant::now() + std::time::Duration::from_secs(10))),
+        budget: limited.then(|| (200_000, web_time::Instant::now() + std::time::Duration::from_secs(10))),
         egui: ctx.clone(),
         // se rellena en el hilo: `metadata` sobre un montaje de red caído bloquearía la interfaz
         #[cfg(unix)]
         dev: 0,
     };
     let (done, result) = (scan.done.clone(), scan.result.clone());
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         #[cfg(unix)]
         let c = {
             use std::os::unix::fs::MetadataExt;
             let mut c = c;
-            c.dev = std::fs::metadata(&path).map(|m| m.dev()).unwrap_or(0);
+            c.dev = crate::vfs::fs::metadata(&path).map(|m| m.dev()).unwrap_or(0);
             c
         };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
@@ -92,7 +94,7 @@ impl Ctx {
             return true;
         }
         if let Some((max, end)) = self.budget {
-            if self.files.load(AO::Relaxed) >= max || std::time::Instant::now() >= end {
+            if self.files.load(AO::Relaxed) >= max || web_time::Instant::now() >= end {
                 self.partial.store(true, AO::Relaxed);
                 return true;
             }
@@ -101,7 +103,7 @@ impl Ctx {
     }
 }
 
-fn file_size(md: &std::fs::Metadata) -> u64 {
+fn file_size(md: &crate::vfs::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -138,11 +140,11 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
                 cut = true;
                 break 'outer;
             }
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = crate::vfs::fs::read_dir(&dir) else { continue };
             for e in rd.flatten() {
                 let Ok(ft) = e.file_type() else { continue };
                 let n = e.file_name().to_string_lossy().into_owned();
-                if ft.is_dir() {
+                if ft.v_is_dir() {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::MetadataExt;
@@ -164,7 +166,7 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
                     }
                     if cnt % 512 == 511 {
                         // baja prioridad: deja respirar al disco y a la CPU
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        crate::vfs::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     arena[idx].own += sz;
                     // sólo se conservan individualmente los archivos de los anillos visibles
@@ -263,13 +265,13 @@ mod tests {
 
     #[test]
     fn many_files_keep_only_largest_and_totals_match() {
-        let d = std::env::temp_dir().join(format!("fb_du_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let d = crate::vfs::temp_dir().join(format!("fb_du_{}", crate::vfs::pid()));
+        let _ = crate::vfs::fs::remove_dir_all(&d);
+        crate::vfs::fs::create_dir_all(d.join("sub")).unwrap();
         for i in 0..400 {
-            std::fs::write(d.join(format!("f{i}")), vec![0u8; 5000 + i]).unwrap();
+            crate::vfs::fs::write(d.join(format!("f{i}")), vec![0u8; 5000 + i]).unwrap();
         }
-        std::fs::write(d.join("sub/x"), vec![0u8; 9000]).unwrap();
+        crate::vfs::fs::write(d.join("sub/x"), vec![0u8; 9000]).unwrap();
         let c = Ctx {
             bytes: Arc::new(AtomicU64::new(0)),
             files: Arc::new(AtomicU64::new(0)),
@@ -280,7 +282,7 @@ mod tests {
             #[cfg(unix)]
             dev: {
                 use std::os::unix::fs::MetadataExt;
-                std::fs::metadata(&d).unwrap().dev()
+                crate::vfs::fs::metadata(&d).unwrap().dev()
             },
         };
         let n = scan_bfs(&d, "r".into(), &c);
@@ -288,6 +290,6 @@ mod tests {
         assert_eq!(sum, n.size);
         assert!(n.kids.len() <= KIDS + 2);
         assert!(n.kids.iter().any(|k| k.other));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = crate::vfs::fs::remove_dir_all(&d);
     }
 }

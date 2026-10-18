@@ -1,9 +1,12 @@
 //! Prueba de robustez: archivos de ejemplo mutados (truncados, bytes cambiados) pasados por los lectores.
 //! Con `panic = "abort"` cualquier pánico cierra la aplicación, así que aquí se buscan.
 //! Se ejecuta con `FUZZ_DIR=<carpeta> cargo test --release --lib fuzz -- --ignored --nocapture`.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::{Instant};
 
 struct Rng(u64);
 impl Rng {
@@ -20,7 +23,7 @@ impl Rng {
 
 fn run(path: &Path) {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size = crate::vfs::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let kind = crate::fsys::kind_of_ext(&ext);
     let _ = crate::meta::collect(path, kind, size);
     match ext.as_str() {
@@ -31,19 +34,19 @@ fn run(path: &Path) {
             let _ = crate::sqlite::read(path);
         }
         "json" => {
-            let t = std::fs::read_to_string(path).unwrap_or_default();
+            let t = crate::vfs::fs::read_to_string(path).unwrap_or_default();
             let _ = crate::tree::from_json(&t);
         }
         "xml" => {
-            let t = std::fs::read_to_string(path).unwrap_or_default();
+            let t = crate::vfs::fs::read_to_string(path).unwrap_or_default();
             let _ = crate::tree::from_xml(&t);
         }
         "csv" => {
-            let t = std::fs::read_to_string(path).unwrap_or_default();
+            let t = crate::vfs::fs::read_to_string(path).unwrap_or_default();
             let _ = crate::table::csv(&t);
         }
         "md" => {
-            let t = std::fs::read_to_string(path).unwrap_or_default();
+            let t = crate::vfs::fs::read_to_string(path).unwrap_or_default();
             let _ = crate::rich::markdown(&t);
         }
         "ttf" | "otf" => {
@@ -86,15 +89,15 @@ fn run(path: &Path) {
 fn fuzz_readers() {
     let Some(dir) = std::env::var_os("FUZZ_DIR") else { return };
     let iters: usize = std::env::var("FUZZ_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
-    let tmp = std::env::temp_dir().join(format!("fb-fuzz-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = crate::vfs::temp_dir().join(format!("fb-fuzz-{}", crate::vfs::pid()));
+    crate::vfs::fs::create_dir_all(&tmp).unwrap();
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let mut bad = Vec::new();
     std::panic::set_hook(Box::new(|_| {}));
-    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    let mut files: Vec<_> = crate::vfs::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
     for f in files {
-        let data = std::fs::read(&f).unwrap();
+        let data = crate::vfs::fs::read(&f).unwrap();
         let name = f.file_name().unwrap().to_string_lossy().into_owned();
         let t0 = Instant::now();
         for it in 0..iters {
@@ -123,13 +126,13 @@ fn fuzz_readers() {
                 }
             }
             let p = tmp.join(&name);
-            std::fs::write(&p, &d).unwrap();
+            crate::vfs::fs::write(&p, &d).unwrap();
             let start = Instant::now();
             let r = catch_unwind(AssertUnwindSafe(|| run(&p)));
             if let Err(e) = r {
                 let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
                 let keep = tmp.join(format!("crash-{it}-{name}"));
-                let _ = std::fs::copy(&p, &keep);
+                let _ = crate::vfs::fs::copy(&p, &keep);
                 bad.push(format!("{name} iter {it}: PÁNICO {msg} ({})", keep.display()));
                 if bad.iter().filter(|b| b.starts_with(&name)).count() >= 3 {
                     break;
@@ -137,7 +140,7 @@ fn fuzz_readers() {
             }
             if start.elapsed() > Duration::from_secs(5) {
                 let keep = tmp.join(format!("slow-{it}-{name}"));
-                let _ = std::fs::copy(&p, &keep);
+                let _ = crate::vfs::fs::copy(&p, &keep);
                 bad.push(format!("{name} iter {it}: LENTO {:?} ({})", start.elapsed(), keep.display()));
             }
         }
@@ -162,7 +165,7 @@ fn fuzz_one() {
 #[ignore]
 fn fuzz_dir_once() {
     let Some(dir) = std::env::var_os("FUZZ_ONCE") else { return };
-    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    let mut files: Vec<_> = crate::vfs::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
     for f in files {
         let t = Instant::now();

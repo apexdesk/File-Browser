@@ -1,7 +1,9 @@
 //! Servicio de miniaturas: cola con prioridad "lo visible primero", pool de hilos,
 //! decodificación JPEG con escalado DCT, y caché LRU de texturas.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use crate::vfs::fs::File;
 use std::io::{BufReader, Read};
 use std::process::{Command, Stdio};
 use std::path::{Path, PathBuf};
@@ -39,6 +41,9 @@ pub struct Thumbs {
     cache: HashMap<u64, (egui::TextureHandle, u64)>,
     failed: HashSet<u64>,
     frame: u64,
+    /// sin hilos (navegador): las miniaturas se decodifican aquí, unas pocas por fotograma
+    #[cfg(target_arch = "wasm32")]
+    tx: Sender<(u64, Option<Decoded>)>,
 }
 
 fn is_video_ext(e: &str) -> bool {
@@ -48,8 +53,8 @@ fn is_video_ext(e: &str) -> bool {
 fn have_cmd(name: &'static str, cell: &'static OnceLock<bool>) -> bool {
     *cell.get_or_init(|| {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::split_paths(&path).any(|d| {
-            d.join(name).is_file() || d.join(format!("{name}.exe")).is_file()
+        crate::vfs::split_paths(&path).any(|d| {
+            d.join(name).v_is_file() || d.join(format!("{name}.exe")).v_is_file()
         })
     })
 }
@@ -74,16 +79,16 @@ fn run_capture(mut cmd: Command) -> Option<Vec<u8>> {
     // un archivo corrupto puede dejar colgado a ffmpeg/magick: se mata pasado el plazo
     let mut child = cmd.spawn().ok()?;
     let mut so = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let reader = crate::vfs::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut so, &mut buf);
         buf
     });
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let end = web_time::Instant::now() + std::time::Duration::from_secs(25);
     let ok = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st.success(),
-            Ok(None) if std::time::Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Ok(None) if web_time::Instant::now() < end => crate::vfs::thread::sleep(std::time::Duration::from_millis(15)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -139,11 +144,11 @@ fn magick_frame(path: &Path, max: u32) -> Option<Decoded> {
 }
 
 fn decode_svg(path: &Path, max: u32) -> Option<Decoded> {
-    let md = std::fs::metadata(path).ok()?;
+    let md = crate::vfs::fs::metadata(path).ok()?;
     if md.len() > 4 * 1024 * 1024 {
         return None;
     }
-    let data = std::fs::read(path).ok()?;
+    let data = crate::vfs::fs::read(path).ok()?;
     // un SVG no puede leer otros archivos del disco (<image href="/ruta">) para pintarlos en la miniatura
     let mut opt = resvg::usvg::Options::default();
     opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
@@ -253,7 +258,7 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
         "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" => {}
         _ => return ffmpeg_frame(path, max, false).or_else(|| magick_frame(path, max)),
     }
-    let md = std::fs::metadata(path).ok()?;
+    let md = crate::vfs::fs::metadata(path).ok()?;
     if md.len() > 256 * 1024 * 1024 {
         return None;
     }
@@ -319,10 +324,15 @@ impl Thumbs {
     pub fn new(ctx: &egui::Context) -> Self {
         let shared = Arc::new(Shared { st: Mutex::new(State::default()), cv: Condvar::new() });
         let (tx, rx) = channel();
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6);
+        let n = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6);
+        #[cfg(target_arch = "wasm32")]
+        let n = {
+            let _ = (n, ctx);
+            0
+        };
         for _ in 0..n {
             let (sh, tx, ctx): (Arc<Shared>, Sender<_>, egui::Context) = (shared.clone(), tx.clone(), ctx.clone());
-            std::thread::spawn(move || loop {
+            crate::vfs::thread::spawn(move || loop {
                 let req = {
                     let mut st = sh.st.lock().unwrap();
                     loop {
@@ -341,12 +351,14 @@ impl Thumbs {
                 ctx.request_repaint();
             });
         }
-        Thumbs { shared, rx, cache: HashMap::new(), failed: HashSet::new(), frame: 0 }
+        Thumbs { shared, rx, cache: HashMap::new(), failed: HashSet::new(), frame: 0, #[cfg(target_arch = "wasm32")] tx }
     }
 
     /// Recoge resultados y los sube a la GPU (acotado por frame).
     pub fn pump(&mut self, ctx: &egui::Context) {
         self.frame += 1;
+        #[cfg(target_arch = "wasm32")]
+        self.decode_some(ctx);
         let mut n = 0;
         while n < 24 {
             let Ok((key, out)) = self.rx.try_recv() else { break };
@@ -373,6 +385,24 @@ impl Thumbs {
             for (k, _) in v.iter().take(excess) {
                 self.cache.remove(k);
             }
+        }
+    }
+
+    /// Decodifica un par de miniaturas pendientes (en el navegador no hay hilos que lo hagan).
+    #[cfg(target_arch = "wasm32")]
+    fn decode_some(&mut self, ctx: &egui::Context) {
+        for _ in 0..2 {
+            let req = {
+                let mut st = self.shared.st.lock().unwrap();
+                let Some(r) = st.queue.pop() else { return };
+                st.inflight.insert(r.key);
+                r
+            };
+            // una imagen grande habría que bajarla entera para una miniatura
+            let big = crate::vfs::fs::metadata(&req.path).map(|m| m.len() > 4 << 20).unwrap_or(true);
+            let out = if big { None } else { decode_image(&req.path, THUMB) };
+            let _ = self.tx.send((req.key, out));
+            ctx.request_repaint();
         }
     }
 

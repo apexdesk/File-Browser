@@ -1,5 +1,7 @@
 //! Lector mínimo de TIFF/EXIF: orientación, datos de la toma, GPS y vistas previas JPEG incrustadas
 //! (RAW de cámara: CR2, NEF, ARW, DNG, ORF, RW2, PEF…).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::i18n::t;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -130,7 +132,7 @@ impl<R: Read + Seek> Tiff<R> {
 }
 
 /// Posición de la cabecera TIFF dentro del archivo: 0 para TIFF y RAW, el segmento APP1 en un JPEG.
-fn tiff_base(path: &Path, f: &mut std::fs::File) -> Option<u64> {
+fn tiff_base(path: &Path, f: &mut crate::vfs::fs::File) -> Option<u64> {
     let mut head = [0u8; 4];
     f.read_exact(&mut head).ok()?;
     if &head[..2] == b"II" || &head[..2] == b"MM" {
@@ -175,7 +177,7 @@ fn find(ents: &[Ent], tag: u16) -> Option<&Ent> {
 
 /// Orientación EXIF (1..8) de un JPEG o TIFF; 1 si no hay.
 pub fn orientation(path: &Path) -> u8 {
-    let Ok(mut f) = std::fs::File::open(path) else { return 1 };
+    let Ok(mut f) = crate::vfs::fs::File::open(path) else { return 1 };
     let Some(base) = tiff_base(path, &mut f) else { return 1 };
     let Some(mut tf) = Tiff::new(f, base) else { return 1 };
     let Some(first) = tf.first_ifd() else { return 1 };
@@ -198,7 +200,7 @@ fn gps(v: &[(u32, u32)], r: &str) -> Option<String> {
 /// Datos de la toma como pares (etiqueta, valor), ya traducidos.
 pub fn summary(path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(mut f) = std::fs::File::open(path) else { return out };
+    let Ok(mut f) = crate::vfs::fs::File::open(path) else { return out };
     let Some(base) = tiff_base(path, &mut f) else { return out };
     let Some(mut tf) = Tiff::new(f, base) else { return out };
     let Some(first) = tf.first_ifd() else { return out };
@@ -259,7 +261,7 @@ pub fn summary(path: &Path) -> Vec<(String, String)> {
 
 /// La mayor vista previa JPEG incrustada en un RAW de cámara o DNG: (desplazamiento, longitud, orientación).
 pub fn embedded_jpeg(path: &Path) -> Option<(u64, usize, u8)> {
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::vfs::fs::File::open(path).ok()?;
     let mut tf = Tiff::new(std::io::BufReader::new(f), 0)?;
     let mut best: Option<(u64, usize)> = None;
     let mut todo = vec![tf.first_ifd()?];
@@ -313,7 +315,7 @@ pub fn embedded_jpeg(path: &Path) -> Option<(u64, usize, u8)> {
 
 /// Vista previa JPEG de otros contenedores (CR3 y similares): busca el mayor flujo JPEG del principio del archivo.
 pub fn scan_jpeg(path: &Path) -> Option<(u64, usize)> {
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = crate::vfs::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     f.by_ref().take(16 << 20).read_to_end(&mut buf).ok()?;
     let mut best: Option<(u64, usize)> = None;
@@ -369,7 +371,7 @@ fn jpeg_end(b: &[u8]) -> Option<usize> {
 }
 
 pub fn read_range(path: &Path, off: u64, len: usize) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = crate::vfs::fs::File::open(path).ok()?;
     // el tamaño viene de la cabecera del archivo: se comprueba contra el real y se acota
     let flen = f.metadata().ok()?.len();
     if len > 64 << 20 || off.checked_add(len as u64)? > flen {

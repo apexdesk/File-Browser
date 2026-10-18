@@ -5,12 +5,15 @@
 //! El índice se guarda en la carpeta de caché para cargarlo al instante en el siguiente arranque
 //! y se vuelve a recorrer en segundo plano cuando pasa cierto tiempo.
 
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::tools::{Search, MAX_RESULTS};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AO};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const NO_PARENT: u32 = u32::MAX;
 const MAGIC: &[u8; 8] = b"FBIDX001";
@@ -120,13 +123,13 @@ impl Index {
             crate::fsys::private_dir(d);
         }
         let tmp = file.with_extension("tmp");
-        if std::fs::write(&tmp, &b).is_ok() {
-            let _ = std::fs::rename(&tmp, file);
+        if crate::vfs::fs::write(&tmp, &b).is_ok() {
+            let _ = crate::vfs::fs::rename(&tmp, file);
         }
     }
 
     fn load(file: &Path) -> Option<Index> {
-        let b = std::fs::read(file).ok()?;
+        let b = crate::vfs::fs::read(file).ok()?;
         if b.len() < 28 || &b[..8] != MAGIC {
             return None;
         }
@@ -214,7 +217,7 @@ fn current() -> Option<Arc<Index>> {
 }
 
 fn cache_file() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join("index.bin")
+    dirs::cache_dir().unwrap_or_else(crate::vfs::temp_dir).join("filebrowser").join("index.bin")
 }
 
 pub fn status() -> Status {
@@ -238,18 +241,22 @@ pub fn disable() {
     if let Ok(mut g) = CURRENT.write() {
         *g = None;
     }
-    let _ = std::fs::remove_file(cache_file());
+    let _ = crate::vfs::fs::remove_file(cache_file());
 }
 
 /// Activa el índice: carga el guardado (si coincide con las raíces) y recorre de nuevo si hace falta.
 pub fn start(roots: Vec<PathBuf>, ctx: egui::Context) {
+    // recorrer todo el servidor por la red no tiene sentido: en la web no hay índice
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
     if LOADING.swap(true, AO::SeqCst) {
         return;
     }
     let gener = GENERATION.load(AO::SeqCst);
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         // no compite con el arranque: el primer fotograma y el listado inicial van antes
-        std::thread::sleep(Duration::from_millis(2500));
+        crate::vfs::thread::sleep(Duration::from_millis(2500));
         if let Some(idx) = Index::load(&cache_file()) {
             if idx.roots() == roots && GENERATION.load(AO::SeqCst) == gener {
                 PROGRESS.store(idx.count(), AO::Relaxed);
@@ -296,13 +303,16 @@ struct Work {
 }
 
 pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
     if BUILDING.swap(true, AO::SeqCst) {
         return;
     }
     let gener = GENERATION.load(AO::SeqCst);
     PROGRESS.store(0, AO::Relaxed);
     let started = now_ms();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let mut idx = Index::default();
         let mut stack = Vec::new();
         for r in &roots {
@@ -311,11 +321,11 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
         }
         let shared = Arc::new((Mutex::new(Work { stack, active: 0 }), Condvar::new()));
         let idx = Arc::new(Mutex::new(idx));
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4);
+        let threads = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4);
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 let (shared, idx, ctx) = (shared.clone(), idx.clone(), ctx.clone());
-                std::thread::spawn(move || worker(&shared, &idx, gener, &ctx))
+                crate::vfs::thread::spawn(move || worker(&shared, &idx, gener, &ctx))
             })
             .collect();
         for h in hs {
@@ -347,7 +357,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
 
 fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: &egui::Context) {
     let (lock, cv) = shared;
-    let mut last = std::time::Instant::now();
+    let mut last = web_time::Instant::now();
     loop {
         let (id, dir) = {
             let mut w = lock.lock().unwrap();
@@ -367,9 +377,9 @@ fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: 
             }
         };
         let mut kids: Vec<(OsString, bool)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
+        if let Ok(rd) = crate::vfs::fs::read_dir(&dir) {
             for e in rd.flatten() {
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = e.file_type().map(|t| t.v_is_dir()).unwrap_or(false);
                 kids.push((e.file_name(), is_dir));
             }
         }
@@ -395,7 +405,7 @@ fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: 
         }
         cv.notify_all();
         if last.elapsed().as_millis() > 300 {
-            last = std::time::Instant::now();
+            last = web_time::Instant::now();
             ctx.request_repaint();
         }
     }
@@ -422,11 +432,11 @@ mod watch {
 
     pub fn restart(idx: Arc<Index>) {
         let gen_id = WATCH_GEN.fetch_add(1, AO::SeqCst) + 1;
-        std::thread::spawn(move || run(idx, gen_id));
+        crate::vfs::thread::spawn(move || run(idx, gen_id));
     }
 
     fn run(idx: Arc<Index>, gen_id: u64) {
-        let limit = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        let limit = crate::vfs::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(8192);
@@ -554,7 +564,7 @@ mod watch {
             let raw = h.0 as isize;
             HANDLES.lock().unwrap().push(raw);
             let base = root.to_string_lossy().into_owned();
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let h = HANDLE(raw as *mut _);
                 let mut buf = vec![0u32; 16 * 1024]; // alineado a 4 bytes
                 loop {
@@ -619,7 +629,7 @@ mod watch {
     pub fn restart(idx: Arc<Index>) {
         let gen_id = WATCH_GEN.fetch_add(1, AO::SeqCst) + 1;
         let roots: Vec<String> = idx.roots().iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut fs = fsevent::FsEvent::new(roots);
             if fs.observe_async(tx).is_err() {
@@ -663,12 +673,12 @@ pub fn spawn_search(scope: Option<PathBuf>, needle: String, hidden: bool, ctx: e
     let st = Arc::new(Search::default());
     st.scanned.store(idx.count() as u64, AO::Relaxed);
     let s = st.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let needle = needle.to_lowercase();
         let n = idx.count();
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
+        let threads = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
         let chunk = n.div_ceil(threads).max(1);
-        let hits: Vec<Vec<u32>> = std::thread::scope(|sc| {
+        let hits: Vec<Vec<u32>> = crate::vfs::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads)
                 .map(|t| {
                     let (idx, needle) = (&idx, &needle);
@@ -727,11 +737,11 @@ mod tests {
 
     #[test]
     fn roundtrip_and_search() {
-        let d = std::env::temp_dir().join(format!("fbidx{}", std::process::id()));
-        std::fs::create_dir_all(d.join("a/b")).unwrap();
-        std::fs::create_dir_all(d.join(".oculta")).unwrap();
-        std::fs::write(d.join("a/b/Informe.txt"), "x").unwrap();
-        std::fs::write(d.join(".oculta/informe2.txt"), "x").unwrap();
+        let d = crate::vfs::temp_dir().join(format!("fbidx{}", crate::vfs::pid()));
+        crate::vfs::fs::create_dir_all(d.join("a/b")).unwrap();
+        crate::vfs::fs::create_dir_all(d.join(".oculta")).unwrap();
+        crate::vfs::fs::write(d.join("a/b/Informe.txt"), "x").unwrap();
+        crate::vfs::fs::write(d.join(".oculta/informe2.txt"), "x").unwrap();
         let mut ix = Index::default();
         let r = ix.push(&d.to_string_lossy(), NO_PARENT, true);
         let a = ix.push("a", r, true);
@@ -744,47 +754,47 @@ mod tests {
         assert_eq!(l.path_of(3), d.join("a/b/Informe.txt"));
         assert_eq!(l.find_dir(&d.join("a/b")), Some(2));
         assert_eq!(l.find_dir(&d.join("zz")), None);
-        std::fs::remove_dir_all(&d).unwrap();
+        crate::vfs::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
     #[ignore]
     fn bench_home() {
         let ctx = egui::Context::default();
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         rebuild(vec![dirs::home_dir().unwrap()], ctx.clone());
         while BUILDING.load(AO::SeqCst) {
-            std::thread::sleep(Duration::from_millis(50));
+            crate::vfs::thread::sleep(Duration::from_millis(50));
         }
         let ix = current().unwrap();
         eprintln!("{} entradas en {:?}, arena {} MB", ix.count(), t.elapsed(), ix.arena.len() >> 20);
-        let t = std::time::Instant::now();
+        let t = web_time::Instant::now();
         let s = spawn_search(None, "informe".into(), false, ctx).unwrap();
         while !s.done.load(AO::Acquire) {
-            std::thread::sleep(Duration::from_millis(1));
+            crate::vfs::thread::sleep(Duration::from_millis(1));
         }
         eprintln!("búsqueda: {} resultados en {:?}", s.results.lock().unwrap().len(), t.elapsed());
-        let _ = std::fs::remove_file(cache_file());
+        let _ = crate::vfs::fs::remove_file(cache_file());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn watcher_marks_dirty() {
-        let d = std::env::temp_dir().join(format!("fbwatch{}", std::process::id()));
-        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let d = crate::vfs::temp_dir().join(format!("fbwatch{}", crate::vfs::pid()));
+        crate::vfs::fs::create_dir_all(d.join("sub")).unwrap();
         let mut ix = Index::default();
         let r = ix.push(&d.to_string_lossy(), NO_PARENT, true);
         ix.push("sub", r, true);
         DIRTY.store(0, AO::Relaxed);
         watch::restart(Arc::new(ix));
-        std::thread::sleep(Duration::from_millis(500));
-        std::fs::write(d.join("sub/nuevo.txt"), "x").unwrap();
-        let t = std::time::Instant::now();
+        crate::vfs::thread::sleep(Duration::from_millis(500));
+        crate::vfs::fs::write(d.join("sub/nuevo.txt"), "x").unwrap();
+        let t = web_time::Instant::now();
         while DIRTY.load(AO::Relaxed) == 0 && t.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
+            crate::vfs::thread::sleep(Duration::from_millis(20));
         }
         watch::stop();
-        std::fs::remove_dir_all(&d).unwrap();
+        crate::vfs::fs::remove_dir_all(&d).unwrap();
         assert!(DIRTY.load(AO::Relaxed) != 0);
     }
 }

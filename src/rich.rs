@@ -1,5 +1,7 @@
 //! Texto con formato en la vista previa: Markdown y libros EPUB. Un documento es una lista de
 //! bloques (títulos, párrafos, listas, código, tablas, imágenes) que se maqueta al ancho disponible.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::markup::{self, Tok};
 use crate::theme::Pal;
 use crate::thumbs::Decoded;
@@ -602,12 +604,12 @@ fn html_into(out: &mut Rich, html: &str, base: &str, read: &mut dyn FnMut(&str) 
 // ---------------------------------------------------------------------------
 
 struct Pkg {
-    ar: zip::ZipArchive<std::io::BufReader<std::fs::File>>,
+    ar: zip::ZipArchive<std::io::BufReader<crate::vfs::fs::File>>,
 }
 
 impl Pkg {
     fn open(path: &Path) -> Option<Pkg> {
-        let f = std::fs::File::open(path).ok()?;
+        let f = crate::vfs::fs::File::open(path).ok()?;
         Some(Pkg { ar: zip::ZipArchive::new(std::io::BufReader::new(f)).ok()? })
     }
 
@@ -684,7 +686,7 @@ fn cover_path(o: &Opf) -> Option<String> {
 }
 
 pub fn epub_cover(path: &Path, max: u32) -> Option<Decoded> {
-    if std::fs::metadata(path).ok()?.len() > 512 << 20 {
+    if crate::vfs::fs::metadata(path).ok()?.len() > 512 << 20 {
         return None;
     }
     let mut pkg = Pkg::open(path)?;
@@ -696,7 +698,7 @@ pub fn epub_cover(path: &Path, max: u32) -> Option<Decoded> {
 pub fn epub(path: &Path) -> Result<Rich, String> {
     let t = crate::i18n::t;
     let fail = || t("No se pudo mostrar el documento").to_string();
-    if std::fs::metadata(path).map(|m| m.len() > 512 << 20).unwrap_or(true) {
+    if crate::vfs::fs::metadata(path).map(|m| m.len() > 512 << 20).unwrap_or(true) {
         return Err(t("El documento es demasiado grande para mostrarlo").into());
     }
     let mut pkg = Pkg::open(path).ok_or_else(fail)?;

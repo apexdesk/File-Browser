@@ -1,6 +1,8 @@
 //! Documentos paginados en la vista previa y las miniaturas: oficina y PDF (biblioteca `apex-view`)
 //! y cómics (CBZ/CBR). Cada visor abre el archivo en un hilo propio y dibuja la página pedida; sólo se
 //! atiende la última petición. Un segundo hilo da el texto de las páginas (búsqueda y selección).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::thumbs::Decoded;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,7 +93,7 @@ fn opener_for(path: &Path) -> Opener {
 
 /// Miniatura de la primera página.
 pub fn thumb(path: &Path, max: u32) -> Option<Decoded> {
-    if std::fs::metadata(path).ok()?.len() > THUMB_MAX_BYTES {
+    if crate::vfs::fs::metadata(path).ok()?.len() > THUMB_MAX_BYTES {
         return None;
     }
     let mut doc = apex_view::Document::open_path(path).ok()?;
@@ -174,7 +176,7 @@ impl DocView {
         let (resp_tx, rx) = channel::<Resp>();
         let latest = Arc::new(AtomicU64::new(0));
         let (l, ctx2, op, rt) = (latest.clone(), ctx.clone(), opener.clone(), resp_tx.clone());
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let mut doc = match op() {
                 Ok(d) => d,
                 Err(m) => {
@@ -231,7 +233,7 @@ impl DocView {
         if self.text_tx.is_none() {
             let (tx, rx) = channel::<TextReq>();
             let (op, rt, ctx, lf) = (self.opener.clone(), self.resp_tx.clone(), self.ctx.clone(), self.latest_find.clone());
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let Ok(mut doc) = op() else { return };
                 while let Ok(req) = rx.recv() {
                     match req {

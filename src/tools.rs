@@ -1,6 +1,8 @@
 //! Herramientas auxiliares: zip/unzip, estadísticas de carpeta, búsqueda recursiva, portapapeles de archivos.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::fsys::Progress;
-use std::fs::{self, File};
+use crate::vfs::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
@@ -107,7 +109,7 @@ fn tar_tree<W: Write>(b: &mut tar::Builder<W>, path: &Path, name: &str, p: &Prog
         return Err("cancelado".into());
     }
     let md = fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
-    if md.is_dir() {
+    if md.v_is_dir() {
         b.append_dir(name, path).map_err(|e| format!("{name}: {e}"))?;
         p.done.fetch_add(1, AO::Relaxed);
         let rd = fs::read_dir(path).map_err(|e| format!("{name}: {e}"))?;
@@ -115,9 +117,16 @@ fn tar_tree<W: Write>(b: &mut tar::Builder<W>, path: &Path, name: &str, p: &Prog
             let child = format!("{name}/{}", e.file_name().to_string_lossy());
             tar_tree(b, &e.path(), &child, p, ctx)?;
         }
-    } else if md.is_file() {
+    } else if md.v_is_file() {
         let mut h = tar::Header::new_gnu();
+        #[cfg(not(target_arch = "wasm32"))]
         h.set_metadata(&md);
+        #[cfg(target_arch = "wasm32")]
+        {
+            h.set_size(md.len());
+            h.set_mode(0o644);
+            h.set_mtime(md.modified().ok().and_then(|t| t.duration_since(web_time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()));
+        }
         // archivo de un servidor SFTP: sin descargar sería un marcador vacío
         crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
         let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
@@ -153,7 +162,7 @@ fn sz_tree<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, path: &P
         return Err("cancelado".into());
     }
     let md = fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
-    if md.is_dir() {
+    if md.v_is_dir() {
         w.push_archive_entry(ArchiveEntry::new_directory(name), None::<File>).map_err(|e| format!("{name}: {e}"))?;
         p.done.fetch_add(1, AO::Relaxed);
         let rd = fs::read_dir(path).map_err(|e| format!("{name}: {e}"))?;
@@ -161,7 +170,7 @@ fn sz_tree<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, path: &P
             let child = format!("{name}/{}", e.file_name().to_string_lossy());
             sz_tree(w, &e.path(), &child, p, ctx)?;
         }
-    } else if md.is_file() {
+    } else if md.v_is_file() {
         // archivo de un servidor SFTP: sin descargar sería un marcador vacío
         crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
         let f = File::open(path).map_err(|e| format!("{name}: {e}"))?;
@@ -185,7 +194,7 @@ fn add_tree<W: Write + io::Seek>(
         return Err("cancelado".into());
     }
     let md = fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
-    if md.is_dir() {
+    if md.v_is_dir() {
         zw.add_directory(format!("{name}/"), opts).map_err(|e| e.to_string())?;
         p.done.fetch_add(1, AO::Relaxed);
         let rd = fs::read_dir(path).map_err(|e| format!("{name}: {e}"))?;
@@ -193,7 +202,7 @@ fn add_tree<W: Write + io::Seek>(
             let child = format!("{name}/{}", e.file_name().to_string_lossy());
             add_tree(zw, &e.path(), &child, opts, p, ctx, buf)?;
         }
-    } else if md.is_file() {
+    } else if md.v_is_file() {
         zw.start_file(name, opts).map_err(|e| e.to_string())?;
         // archivo de un servidor SFTP: sin descargar sería un marcador vacío
         crate::sftp::ensure_local_with(path, &p.cancel, &mut |_| {}).map_err(|e| format!("{name}: {e}"))?;
@@ -293,15 +302,15 @@ pub struct Stats {
 pub fn spawn_stats(paths: Vec<PathBuf>, ctx: egui::Context) -> Arc<Stats> {
     let st = Arc::new(Stats::default());
     let s = st.clone();
-    std::thread::spawn(move || {
-        let mut last = std::time::Instant::now();
+    crate::vfs::thread::spawn(move || {
+        let mut last = web_time::Instant::now();
         let mut stack = paths;
         while let Some(p) = stack.pop() {
             if s.cancel.load(AO::Relaxed) {
                 return;
             }
             let Ok(md) = fs::symlink_metadata(&p) else { continue };
-            if md.is_dir() {
+            if md.v_is_dir() {
                 s.dirs.fetch_add(1, AO::Relaxed);
                 if let Ok(rd) = fs::read_dir(&p) {
                     stack.extend(rd.flatten().map(|e| e.path()));
@@ -311,7 +320,7 @@ pub fn spawn_stats(paths: Vec<PathBuf>, ctx: egui::Context) -> Arc<Stats> {
                 s.bytes.fetch_add(md.len(), AO::Relaxed);
             }
             if last.elapsed().as_millis() > 120 {
-                last = std::time::Instant::now();
+                last = web_time::Instant::now();
                 ctx.request_repaint();
             }
         }
@@ -349,10 +358,10 @@ pub fn all_roots() -> Vec<PathBuf> {
     #[cfg(target_os = "android")]
     {
         let mut v = vec![PathBuf::from("/storage/emulated/0")];
-        if let Ok(rd) = std::fs::read_dir("/storage") {
+        if let Ok(rd) = crate::vfs::fs::read_dir("/storage") {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
-                if n != "emulated" && n != "self" && e.path().is_dir() {
+                if n != "emulated" && n != "self" && e.path().v_is_dir() {
                     v.push(e.path());
                 }
             }
@@ -376,10 +385,10 @@ pub fn pseudo_fs(p: &Path) -> bool {
 pub fn spawn_search(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui::Context) -> Arc<Search> {
     let st = Arc::new(Search::default());
     let s = st.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let needle = needle.to_lowercase();
         let mut stack = roots;
-        let mut last = std::time::Instant::now();
+        let mut last = web_time::Instant::now();
         let mut found = 0usize;
         'outer: while let Some(dir) = stack.pop() {
             let Ok(rd) = fs::read_dir(&dir) else { continue };
@@ -393,7 +402,7 @@ pub fn spawn_search(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui
                     continue;
                 }
                 s.scanned.fetch_add(1, AO::Relaxed);
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let is_dir = e.file_type().map(|t| t.v_is_dir()).unwrap_or(false);
                 if crate::fsys::contains_ci(&name, &needle) {
                     s.results.lock().unwrap().push((e.path(), is_dir));
                     found += 1;
@@ -405,7 +414,7 @@ pub fn spawn_search(roots: Vec<PathBuf>, needle: String, hidden: bool, ctx: egui
                     stack.push(e.path());
                 }
                 if last.elapsed().as_millis() > 150 {
-                    last = std::time::Instant::now();
+                    last = web_time::Instant::now();
                     ctx.request_repaint();
                 }
             }
@@ -430,7 +439,7 @@ mod clip_impl {
 
     fn have(bin: &str) -> bool {
         std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+            .map(|p| crate::vfs::split_paths(&p).any(|d| d.join(bin).v_is_file()))
             .unwrap_or(false)
     }
 
@@ -498,7 +507,7 @@ mod clip_impl {
             let _ = si.write_all(payload.as_bytes());
         }
         // wl-copy/xclip se quedan en segundo plano sirviendo el portapapeles
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let _ = child.wait();
         });
         true
@@ -514,7 +523,7 @@ mod clip_impl {
             .ok()?;
         let mut out = child.stdout.take()?;
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let mut s = String::new();
             let _ = out.read_to_string(&mut s);
             let _ = tx.send(s);
@@ -617,7 +626,7 @@ mod clip_impl {
                 if OpenClipboard(hwnd) != 0 {
                     return true;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                crate::vfs::thread::sleep(std::time::Duration::from_millis(20));
             }
             false
         }
@@ -793,7 +802,7 @@ mod compress_tests {
     use super::*;
 
     fn tree(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fb_cmp_{}_{tag}", std::process::id()));
+        let d = crate::vfs::temp_dir().join(format!("fb_cmp_{}_{tag}", crate::vfs::pid()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("src/sub")).unwrap();
         fs::write(d.join("src/a.txt"), b"hola mundo ".repeat(500)).unwrap();

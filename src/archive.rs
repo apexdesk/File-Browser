@@ -1,11 +1,14 @@
 //! Archivos comprimidos: zip, 7z, rar (sólo lectura), tar y tar.gz/tgz.
 //! `list` da un índice rápido (para la vista previa) y `extract_all` descomprime a una carpeta.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::fsys::Progress;
-use std::fs::{self, File};
+use crate::vfs::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path};
 use std::sync::atomic::Ordering as AO;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
+use web_time::{Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
@@ -151,9 +154,9 @@ pub fn list(path: &Path, max: usize, budget: Duration) -> Result<Listing, String
                 items.push(Item { name: e.name().to_string(), size: e.size(), dir: e.is_directory() });
             }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_arch = "wasm32"))]
         Format::Rar => return Err("RAR no está soportado en Android".into()),
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         Format::Rar => {
             let ar = unrar::Archive::new(path).open_for_listing().map_err(|e| e.to_string())?;
             let end = Instant::now() + budget;
@@ -237,6 +240,10 @@ pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::
             }
         }
         Format::SevenZ => {
+            #[cfg(target_arch = "wasm32")]
+            return Err("7z no está disponible en la web".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
             sevenz_header_ok(src)?;
             let ar = sevenz_rust2::Archive::open(src).map_err(|e| e.to_string())?;
             if ar.files.iter().any(|f| f.name() == entry && f.size() > max) {
@@ -251,10 +258,11 @@ pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::
                 }
             })
             .map_err(|e| e.to_string())?;
+            }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_arch = "wasm32"))]
         Format::Rar => return Err("RAR no está soportado en Android".into()),
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         Format::Rar => {
             let mut cur = unrar::Archive::new(src).open_for_processing().map_err(|e| e.to_string())?;
             loop {
@@ -274,7 +282,7 @@ pub fn read_entry(src: &Path, entry: &str, dst: &Path, max: u64) -> Result<std::
             }
         }
     }
-    if out.is_file() { Ok(out) } else { Err("no se pudo extraer".into()) }
+    if out.v_is_file() { Ok(out) } else { Err("no se pudo extraer".into()) }
 }
 
 /// Extrae todo `src` dentro de `dst`. Devuelve los nombres de primer nivel.
@@ -309,6 +317,10 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
             }
         }
         Format::SevenZ => {
+            #[cfg(target_arch = "wasm32")]
+            return Err("7z no está disponible en la web".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
             sevenz_header_ok(src)?;
             let mut total = 0u64;
             let r = Counting { inner: BufReader::new(open()?), p };
@@ -334,10 +346,11 @@ pub fn extract_all(src: &Path, dst: &Path, p: &Progress, ctx: &egui::Context, pa
             if p.cancelled() {
                 return Err("cancelado".into());
             }
+            }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_arch = "wasm32"))]
         Format::Rar => return Err("RAR no está soportado en Android".into()),
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         Format::Rar => {
             let pw = pass.unwrap_or("");
             let arch = if pass.is_some() { unrar::Archive::with_password(src, pw) } else { unrar::Archive::new(src) };
@@ -384,7 +397,7 @@ mod tests {
     use std::io::Write;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("fb-arch-{}-{name}", std::process::id()));
+        let d = crate::vfs::temp_dir().join(format!("fb-arch-{}-{name}", crate::vfs::pid()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

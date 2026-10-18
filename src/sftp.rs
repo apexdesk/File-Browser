@@ -3,6 +3,8 @@
 //! Los servidores se ven como una carpeta espejo en la caché: cada carpeta remota que se abre se
 //! lista y se refleja con archivos «marcadores» (dispersos, con el tamaño y la fecha reales); el
 //! contenido se descarga cuando hace falta (abrir, copiar, vista previa). Es de sólo lectura.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -309,7 +311,7 @@ impl Client {
             local.with_file_name(n)
         };
         let res = (|| -> Result<(), String> {
-            let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut f = crate::vfs::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             let mut pending: HashMap<u32, (u64, u32)> = HashMap::new();
             let mut next_off = 0u64;
             let mut got = 0u64;
@@ -376,9 +378,9 @@ impl Client {
         })();
         self.close(&h);
         match res {
-            Ok(()) => std::fs::rename(&tmp, local).map_err(|e| e.to_string()),
+            Ok(()) => crate::vfs::fs::rename(&tmp, local).map_err(|e| e.to_string()),
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = crate::vfs::fs::remove_file(&tmp);
                 Err(e)
             }
         }
@@ -444,7 +446,7 @@ fn spawn_ssh(c: &Conn) -> Result<Client, String> {
     let (w, r, mut er) = (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let err = Arc::new(Mutex::new(String::new()));
     let e2 = err.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let mut s = Vec::new();
         let mut buf = [0u8; 1024];
         while let Ok(n) = er.read(&mut buf) {
@@ -485,7 +487,7 @@ fn sessions() -> &'static Mutex<Vec<Arc<Session>>> {
 }
 
 fn cache_root() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("filebrowser").join("sftp")
+    dirs::cache_dir().unwrap_or_else(crate::vfs::temp_dir).join("filebrowser").join("sftp")
 }
 
 /// ¿Está `p` dentro de la carpeta espejo de algún servidor?
@@ -538,7 +540,7 @@ impl Session {
     fn sync(&self, dir: &Path) -> Result<(), String> {
         let Some(remote) = self.remote_of(dir) else { return Ok(()) };
         let ents = self.with_client(|c| c.list(&remote))?;
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::vfs::fs::create_dir_all(dir);
         let mut keep: Vec<String> = Vec::new();
         let base = remote.trim_end_matches('/');
         let mut nodes = self.nodes.lock().unwrap();
@@ -548,31 +550,31 @@ impl Session {
             let rp = format!("{base}/{}", e.name);
             keep.push(ln);
             if e.attrs.is_dir() {
-                let _ = std::fs::create_dir_all(&lp);
+                let _ = crate::vfs::fs::create_dir_all(&lp);
                 nodes.insert(lp, Node { remote: rp, size: 0, mtime: e.attrs.mtime, dir: true, fetched: true });
             } else {
                 let same = nodes.get(&lp).map(|n| !n.dir && n.size == e.attrs.size && n.mtime == e.attrs.mtime).unwrap_or(false)
-                    && std::fs::symlink_metadata(&lp).is_ok();
+                    && crate::vfs::fs::symlink_metadata(&lp).is_ok();
                 if !same {
-                    if let Ok(f) = std::fs::File::create(&lp) {
+                    if let Ok(f) = crate::vfs::fs::File::create(&lp) {
                         let _ = f.set_len(e.attrs.size);
-                        let _ = f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.attrs.mtime.max(0) as u64));
+                        let _ = f.set_modified(web_time::UNIX_EPOCH + std::time::Duration::from_secs(e.attrs.mtime.max(0) as u64));
                     }
                     nodes.insert(lp, Node { remote: rp, size: e.attrs.size, mtime: e.attrs.mtime, dir: false, fetched: false });
                 }
             }
         }
         // lo que ya no está en el servidor
-        if let Ok(rd) = std::fs::read_dir(dir) {
+        if let Ok(rd) = crate::vfs::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
                 if !keep.contains(&n) && !n.ends_with(".fb_part") {
                     let p = e.path();
                     nodes.retain(|k, _| !k.starts_with(&p));
-                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(&p);
+                    if e.file_type().map(|t| t.v_is_dir()).unwrap_or(false) {
+                        let _ = crate::vfs::fs::remove_dir_all(&p);
                     } else {
-                        let _ = std::fs::remove_file(&p);
+                        let _ = crate::vfs::fs::remove_file(&p);
                     }
                 }
             }
@@ -695,9 +697,9 @@ pub fn trust_host(k: &PendingKey) -> Result<(), String> {
     if let Some(d) = path.parent() {
         crate::fsys::private_dir(d);
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+    let mut f = crate::vfs::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
     // si el archivo no acaba en salto de línea, se añade para no pegar la clave a la anterior
-    let needs_nl = std::fs::read(&path).map(|b| !b.is_empty() && b.last() != Some(&b'\n')).unwrap_or(false);
+    let needs_nl = crate::vfs::fs::read(&path).map(|b| !b.is_empty() && b.last() != Some(&b'\n')).unwrap_or(false);
     if needs_nl {
         f.write_all(b"\n").map_err(|e| e.to_string())?;
     }
@@ -751,7 +753,7 @@ pub fn connect(conn: Conn, path: &str) -> Result<PathBuf, String> {
             nodes.insert(cur.clone(), Node { remote, size: 0, mtime: 0, dir: true, fetched: true });
         }
         drop(nodes);
-        let _ = std::fs::create_dir_all(&cur);
+        let _ = crate::vfs::fs::create_dir_all(&cur);
     }
     sess.sync(&cur)?;
     Ok(cur)
@@ -768,13 +770,13 @@ pub fn sync_dir(dir: &Path) -> Result<(), String> {
 /// Refleja `p` y todas sus subcarpetas (para conocer el tamaño real antes de copiar).
 pub fn sync_tree(p: &Path) {
     let Some(s) = session_for(p) else { return };
-    if !p.is_dir() {
+    if !p.v_is_dir() {
         return;
     }
     let _ = s.sync(p);
-    if let Ok(rd) = std::fs::read_dir(p) {
+    if let Ok(rd) = crate::vfs::fs::read_dir(p) {
         for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if e.file_type().map(|t| t.v_is_dir()).unwrap_or(false) {
                 sync_tree(&e.path());
             }
         }
@@ -796,7 +798,7 @@ pub fn ensure_local_with(p: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut
         }
     };
     s.with_client(|c| c.download(&remote, p, size, cancel, progress))?;
-    let _ = std::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64)));
+    let _ = crate::vfs::fs::File::options().write(true).open(p).and_then(|f| f.set_modified(web_time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64)));
     if let Some(n) = s.nodes.lock().unwrap().get_mut(p) {
         n.fetched = true;
     }
@@ -865,7 +867,7 @@ mod tests {
     fn mock(content: Vec<u8>) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
         let (c2s_tx, c2s_rx) = channel::<Vec<u8>>();
         let (s2c_tx, s2c_rx) = channel::<Vec<u8>>();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             let mut r = PipeR { rx: c2s_rx, buf: vec![] };
             let mut listed = false;
             loop {
@@ -969,15 +971,15 @@ mod tests {
         assert_eq!(c.realpath(".").unwrap(), "/home/u");
         let l = c.list("/home/u").unwrap();
         assert_eq!(l.len(), 2);
-        assert!(l.iter().any(|e| e.name == "sub" && e.attrs.is_dir()));
+        assert!(l.iter().any(|e| e.name == "sub" && e.attrs.v_is_dir()));
         let big = l.iter().find(|e| e.name == "big.bin").unwrap();
         assert_eq!(big.attrs.size, 300_000);
         assert_eq!(big.attrs.mtime, 1_700_000_000);
-        let dst = std::env::temp_dir().join(format!("fb_sftp_{}.bin", std::process::id()));
+        let dst = crate::vfs::temp_dir().join(format!("fb_sftp_{}.bin", crate::vfs::pid()));
         let mut last = 0;
         c.download("/home/u/big.bin", &dst, 300_000, &AtomicBool::new(false), &mut |n| last = n).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), content);
+        assert_eq!(crate::vfs::fs::read(&dst).unwrap(), content);
         assert_eq!(last, 300_000);
-        let _ = std::fs::remove_file(&dst);
+        let _ = crate::vfs::fs::remove_file(&dst);
     }
 }

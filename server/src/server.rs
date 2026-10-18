@@ -280,6 +280,7 @@ fn virt_path(p: &str) -> Option<Vec<String>> {
 fn api_route(s: &mut Stream, ctx: &Ctx, req: &Req, api: &str) -> io::Result<()> {
     let json = "application/json; charset=utf-8";
     match api {
+        "info" => http::send(s, 200, json, b"{\"write\":false}", req.head, &[]),
         "list" => {
             let Some(comps) = virt_path(&query_get(&req.query, "p").unwrap_or_default()) else {
                 return http::error(s, 400, req.head);

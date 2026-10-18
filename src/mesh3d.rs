@@ -1,5 +1,7 @@
 //! Visor 3D mínimo: lee STL (binario y ASCII) y OBJ y los dibuja con un rasterizador por software
 //! (z-buffer, proyección ortogonal, sombreado plano de dos caras). Sin GPU ni dependencias.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
@@ -49,11 +51,11 @@ pub fn is_mesh_ext(ext: &str) -> bool {
 
 pub fn load(path: &Path) -> Result<Mesh, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let len = crate::vfs::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if len > MAX_BYTES {
         return Err("archivo demasiado grande".into());
     }
-    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let f = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
     match ext.as_str() {
         "stl" => load_stl(f, len),
         "obj" => load_obj(f),
@@ -64,7 +66,7 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
     }
 }
 
-fn load_stl(f: std::fs::File, len: u64) -> Result<Mesh, String> {
+fn load_stl(f: crate::vfs::fs::File, len: u64) -> Result<Mesh, String> {
     let mut r = BufReader::with_capacity(1 << 20, f);
     let mut head = [0u8; 84];
     let n = r.read(&mut head).map_err(|e| e.to_string())?;
@@ -118,7 +120,7 @@ fn load_stl(f: std::fs::File, len: u64) -> Result<Mesh, String> {
     Mesh::finish(tris)
 }
 
-fn load_obj(f: std::fs::File) -> Result<Mesh, String> {
+fn load_obj(f: crate::vfs::fs::File) -> Result<Mesh, String> {
     let r = BufReader::with_capacity(1 << 20, f);
     let mut verts: Vec<[f32; 3]> = Vec::new();
     let mut tris: Vec<f32> = Vec::new();
@@ -174,7 +176,7 @@ pub fn render(m: &Mesh, yaw: f32, pitch: f32, zoom: f32, w: usize, h: usize, bg:
     let l1 = norm([-0.35, 0.55, -0.75]);
     let l2 = norm([0.6, -0.2, -0.4]);
     let step = if full || n_tris <= 400_000 { 1 } else { n_tris / 400_000 + 1 };
-    let threads = if n_tris >= 20_000 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8) } else { 1 };
+    let threads = if n_tris >= 20_000 { crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8) } else { 1 };
     let raster = |first: usize| -> (Vec<f32>, Vec<[u8; 3]>) {
     let mut z = vec![f32::INFINITY; rw * rh];
     let mut col = vec![[bg[0], bg[1], bg[2]]; rw * rh];
@@ -234,7 +236,7 @@ pub fn render(m: &Mesh, yaw: f32, pitch: f32, zoom: f32, w: usize, h: usize, bg:
     let col = if threads == 1 {
         raster(0).1
     } else {
-        let parts: Vec<(Vec<f32>, Vec<[u8; 3]>)> = std::thread::scope(|sc| {
+        let parts: Vec<(Vec<f32>, Vec<[u8; 3]>)> = crate::vfs::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || raster(k))).collect();
             hs.into_iter().filter_map(|h| h.join().ok()).collect()
         });
@@ -292,19 +294,19 @@ mod tests {
 
     #[test]
     fn parses_ascii_stl_and_obj() {
-        let d = std::env::temp_dir().join(format!("fbmesh{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::vfs::temp_dir().join(format!("fbmesh{}", crate::vfs::pid()));
+        crate::vfs::fs::create_dir_all(&d).unwrap();
         let stl = d.join("a.stl");
-        std::fs::write(&stl, "solid t\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid t\n").unwrap();
+        crate::vfs::fs::write(&stl, "solid t\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid t\n").unwrap();
         let m = load(&stl).unwrap();
         assert_eq!(m.count(), 1);
         let obj = d.join("a.obj");
-        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n").unwrap();
+        crate::vfs::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n").unwrap();
         let m = load(&obj).unwrap();
         assert_eq!(m.count(), 2);
         let img = render(&m, 0.3, 0.4, 1.0, 64, 64, [0, 0, 0], [200, 200, 255], true);
         assert!(img.chunks_exact(4).any(|p| p[2] > 20));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = crate::vfs::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -312,7 +314,7 @@ mod tests {
     fn bench_render() {
         let m = load(std::path::Path::new(&std::env::var("MESH").unwrap())).unwrap();
         for full in [true, false] {
-            let t = std::time::Instant::now();
+            let t = web_time::Instant::now();
             for k in 0..5 {
                 render(&m, k as f32 * 0.1, 0.5, 1.0, 800, 600, [20, 20, 30], [150, 185, 255], full);
             }
@@ -322,8 +324,8 @@ mod tests {
 
     #[test]
     fn parses_binary_stl() {
-        let d = std::env::temp_dir().join(format!("fbmeshb{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::vfs::temp_dir().join(format!("fbmeshb{}", crate::vfs::pid()));
+        crate::vfs::fs::create_dir_all(&d).unwrap();
         let p = d.join("b.stl");
         let mut v = vec![0u8; 80];
         v.extend_from_slice(&1u32.to_le_bytes());
@@ -332,9 +334,9 @@ mod tests {
             v.extend_from_slice(&f.to_le_bytes());
         }
         v.extend_from_slice(&[0u8; 2]);
-        std::fs::write(&p, v).unwrap();
+        crate::vfs::fs::write(&p, v).unwrap();
         assert_eq!(load(&p).unwrap().count(), 1);
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = crate::vfs::fs::remove_dir_all(&d);
     }
 }
 
@@ -342,10 +344,10 @@ mod tests {
 // PLY (ASCII y binario)
 // ---------------------------------------------------------------------------
 
-fn load_ply(f: std::fs::File) -> Result<Mesh, String> {
+fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
     let mut r = BufReader::with_capacity(1 << 20, f);
     let mut line = String::new();
-    let read_line = |r: &mut BufReader<std::fs::File>, line: &mut String| -> Result<bool, String> {
+    let read_line = |r: &mut BufReader<crate::vfs::fs::File>, line: &mut String| -> Result<bool, String> {
         line.clear();
         Ok(r.read_line(line).map_err(|e| e.to_string())? > 0)
     };
@@ -396,7 +398,7 @@ fn load_ply(f: std::fs::File) -> Result<Mesh, String> {
     // lector de valores numéricos como f64
     let mut toks: Vec<String> = Vec::new();
     let mut tok_i = 0usize;
-    let mut next_val = |r: &mut BufReader<std::fs::File>, ty: &str| -> Result<f64, String> {
+    let mut next_val = |r: &mut BufReader<crate::vfs::fs::File>, ty: &str| -> Result<f64, String> {
         if ascii {
             while tok_i >= toks.len() {
                 let mut l = String::new();
@@ -485,7 +487,7 @@ fn load_ply(f: std::fs::File) -> Result<Mesh, String> {
 
 fn load_3mf(path: &Path) -> Result<Mesh, String> {
     use crate::markup::{self, Tok};
-    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let f = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut ar = zip::ZipArchive::new(BufReader::new(f)).map_err(|e| e.to_string())?;
     let mut name = None;
     for i in 0..ar.len() {
@@ -697,7 +699,7 @@ impl Gltf {
 
 fn load_gltf(path: &Path) -> Result<Mesh, String> {
     use crate::markup::parse_json;
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let data = crate::vfs::fs::read(path).map_err(|e| e.to_string())?;
     let (json_text, glb_bin): (String, Option<Vec<u8>>) = if data.starts_with(b"glTF") {
         let mut json = None;
         let mut bin = None;
@@ -735,14 +737,14 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
                 }
                 // solo archivos normales y de tamaño razonable (una FIFO o /dev/zero colgaría el hilo)
                 let bp = dir.join(rel);
-                match std::fs::metadata(&bp) {
-                    Ok(m) if m.is_file() && m.len() <= 512 << 20 => {}
+                match crate::vfs::fs::metadata(&bp) {
+                    Ok(m) if m.v_is_file() && m.len() <= 512 << 20 => {}
                     _ => return Err("buffer no válido".into()),
                 }
                 // presupuesto total: el mismo archivo grande repetido en cientos de buffers no se lee cientos de veces
-                let sz = std::fs::metadata(&bp).map(|m| m.len() as usize).unwrap_or(0);
+                let sz = crate::vfs::fs::metadata(&bp).map(|m| m.len() as usize).unwrap_or(0);
                 budget = budget.checked_sub(sz).ok_or("buffers demasiado grandes")?;
-                std::fs::read(bp).map_err(|e| e.to_string())?
+                crate::vfs::fs::read(bp).map_err(|e| e.to_string())?
             }
             None if i == 0 => glb_bin.clone().ok_or("sin datos binarios")?,
             None => Vec::new(),
@@ -811,10 +813,10 @@ impl Gltf {
             }
             let p = dir.join(rel);
             // nada de tuberías ni dispositivos, y con tope de tamaño
-            if !std::fs::metadata(&p).map(|m| m.is_file() && m.len() <= 256 << 20).unwrap_or(false) {
+            if !crate::vfs::fs::metadata(&p).map(|m| m.v_is_file() && m.len() <= 256 << 20).unwrap_or(false) {
                 return None;
             }
-            return std::fs::read(p).ok();
+            return crate::vfs::fs::read(p).ok();
         }
         let view = self.json.get("bufferViews")?.at(img.get("bufferView")?.num()? as usize)?;
         let buf = self.buffers.get(view.get("buffer")?.num()? as usize)?;

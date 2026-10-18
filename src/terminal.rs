@@ -1,4 +1,6 @@
 //! Terminal integrada: PTY (portable-pty) + emulador (vt100) dibujado con el painter de egui.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::i18n::{t, tf};
 use crate::theme::Pal;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Stroke};
@@ -47,7 +49,7 @@ impl Terminal {
         let alive = Arc::new(AtomicBool::new(true));
         {
             let (parser, alive, ctx) = (parser.clone(), alive.clone(), ctx.clone());
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let mut buf = [0u8; 16 * 1024];
                 loop {
                     match reader.read(&mut buf) {

@@ -1,14 +1,17 @@
 //! Capa de sistema de archivos: listado en streaming, ordenación y operaciones.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 #[cfg(target_os = "android")]
 use crate::trash;
 use crate::i18n::{t, tf};
 use std::cmp::Ordering;
-use std::fs;
+use crate::vfs::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration};
+use web_time::{Instant, UNIX_EPOCH};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -125,10 +128,10 @@ pub fn spawn_load(
     tx: Sender<LoadMsg>,
     ctx: egui::Context,
 ) {
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         // carpeta espejo de un servidor SFTP: se refleja antes de leerla
         if let Err(e) = crate::sftp::sync_dir(&dir) {
-            if !dir.exists() {
+            if !dir.v_exists() {
                 let _ = tx.send(LoadMsg::Done(generation, Some(e)));
                 ctx.request_repaint();
                 return;
@@ -148,7 +151,7 @@ pub fn spawn_load(
             use std::io::Read;
             let hp = dir.join(".hidden");
             match fs::metadata(&hp) {
-                Ok(m) if m.is_file() => {
+                Ok(m) if m.v_is_file() => {
                     let mut s = String::new();
                     let _ = fs::File::open(&hp).and_then(|f| f.take(1 << 20).read_to_string(&mut s));
                     s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
@@ -170,13 +173,13 @@ pub fn spawn_load(
             };
             let mut flags = 0u8;
             let mut md_eff = md;
-            if md_eff.file_type().is_symlink() {
+            if md_eff.file_type().v_is_symlink() {
                 flags |= F_LINK;
                 if let Ok(m) = fs::metadata(de.path()) {
                     md_eff = m;
                 }
             }
-            if md_eff.is_dir() {
+            if md_eff.v_is_dir() {
                 flags |= F_DIR;
             }
             if is_hidden_meta(&name, &md_eff) || (!hidden_list.is_empty() && hidden_list.contains(&name)) {
@@ -228,13 +231,13 @@ pub fn entry_from_path(path: &Path, name: String) -> Option<Entry> {
     let md = fs::symlink_metadata(path).ok()?;
     let mut flags = 0u8;
     let mut md_eff = md;
-    if md_eff.file_type().is_symlink() {
+    if md_eff.file_type().v_is_symlink() {
         flags |= F_LINK;
         if let Ok(m) = fs::metadata(path) {
             md_eff = m;
         }
     }
-    if md_eff.is_dir() {
+    if md_eff.v_is_dir() {
         flags |= F_DIR;
     }
     let base = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -268,7 +271,7 @@ pub const DEEP_MAX: usize = 300_000;
 
 /// Listado recursivo: todos los elementos de `dir` y sus subcarpetas, con nombres relativos.
 pub fn spawn_load_deep(dir: PathBuf, hidden: bool, generation: u64, current: Arc<AtomicU64>, tx: Sender<LoadMsg>, ctx: egui::Context) {
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         let mut stack: Vec<PathBuf> = vec![dir.clone()];
         let mut buf: Vec<Entry> = Vec::with_capacity(1024);
         let mut total = 0usize;
@@ -287,7 +290,7 @@ pub fn spawn_load_deep(dir: PathBuf, hidden: bool, generation: u64, current: Arc
                 let p = de.path();
                 let Ok(rel) = p.strip_prefix(&dir) else { continue };
                 let Some(e) = entry_from_path(&p, rel.to_string_lossy().replace('\\', "/")) else { continue };
-                if de.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if de.file_type().map(|t| t.v_is_dir()).unwrap_or(false) {
                     stack.push(p);
                 }
                 buf.push(e);
@@ -501,7 +504,7 @@ pub fn private_dir(p: &Path) {
 
 pub(crate) fn size_of_tree(p: &Path) -> u64 {
     match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => fs::read_dir(p)
+        Ok(m) if m.v_is_dir() => fs::read_dir(p)
             .map(|rd| rd.flatten().fold(0u64, |a, e| a.saturating_add(size_of_tree(&e.path()))))
             .unwrap_or(0)
             .saturating_add(1),
@@ -513,8 +516,8 @@ pub(crate) fn size_of_tree(p: &Path) -> u64 {
 /// Nombre temporal junto al destino para copiar antes de reemplazar.
 fn continue_with_tmp(dir: &Path, name: &str) -> PathBuf {
     // nombre impredecible: nadie puede dejar ahí un enlace simbólico a la espera
-    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    dir.join(format!(".fbrep-{}-{n:x}-{name}", std::process::id()))
+    let n = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    dir.join(format!(".fbrep-{}-{n:x}-{name}", crate::vfs::pid()))
 }
 
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
@@ -626,7 +629,7 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
         }
     };
     let mut failed = 0;
-    if md.is_dir() {
+    if md.v_is_dir() {
         if let Err(e) = fs::create_dir_all(dst) {
             note_error(prog, dst, &e);
             // sin la carpeta no se puede copiar su contenido; se da por hecho su tamaño
@@ -643,7 +646,7 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
                         Ok(e) => {
                             let sp = e.path();
                             let dp = dst.join(e.file_name());
-                            let is_small = e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                            let is_small = e.file_type().map(|t| t.v_is_file()).unwrap_or(false)
                                 && e.metadata().map(|m| m.len() < (8 << 20)).unwrap_or(false);
                             if is_small {
                                 small.push((sp, dp));
@@ -665,7 +668,7 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let fails = std::sync::atomic::AtomicUsize::new(0);
                     let cancelled = std::sync::atomic::AtomicBool::new(false);
-                    std::thread::scope(|sc| {
+                    crate::vfs::thread::scope(|sc| {
                         for _ in 0..small.len().min(6) {
                             sc.spawn(|| {
                                 let mut b: Vec<u8> = Vec::new();
@@ -699,8 +702,8 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
         // permisos y fecha de la carpeta, al final (si es de sólo lectura no estorba a su contenido)
         let _ = fs::set_permissions(dst, md.permissions());
         prog.done.fetch_add(1, AO::Relaxed);
-    } else if md.file_type().is_symlink() {
-        let r = fs::read_link(src).and_then(|target| {
+    } else if md.file_type().v_is_symlink() {
+        let r: std::io::Result<()> = fs::read_link(src).and_then(|target| {
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink(target, dst)
@@ -710,13 +713,18 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
                 let _ = target;
                 fs::copy(src, dst).map(|_| ())
             }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = (target, dst);
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            }
         });
         if let Err(e) = r {
             note_error(prog, src, &e);
             failed += 1;
         }
         prog.done.fetch_add(1, AO::Relaxed);
-    } else if cfg!(unix) && !md.file_type().is_file() {
+    } else if cfg!(unix) && !md.file_type().v_is_file() {
         // FIFO, sockets y dispositivos: abrirlos bloquearía la copia para siempre
         note_error(prog, src, &std::io::Error::other(t("archivo especial")));
         failed += 1;
@@ -739,7 +747,7 @@ fn copy_tree(src: &Path, dst: &Path, prog: &Progress, buf: &mut Vec<u8>) -> std:
 pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
     let prog = Arc::new(Progress::default());
     let p = prog.clone();
-    std::thread::spawn(move || {
+    crate::vfs::thread::spawn(move || {
         match op {
             Op::Copy { srcs, dst, mv, policy } => {
                 *p.label.lock().unwrap() = t("Calculando…").into();
@@ -760,7 +768,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                         continue;
                     }
                     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                    if src.is_dir() && canon(&dst).starts_with(canon(&src)) {
+                    if src.v_is_dir() && canon(&dst).starts_with(canon(&src)) {
                         p.errors.lock().unwrap().push(tf("{name}: no se puede copiar dentro de sí misma", &[&name]));
                         continue;
                     }
@@ -793,7 +801,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                                 // El elemento reemplazado va a la papelera para poder recuperarlo.
                                 if let Err(e) = crate::extras::trash_delete(&t) {
                                     // sin papelera (Android…): se sobrescribe, que es lo que pide «Reemplazar»
-                                    let gone = if t.is_dir() && !t.is_symlink() { fs::remove_dir_all(&t) } else { fs::remove_file(&t) };
+                                    let gone = if t.v_is_dir() && !t.v_is_symlink() { fs::remove_dir_all(&t) } else { fs::remove_file(&t) };
                                     if let Err(e2) = gone {
                                         p.errors.lock().unwrap().push(format!("{name}: {e} ({e2})"));
                                         continue;
@@ -818,9 +826,9 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                             Err(_) => copy_tree(&src, &target, &p, &mut buf).and_then(|failed| {
                                 if failed > 0 {
                                     // copia incompleta: se conserva el origen y se avisa del fallo
-                                    let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+                                    let _ = if target.v_is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
                                     Err(std::io::Error::other(t("la copia no se completó")))
-                                } else if src.is_dir() {
+                                } else if src.v_is_dir() {
                                     fs::remove_dir_all(&src)
                                 } else {
                                     fs::remove_file(&src)
@@ -830,12 +838,12 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     } else if let Some(old) = &replace_old {
                         copy_tree(&src, &target, &p, &mut buf).and_then(|failed| {
                             if failed > 0 {
-                                let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+                                let _ = if target.v_is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
                                 return Err(std::io::Error::other(t("la copia no se completó")));
                             }
                             // copia completa: ahora sí se retira lo anterior (papelera si hay) y se coloca la copia
                             if crate::extras::trash_delete(old).is_err() {
-                                if old.is_dir() && !old.is_symlink() { fs::remove_dir_all(old)? } else { fs::remove_file(old)? }
+                                if old.v_is_dir() && !old.v_is_symlink() { fs::remove_dir_all(old)? } else { fs::remove_file(old)? }
                             }
                             fs::rename(&target, old)
                         })
@@ -848,7 +856,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                             p.pairs.lock().unwrap().push((src.clone(), final_target.clone()));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                            let _ = if target.is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
+                            let _ = if target.v_is_dir() { fs::remove_dir_all(&target) } else { fs::remove_file(&target) };
                         }
                         Err(e) => p.errors.lock().unwrap().push(format!("{name}: {e}")),
                     }
@@ -900,7 +908,7 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
                     if p.cancelled() {
                         break;
                     }
-                    let r = if it.is_dir() && !fs::symlink_metadata(&it).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    let r = if it.v_is_dir() && !fs::symlink_metadata(&it).map(|m| m.file_type().v_is_symlink()).unwrap_or(false) {
                         fs::remove_dir_all(&it)
                     } else {
                         fs::remove_file(&it)
@@ -921,9 +929,9 @@ pub fn run_op(op: Op, ctx: egui::Context) -> Arc<Progress> {
 
 pub fn open_external(path: &Path) {
     // archivo de un servidor SFTP: se descarga y luego se abre
-    if crate::sftp::is_remote(path) && !path.is_dir() {
+    if crate::sftp::is_remote(path) && !path.v_is_dir() {
         let p = path.to_path_buf();
-        std::thread::spawn(move || {
+        crate::vfs::thread::spawn(move || {
             if crate::sftp::ensure_local(&p).is_ok() {
                 open_external(&p);
             }
@@ -938,7 +946,7 @@ pub fn open_external(path: &Path) {
         let prog = "open";
         if let Ok(mut c) = std::process::Command::new(prog).arg(path).spawn() {
             // sin esperar al proceso quedaría zombi
-            std::thread::spawn(move || {
+            crate::vfs::thread::spawn(move || {
                 let _ = c.wait();
             });
         }
@@ -985,6 +993,11 @@ fn local_offset(t: i64) -> i64 {
         }
         tm.tm_gmtoff as i64
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_offset(t: i64) -> i64 {
+    -(js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(t as f64 * 1000.0)).get_timezone_offset() as i64) * 60
 }
 
 #[cfg(windows)]
@@ -1048,8 +1061,8 @@ pub fn parse_time(text: &str) -> Option<i64> {
 
 /// Cambia la fecha de modificación de un archivo o carpeta.
 pub fn set_mtime(path: &Path, secs: i64) -> std::io::Result<()> {
-    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64);
-    let mut o = std::fs::OpenOptions::new();
+    let t = web_time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64);
+    let mut o = crate::vfs::fs::OpenOptions::new();
     o.read(true);
     #[cfg(windows)]
     {
@@ -1111,9 +1124,9 @@ pub struct ExtraMeta {
     pub link: String,
 }
 
-fn secs(t: std::io::Result<std::time::SystemTime>) -> i64 {
+fn secs(t: std::io::Result<web_time::SystemTime>) -> i64 {
     t.ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| t.duration_since(web_time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
@@ -1142,12 +1155,12 @@ fn name_of(id: u32, group: bool) -> String {
 
 pub fn extra_meta(p: &Path, is_dir: bool) -> ExtraMeta {
     let mut x = ExtraMeta::default();
-    if let Ok(l) = std::fs::symlink_metadata(p) {
-        if l.file_type().is_symlink() {
-            x.link = std::fs::read_link(p).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Ok(l) = crate::vfs::fs::symlink_metadata(p) {
+        if l.file_type().v_is_symlink() {
+            x.link = crate::vfs::fs::read_link(p).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
         }
     }
-    let Ok(md) = std::fs::metadata(p) else { return x };
+    let Ok(md) = crate::vfs::fs::metadata(p) else { return x };
     x.created = secs(md.created());
     x.accessed = secs(md.accessed());
     #[cfg(unix)]
@@ -1162,7 +1175,7 @@ pub fn extra_meta(p: &Path, is_dir: bool) -> ExtraMeta {
         x.mode = Some(if md.permissions().readonly() { 0o444 } else { 0o666 });
     }
     if is_dir {
-        x.items = std::fs::read_dir(p).ok().map(|d| d.count());
+        x.items = crate::vfs::fs::read_dir(p).ok().map(|d| d.count());
     }
     x
 }
@@ -1188,7 +1201,7 @@ mod copy_tests {
         let t0 = Instant::now();
         while !p.finished.load(AO::Acquire) {
             assert!(t0.elapsed() < Duration::from_secs(120), "timeout");
-            std::thread::sleep(Duration::from_millis(20));
+            crate::vfs::thread::sleep(Duration::from_millis(20));
         }
         let e = p.errors.lock().unwrap().clone();
         e
@@ -1199,7 +1212,7 @@ mod copy_tests {
         let t0 = Instant::now();
         while !p.finished.load(AO::Acquire) {
             assert!(t0.elapsed() < Duration::from_secs(60), "timeout");
-            std::thread::sleep(Duration::from_millis(20));
+            crate::vfs::thread::sleep(Duration::from_millis(20));
         }
         let e = p.errors.lock().unwrap().clone();
         e
@@ -1207,7 +1220,7 @@ mod copy_tests {
 
     #[test]
     fn replace_copies_then_swaps() {
-        let base = std::env::temp_dir().join(format!("fbrep{}", std::process::id()));
+        let base = crate::vfs::temp_dir().join(format!("fbrep{}", crate::vfs::pid()));
         let (a, b) = (base.join("a"), base.join("b"));
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
@@ -1226,7 +1239,7 @@ mod copy_tests {
 
     #[test]
     fn copy_many_files() {
-        let base = std::env::temp_dir().join(format!("fbcopy{}", std::process::id()));
+        let base = crate::vfs::temp_dir().join(format!("fbcopy{}", crate::vfs::pid()));
         let src = base.join("src");
         for d in 0..40 {
             let dir = src.join(format!("d{d}")).join("sub");
@@ -1249,7 +1262,7 @@ mod copy_tests {
         if let Ok(rd) = fs::read_dir(p) {
             for e in rd.flatten() {
                 n += 1;
-                if e.path().is_dir() {
+                if e.path().v_is_dir() {
                     n += walk_count(&e.path());
                 }
             }

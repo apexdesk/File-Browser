@@ -1,7 +1,9 @@
 //! Lector mínimo de bases SQLite (sólo lectura): lista las tablas y las primeras filas de cada una.
 //! No ejecuta SQL; recorre directamente los árboles B de las tablas con clave de fila.
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::table::Table;
-use std::fs::File;
+use crate::vfs::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 

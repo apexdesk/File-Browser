@@ -1,4 +1,6 @@
 //! Ajustes persistentes en un fichero de texto `clave=valor` (sin serde).
+#[allow(unused_imports)]
+use crate::vfs::{KindV as _, PathV as _};
 use crate::fsys::SortKey;
 use std::path::PathBuf;
 
@@ -122,7 +124,7 @@ fn file() -> Option<PathBuf> {
 impl Config {
     pub fn load() -> Config {
         let mut c = Config::default();
-        let Some(txt) = file().and_then(|f| std::fs::read_to_string(f).ok()) else {
+        let Some(txt) = file().and_then(|f| crate::vfs::fs::read_to_string(f).ok()) else {
             return c;
         };
         let mut has_theme = false;
@@ -270,7 +272,7 @@ impl Config {
     pub fn save(&self) {
         let Some(f) = file() else { return };
         if let Some(p) = f.parent() {
-            let _ = std::fs::create_dir_all(p);
+            let _ = crate::vfs::fs::create_dir_all(p);
         }
         let mut s = String::new();
         for b in &self.bookmarks {
@@ -337,8 +339,8 @@ impl Config {
         s.push_str(&format!("win={}x{}\n", self.win.0, self.win.1));
         // escritura atómica: un corte a medias no deja la configuración vacía
         let tmp = f.with_extension("tmp");
-        if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &f).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if crate::vfs::fs::write(&tmp, s).is_ok() && crate::vfs::fs::rename(&tmp, &f).is_err() {
+            let _ = crate::vfs::fs::remove_file(&tmp);
         }
     }
 }

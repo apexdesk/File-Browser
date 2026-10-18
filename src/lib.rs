@@ -27,6 +27,11 @@ mod dragout_macos;
 pub mod config;
 pub mod extras;
 pub mod fsys;
+pub mod vfs;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu3d;
+#[cfg(target_arch = "wasm32")]
+#[path = "gpu3d_web.rs"]
 pub mod gpu3d;
 pub mod pbr;
 #[cfg(test)]
@@ -39,6 +44,10 @@ pub mod preview;
 pub mod sftp;
 pub mod sysicons;
 pub mod system;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod terminal;
+#[cfg(target_arch = "wasm32")]
+#[path = "terminal_web.rs"]
 pub mod terminal;
 pub mod theme;
 pub mod tools;
@@ -52,12 +61,14 @@ pub mod droid;
 pub mod thumbs;
 
 
+#[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> egui::IconData {
     let img = image::load_from_memory(include_bytes!("../assets/icon-256.png")).expect("icono").into_rgba8();
     let (width, height) = img.dimensions();
     egui::IconData { rgba: img.into_raw(), width, height }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn options(cfg: &config::Config) -> eframe::NativeOptions {
     let mut vb = egui::ViewportBuilder::default()
         .with_title("File Browser")
@@ -88,8 +99,9 @@ fn options(cfg: &config::Config) -> eframe::NativeOptions {
 }
 
 /// Instante de arranque del proceso (para la traza de rendimiento de FB_SHOT).
-pub static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+pub static T0: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result {
     if std::env::var_os("FB_SHOT").is_some() {
         eprintln!("[trace] antes de eframe: {:?}", T0.get().map(|t| t.elapsed()));
@@ -108,9 +120,9 @@ fn run_with(opts: eframe::NativeOptions, cfg: config::Config) -> eframe::Result 
 }
 
 /// Punto de entrada de escritorio.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 pub fn run() -> eframe::Result {
-    let _ = T0.set(std::time::Instant::now());
+    let _ = T0.set(web_time::Instant::now());
     // `ssh` nos llama como programa de contraseñas (SSH_ASKPASS) para conectar por SFTP
     sftp::askpass_main();
     if let system::Cli::Exit(code) = system::start() {
@@ -446,4 +458,17 @@ pub fn android_open(path: &std::path::Path) -> Result<(), String> {
         }
         e.to_string()
     })
+}
+
+/// Arranque en el navegador: la misma aplicación dibujada en el `<canvas>` de la página que sirve
+/// `filebrowser-server`. `writable` dice si el servidor deja modificar archivos.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn start(canvas: web_sys::HtmlCanvasElement, writable: bool) -> Result<(), wasm_bindgen::JsValue> {
+    std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&format!("File Browser: {info}").into())));
+    vfs::net::set_writable(writable);
+    let cfg = config::Config::load();
+    eframe::WebRunner::new()
+        .start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
+        .await
 }
