@@ -558,6 +558,8 @@ pub struct App {
     op: Option<Arc<Progress>>,
     msg: Option<(String, Instant, bool)>,
     confirm_delete: Option<Vec<PathBuf>>,
+    /// Vista previa del renombrado en lote: nombre actual -> nombre nuevo (se pinta en la carpeta).
+    batch_names: HashMap<String, String>,
     pending_select: Vec<String>,
     pending_rename: bool,
     typeahead: (String, Instant),
@@ -1244,6 +1246,7 @@ impl App {
             msg: None,
             confirm_delete: None,
             pending_select: cli_select,
+            batch_names: HashMap::new(),
             pending_rename: false,
             typeahead: (String::new(), Instant::now()),
             vmode: VMode::Dir,
@@ -5297,7 +5300,7 @@ impl App {
                         let lr = Rect::from_center_size(pos2(cx, r.top() + zoom + 29.0), vec2(w, 28.0));
                         self.rename_editor(ui, lr);
                     } else {
-                        let mut job = egui::text::LayoutJob::simple(base_name(&e.name).to_string(), FontId::proportional(12.5), pal.text, cell_w - 16.0);
+                        let mut job = egui::text::LayoutJob::simple(self.batch_names.get(&*e.name).map(|n| base_name(n)).unwrap_or(base_name(&e.name)).to_string(), FontId::proportional(12.5), pal.text, cell_w - 16.0);
                         job.wrap.max_rows = 2;
                         job.wrap.break_anywhere = true;
                         job.halign = Align::Center;
@@ -5335,7 +5338,7 @@ impl App {
                         let lr = Rect::from_min_size(pos2(name_x - 4.0, r.top() + 2.0), vec2(name_w, r.height() - 4.0));
                         self.rename_editor(ui, lr);
                     } else {
-                        let mut job = egui::text::LayoutJob::simple_singleline(base_name(&e.name).to_string(), FontId::proportional(13.5), pal.text);
+                        let mut job = egui::text::LayoutJob::simple_singleline(self.batch_names.get(&*e.name).map(|n| base_name(n)).unwrap_or(base_name(&e.name)).to_string(), FontId::proportional(13.5), pal.text);
                         job.wrap.max_width = name_w;
                         job.wrap.max_rows = 1;
                         job.wrap.break_anywhere = true;
@@ -8429,18 +8432,67 @@ impl App {
                 let changes = d.names.iter().zip(&new).filter(|(o, n)| o != n).count();
                 let mut act = 0;
                 let mut open = true;
-                // ventana aparte y movible, como la vista previa (en Android egui la incrusta)
+                // nombres nuevos en la vista de carpeta mientras «Vista previa» esté activa
+                self.batch_names.clear();
+                if d.preview {
+                    for (o, n) in d.names.iter().zip(&new) {
+                        if o != n {
+                            self.batch_names.insert(o.clone(), n.clone());
+                        }
+                    }
+                }
+                let example = d.names.iter().zip(&new).find(|(o, n)| o != n).or_else(|| d.names.first().zip(new.first())).map(|(o, n)| format!("{o}  ->  {n}")).unwrap_or_default();
+                let ex_bad = bad.iter().any(|b| *b);
+                let rounded = self.transparent;
+                let edges = |a: &Self, c: &egui::Context| a.resize_edges(c);
+                // ventana aparte y movible, sin decoración del sistema, como la vista previa
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("batch_window"),
-                    egui::ViewportBuilder::default().with_title(t("Renombrar en lote")).with_inner_size([620.0, 600.0]).with_min_inner_size([420.0, 360.0]),
-                    |ui, _class| {
+                    egui::ViewportBuilder::default()
+                        .with_title(t("Renombrar en lote"))
+                        .with_decorations(false)
+                        .with_transparent(rounded)
+                        .with_inner_size([560.0, 440.0])
+                        .with_min_inner_size([400.0, 340.0]),
+                    |ui, class| {
+                        let emb = class == egui::ViewportClass::EmbeddedWindow;
                         let c = ui.ctx().clone();
                         if c.input(|i| i.viewport().close_requested()) || c.input(|i| i.key_pressed(egui::Key::Escape) && c.memory(|m| m.focused().is_none())) {
                             open = false;
                             return;
                         }
-                        let fw = (ui.available_width() - 150.0).max(120.0);
-                        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::same(16))).show_inside(ui, |ui| {
+                        if let (false, Some(dir)) = (emb, edges(self, &c)) {
+                            c.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                        }
+                        let screen = c.content_rect();
+                        let maxed = c.input(|i| i.viewport().maximized.unwrap_or(false));
+                        let rad = if rounded && !maxed { egui::CornerRadius::same(14) } else { egui::CornerRadius::ZERO };
+                        let p = c.layer_painter(egui::LayerId::background());
+                        if !emb {
+                        p.rect_filled(screen, rad, pal.panel);
+                        p.rect_stroke(screen, rad, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                        // cabecera propia: arrastra la ventana, doble clic maximiza
+                        let head = Rect::from_min_size(screen.min, vec2(screen.width(), 46.0));
+                        let close_r = Rect::from_center_size(pos2(head.right() - 28.0, head.center().y), vec2(30.0, 30.0));
+                        let hr = ui.interact(Rect::from_min_max(head.min, pos2(close_r.left() - 4.0, head.max.y)), egui::Id::new("batch_head"), egui::Sense::click_and_drag());
+                        if hr.double_clicked() {
+                            c.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+                        } else if hr.drag_started() {
+                            c.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        let cr = ui.interact(close_r, egui::Id::new("batch_close"), egui::Sense::click());
+                        if cr.hovered() {
+                            p.rect_filled(close_r, egui::CornerRadius::same(9), pal.hover);
+                        }
+                        theme::draw_glyph(&p, close_r.center(), 14.0, theme::Glyph::Close, pal.text);
+                        if cr.clicked() {
+                            open = false;
+                        }
+                        p.text(pos2(head.left() + 18.0, head.center().y), egui::Align2::LEFT_CENTER, t("Renombrar en lote"), FontId::proportional(16.0), pal.text);
+                        p.line_segment([pos2(head.left() + 14.0, head.bottom()), pos2(head.right() - 14.0, head.bottom())], Stroke::new(1.0, pal.border));
+                        }
+                        let fw = (screen.width() - 32.0 - 150.0).max(120.0);
+                        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: if emb { 8 } else { 56 }, bottom: 14 })).show_inside(ui, |ui| {
                     egui::Grid::new("batch").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                         ui.label(t("Plantilla"));
                         ui.add(egui::TextEdit::singleline(&mut d.template).hint_text("{nombre} {n:3} {fecha} {padre}").desired_width(fw));
@@ -8475,11 +8527,15 @@ impl App {
                         });
                         ui.end_row();
                     });
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&example).size(12.5).color(if ex_bad { Color32::from_rgb(235, 100, 100) } else { pal.subtle })).truncate());
                     if bad_re {
                         ui.colored_label(Color32::from_rgb(235, 100, 100), t("Expresión regular no válida."));
                     } else if conflict {
                         ui.colored_label(Color32::from_rgb(235, 100, 100), t("Hay nombres vacíos, repetidos o que ya existen."));
                     }
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut d.preview, t("Vista previa"));
                     ui.add_space(8.0);
                     ui.allocate_ui_with_layout(vec2(ui.available_width(), 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
@@ -8492,20 +8548,6 @@ impl App {
                             act = 2;
                         }
                     });
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut d.preview, t("Vista previa"));
-                    if d.preview {
-                        ui.add_space(4.0);
-                        // la lista llena el resto de la ventana y se desplaza sola (virtualizada)
-                        let row_h = 20.0;
-                        egui::ScrollArea::vertical().id_salt("batch_prev").auto_shrink([false, false]).show_rows(ui, row_h, d.names.len(), |ui, range| {
-                            for k in range {
-                                let (o, n, b) = (&d.names[k], &new[k], bad[k]);
-                                let col = if b { Color32::from_rgb(235, 100, 100) } else if o == n { pal.subtle } else { pal.text };
-                                ui.add(egui::Label::new(egui::RichText::new(format!("{o}  ->  {n}")).size(12.5).color(col)).truncate());
-                            }
-                        });
-                    }
                         });
                     },
                 );
@@ -8575,6 +8617,9 @@ impl App {
                     self.refresh();
                 }
                 keep = act == 0;
+                if !keep {
+                    self.batch_names.clear();
+                }
             }
             Dlg::Options => {
                 let mut open = true;
