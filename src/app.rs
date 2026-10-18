@@ -147,6 +147,10 @@ struct BatchDlg {
     parent: String,
     /// Carpeta donde se abrió: el diálogo no se mueve con la navegación.
     dir: PathBuf,
+    /// ¿Existe ya ese nombre en la carpeta? (una consulta por nombre, no por fotograma)
+    exists: HashMap<String, bool>,
+    /// Expresión compilada para el texto de búsqueda actual.
+    re_cache: Option<(String, Option<regex::Regex>)>,
 }
 
 /// Acción reversible registrada para deshacer/rehacer.
@@ -439,6 +443,10 @@ pub struct App {
     preview_was: bool,
     /// Datos extra de las columnas opcionales de la lista, por ruta; se vacía al recargar.
     extra_cache: HashMap<PathBuf, fsys::ExtraMeta>,
+    /// Metadatos de columnas que se calculan en un hilo (red, NSS…): llegan por aquí.
+    extra_tx: Sender<(PathBuf, fsys::ExtraMeta)>,
+    extra_rx: Receiver<(PathBuf, fsys::ExtraMeta)>,
+    extra_pending: std::collections::HashSet<PathBuf>,
     /// Comprimidos abiertos como carpeta: (carpeta de caché, archivo original).
     arch: Vec<(PathBuf, PathBuf)>,
     /// El usuario cerró el panel del portapapeles (reaparece al copiar de nuevo).
@@ -656,7 +664,8 @@ struct NetPlace {
 
 #[cfg(target_os = "linux")]
 fn gvfs_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("gvfs")).filter(|p| p.is_dir())
+    // sin tocar el disco: un gvfs colgado bloquearía cada fotograma; quien lo use ya falla si no existe
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("gvfs"))
 }
 
 /// Nombre legible de un montaje gvfs («smb-share:server=nas,share=media» -> «media en nas»).
@@ -836,7 +845,7 @@ fn run_gio(args: &[&str], uri: &str, c: &GioCred) -> Result<(), String> {
     if c.anon {
         cmd.arg("-a");
     }
-    cmd.arg(uri).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("--").arg(uri).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("gio: {e}"))?;
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let outs: [Option<Box<dyn Read + Send>>; 2] = [
@@ -1082,6 +1091,7 @@ impl App {
         theme::apply_style(&ctx, &pal, cfg.dark);
         let (load_tx, load_rx) = channel();
         let (sort_tx, sort_rx) = channel();
+        let (extra_tx, extra_rx) = channel();
         // Rutas de la línea de órdenes: carpetas → pestañas; archivos → su carpeta con el archivo seleccionado.
         let mut cli_dirs: Vec<PathBuf> = Vec::new();
         let mut cli_select: Vec<String> = Vec::new();
@@ -1170,6 +1180,9 @@ impl App {
             tap_block: false,
             preview_was: false,
             extra_cache: HashMap::new(),
+            extra_tx,
+            extra_rx,
+            extra_pending: Default::default(),
             arch: Vec::new(),
             clip_hidden: false,
             col_cache: HashMap::new(),
@@ -1793,6 +1806,13 @@ impl App {
 
     fn poll(&mut self) {
         self.poll_search();
+        while let Ok((k, m)) = self.extra_rx.try_recv() {
+            self.extra_pending.remove(&k);
+            if self.extra_cache.len() > 4000 {
+                self.extra_cache.clear();
+            }
+            self.extra_cache.insert(k, m);
+        }
         let mut done = false;
         let needle = self.filter.to_lowercase();
         while let Ok(m) = self.load_rx.try_recv() {
@@ -3990,10 +4010,12 @@ impl App {
             let home = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
             self.navigate(home);
         }
-        for tab in self.other.as_deref_mut() {
-            if tab.cwd.starts_with(&path) {
-                tab.cwd = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
-            }
+        // el panel inactivo se recarga de verdad: si no, la lista y la carpeta quedarían incoherentes
+        if self.other.as_deref().map(|o| o.cwd.starts_with(&path)).unwrap_or(false) {
+            let home = self.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+            self.swap_pane();
+            self.navigate(home);
+            self.swap_pane();
         }
         self.say(t("Desmontando…").into(), false);
         let is_gvfs = gvfs_dir().map(|g| path.starts_with(g)).unwrap_or(false);
@@ -5438,11 +5460,15 @@ impl App {
                     let sub = pal.subtle;
                     if !lc.cols.is_empty() {
                         let key = self.cwd.join(&*e.name);
-                        if lc.cols.iter().any(|c| c.def.meta) && !self.extra_cache.contains_key(&key) {
-                            if self.extra_cache.len() > 4000 {
-                                self.extra_cache.clear();
-                            }
-                            self.extra_cache.insert(key.clone(), fsys::extra_meta(&key, e.is_dir()));
+                        if lc.cols.iter().any(|c| c.def.meta) && !self.extra_cache.contains_key(&key) && self.extra_pending.len() < 64 && !self.extra_pending.contains(&key) {
+                            // en un hilo: owner/elementos pueden tocar la red o NSS; la celda sale vacía hasta que llegue
+                            self.extra_pending.insert(key.clone());
+                            let (tx, k, d, c) = (self.extra_tx.clone(), key.clone(), e.is_dir(), self.ctx.clone());
+                            std::thread::spawn(move || {
+                                let m = fsys::extra_meta(&k, d);
+                                let _ = tx.send((k, m));
+                                c.request_repaint();
+                            });
                         }
                         let ex = self.extra_cache.get(&key);
                         for pc in &lc.cols {
@@ -6128,7 +6154,11 @@ fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
     }
     let old = md.permissions().mode();
     let new = if md.is_dir() { (old & !0o777) | bits } else { (old & !0o777) | bits };
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(new))?;
+    // si la carpeta pierde lectura/ejecución, primero se recorre el contenido y la carpeta se cambia al final
+    let last = recursive && md.is_dir() && new & 0o500 != 0o500;
+    if !last {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(new))?;
+    }
     if recursive && md.is_dir() {
         for e in std::fs::read_dir(p)? {
             let e = e?;
@@ -6143,6 +6173,9 @@ fn set_perms(p: &Path, bits: u32, recursive: bool) -> std::io::Result<()> {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(nb))?;
             }
         }
+    }
+    if last {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(new))?;
     }
     Ok(())
 }
@@ -6356,7 +6389,11 @@ impl App {
             if let Some(p) = pos {
                 cmd.env("FB_POS", p);
             }
-            let _ = cmd.spawn();
+            if let Ok(mut ch) = cmd.spawn() {
+                std::thread::spawn(move || {
+                    let _ = ch.wait();
+                });
+            }
         }
     }
 
@@ -7398,6 +7435,12 @@ impl App {
             self.navigate(root);
             return;
         }
+        // ya se está extrayendo ahí: borrar la caché ahora pisaría esa extracción
+        let busy = matches!(&self.op_meta, OpMeta::OpenArchive { root: r, .. } if *r == root) && self.op.is_some()
+            || self.queue.iter().any(|(_, m)| matches!(m, OpMeta::OpenArchive { root: r, .. } if *r == root));
+        if busy {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&root);
         self.start_op(Op::Unzip { src: p.clone(), dst: root.clone(), pass: None }, OpMeta::OpenArchive { archive: p, root });
     }
@@ -7617,6 +7660,8 @@ impl App {
             start: 1,
             case: 0,
             preview: true,
+            exists: HashMap::new(),
+            re_cache: None,
         });
     }
 
@@ -7636,8 +7681,14 @@ impl App {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Err(e) = c.spawn() {
-            self.say(format!("{}: {e}", t("No se pudo abrir")), true);
+        match c.spawn() {
+            // se recoge el hijo al terminar: sin wait quedaría como zombi
+            Ok(mut ch) => {
+                std::thread::spawn(move || {
+                    let _ = ch.wait();
+                });
+            }
+            Err(e) => self.say(format!("{}: {e}", t("No se pudo abrir")), true),
         }
     }
 
@@ -8504,7 +8555,7 @@ impl App {
                 }
                 if act == 1 {
                     let n = name.trim().to_string();
-                    if n.is_empty() || n.contains(['/', '\\']) {
+                    if bad_name(&n) {
                         self.say(t("Nombre no válido").into(), true);
                     } else if self.remote_ro(&self.cwd.clone()) {
                     } else {
@@ -8512,8 +8563,16 @@ impl App {
                         self.say(t("Creando archivo…").into(), false);
                         self.spawn_io(
                             move || {
-                                let p = fsys::unique_path(&cwd, &n);
-                                std::fs::File::create(&p).map(|_| p)
+                                // create_new: si aparece un archivo con ese nombre entre medias, no se vacía
+                                let mut p = fsys::unique_path(&cwd, &n);
+                                for _ in 0..8 {
+                                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                                        Ok(_) => return Ok(p),
+                                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => p = fsys::unique_path(&cwd, &n),
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "ya existe"))
                             },
                             |a, r| match r {
                                 Ok(p) => {
@@ -8532,15 +8591,24 @@ impl App {
                 keep = act == 0;
             }
             Dlg::Batch(d) => {
-                let re = if d.regex && !d.find.is_empty() { regex::Regex::new(&d.find).ok() } else { None };
+                let re = if d.regex && !d.find.is_empty() {
+                    if d.re_cache.as_ref().map(|c| c.0 != d.find).unwrap_or(true) {
+                        let r = regex::RegexBuilder::new(&d.find).size_limit(1 << 20).build().ok();
+                        d.re_cache = Some((d.find.clone(), r));
+                    }
+                    d.re_cache.as_ref().and_then(|c| c.1.clone())
+                } else {
+                    None
+                };
                 let bad_re = d.regex && !d.find.is_empty() && re.is_none();
                 let new: Vec<String> = d.names.iter().enumerate().map(|(i, n)| batch_name(n, d, i, re.as_ref())).collect();
                 let olds: HashSet<&str> = d.names.iter().map(|s| s.as_str()).collect();
                 let mut seen: HashSet<&str> = HashSet::new();
                 // por fila: ¿tiene problema? (vacío, repetido, con barra o ya existente)
                 let mut bad: Vec<bool> = Vec::with_capacity(new.len());
+                let (dir, exists) = (&d.dir, &mut d.exists);
                 for (o, n) in d.names.iter().zip(&new) {
-                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && d.dir.join(n).exists());
+                    let b = bad_name(n) || !seen.insert(n.as_str()) || (n != o && !olds.contains(n.as_str()) && *exists.entry(n.clone()).or_insert_with(|| dir.join(n).symlink_metadata().is_ok()));
                     bad.push(b);
                 }
                 let conflict = bad.iter().any(|b| *b) || bad_re;
@@ -8681,7 +8749,14 @@ impl App {
                     let tmpn = |i: usize| format!(".fbtmp-{pid}-{i}");
                     let mut staged = 0;
                     for (i, (o, _)) in pairs.iter().enumerate() {
-                        if let Err(e) = std::fs::rename(d.dir.join(o), d.dir.join(tmpn(i))) {
+                        // rename sobrescribe: un temporal viejo con el mismo nombre se perdería sin aviso
+                        let tmp = d.dir.join(tmpn(i));
+                        let r = if tmp.symlink_metadata().is_ok() {
+                            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, t("ya existe")))
+                        } else {
+                            std::fs::rename(d.dir.join(o), &tmp)
+                        };
+                        if let Err(e) = r {
                             err = Some(format!("{o}: {e}"));
                             break;
                         }
@@ -8714,9 +8789,9 @@ impl App {
                         for i in 0..staged {
                             let back = d.dir.join(&pairs[i].0);
                             let tmp = d.dir.join(tmpn(i));
-                            if std::fs::rename(&tmp, &back).is_err() && back.symlink_metadata().is_err() {
-                                // último recurso: dejarlo con un nombre reconocible, nunca «.fbtmp»
-                                let _ = std::fs::rename(&tmp, d.dir.join(format!("{} (recuperado)", pairs[i].0)));
+                            // si el original ya está ocupado no se sobrescribe: se deja con un nombre reconocible
+                            if back.symlink_metadata().is_ok() || std::fs::rename(&tmp, &back).is_err() {
+                                let _ = std::fs::rename(&tmp, fsys::unique_path(&d.dir, &format!("{} (recuperado)", pairs[i].0)));
                             }
                         }
                     }

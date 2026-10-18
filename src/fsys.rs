@@ -489,6 +489,16 @@ pub enum Op {
     Unzip { src: PathBuf, dst: PathBuf, pass: Option<String> },
 }
 
+/// Crea una carpeta de datos privada (caché, índice): en unix solo la lee su usuario.
+pub fn private_dir(p: &Path) {
+    let _ = fs::create_dir_all(p);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+    }
+}
+
 pub(crate) fn size_of_tree(p: &Path) -> u64 {
     match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => fs::read_dir(p)

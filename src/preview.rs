@@ -1061,7 +1061,7 @@ impl Preview {
             }
         } else {
             match &self.player {
-                Some(pl) => (pl.playing(), pl.position(), pl.duration, pl.error.clone()),
+                Some(pl) => (pl.playing(), pl.position(), pl.duration(), pl.error.clone()),
                 None => (false, 0.0, 0.0, None),
             }
         };

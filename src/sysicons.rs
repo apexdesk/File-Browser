@@ -222,6 +222,11 @@ mod linux {
 
     /// Lee index.theme: devuelve (Inherits, directorios).
     fn parse_theme(base: &PathBuf, name: &str) -> Option<(Vec<String>, Vec<Dir>)> {
+        // un nombre de tema o carpeta con «..» o ruta absoluta saldría de la carpeta de iconos
+        let safe = |s: &str| !s.is_empty() && !s.starts_with('/') && !s.split('/').any(|c| c == "..");
+        if !safe(name) {
+            return None;
+        }
         let root = base.join(name);
         let txt = std::fs::read_to_string(root.join("index.theme")).ok()?;
         let mut inherits = Vec::new();
@@ -246,6 +251,9 @@ mod linux {
         }
         let mut out = Vec::new();
         for d in dirs_list {
+            if !safe(&d) {
+                continue;
+            }
             let Some(sec) = sections.get(&d) else { continue };
             let num = |k: &str| sec.get(k).and_then(|v| v.parse::<i32>().ok());
             if num("Scale").unwrap_or(1) != 1 {
