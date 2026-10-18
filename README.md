@@ -35,6 +35,62 @@ target. Then:
 
 `ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK.
 
+### Web version (the same app in the browser)
+
+The file manager itself, compiled to WebAssembly and drawn on a canvas, runs in any modern browser. It is
+served by `filebrowser-server` (the `server/` crate), which shares the folders you choose over HTTP. Nothing is
+reimplemented: the browser runs the same code as the desktop app, reading files from the server.
+
+Build once (needs the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.128):
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128
+./server/build-web.sh                         # compiles the app to WebAssembly into server/webui/
+cargo build --release -p filebrowser-server   # embeds it in the server binary
+```
+
+Run it and open the printed link (it contains a secret token that only exists while the server runs):
+
+```sh
+filebrowser-server ~/Documents ~/Pictures      # read-only, only this computer (127.0.0.1)
+# → http://127.0.0.1:41873/s/<token>/    open it and follow the app link, or append app/
+```
+
+| Option | Effect |
+| --- | --- |
+| `--bind 0.0.0.0` | listen on the local network (default: `127.0.0.1`) |
+| `--port N` | fixed port (default: a free one) |
+| `--ttl 2h` | the link expires after that time (`30s`, `90m`, `2h`, `1d`) |
+| `--tls` | HTTPS with a self-signed certificate (the browser will warn; the fingerprint is printed) |
+| `--user NAME` | also ask for a user name and password (HTTP Basic). The password comes from `FB_PASSWORD`, `--password-file FILE` or a prompt, at least 8 characters |
+| `--write` | allow uploading, deleting, moving and copying (default: read-only). `--max-upload MiB` limits a file (default 2048) |
+| `--hidden` | also serve names starting with `.` (hidden by default) |
+
+Examples:
+
+```sh
+# on your LAN, with HTTPS, a password and a 2 hour link, allowing changes
+FB_PASSWORD='a long password' filebrowser-server --bind 0.0.0.0 --tls --user me --write --ttl 2h ~/Shared
+```
+
+Using it: browse, preview, search (including file contents), sort and select exactly as in the desktop app.
+With `--write` you can create, rename, delete, copy and paste, and upload by dragging files onto the window or
+with *File → Upload files…*. Files open in a new browser tab. Settings (view, theme, bookmarks, recent
+folders) are kept in the browser's local storage.
+
+Notes and limits:
+
+- Share specific folders; the filesystem root cannot be shared. Without `--tls` (or a tunnel such as
+  WireGuard or Tailscale) the link, and the password if you set one, travel unencrypted, so use it on trusted
+  networks only. Anyone who has the link (and the password) can see everything shared, and change it with `--write`.
+- Not available in the browser: terminal, 3D GPU viewer, audio playback, RAR/7z archives and the trash
+  (deleting is permanent). Copy, move and rename act within one shared folder.
+- Every file operation is a request to the server, so very large folders are slower than on the desktop,
+  and content search, duplicates and checksums run in the page and stop it while they work.
+- More about the server and its security model: [`server/README.md`](server/README.md) and
+  [`server/PLAN.md`](server/PLAN.md).
+
 ## Releases and CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the tests and builds every target on each push and pull
