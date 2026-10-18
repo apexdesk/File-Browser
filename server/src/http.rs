@@ -23,6 +23,7 @@ pub struct Req {
     pub query: String,
     pub range: Option<String>,
     pub inm: Option<String>,
+    pub auth: Option<String>,
     /// Solo PUT/POST: tamaño del cuerpo, cabeceras para el control de origen y lo ya leído del cuerpo.
     pub content_length: u64,
     pub origin: Option<String>,
@@ -85,7 +86,7 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
         return Err(400);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut req = Req { method, head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None, content_length: 0, origin: None, host: None, xfb: false, leftover: Vec::new() };
+    let mut req = Req { method, head: head_only, path: path.to_string(), query: query.to_string(), range: None, inm: None, auth: None, content_length: 0, origin: None, host: None, xfb: false, leftover: Vec::new() };
     let mut n = 0;
     for l in lines {
         n += 1;
@@ -100,6 +101,7 @@ pub fn parse(head: &[u8]) -> Result<Req, u16> {
         match k.to_ascii_lowercase().as_str() {
             "range" => req.range = Some(v.to_string()),
             "if-none-match" => req.inm = Some(v.to_string()),
+            "authorization" => req.auth = Some(v.to_string()),
             "transfer-encoding" => return Err(400),
             "content-length" => {
                 req.content_length = v.parse::<u64>().map_err(|_| 400u16)?;
@@ -125,6 +127,7 @@ pub fn reason(code: u16) -> &'static str {
         304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",

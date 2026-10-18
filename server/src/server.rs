@@ -31,13 +31,15 @@ pub struct Ctx {
     pub write: bool,
     pub max_upload: u64,
     pub tls: Option<crate::tls::Config>,
+    /// `--user`: además del token, usuario y contraseña (HTTP Basic)
+    pub auth: Option<crate::auth::Creds>,
     limiter: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
 }
 
 impl Ctx {
     pub fn new(roots: Vec<Root>, token: String, hidden: bool, write: bool, max_upload: u64, tls: Option<crate::tls::Config>) -> Self {
-        Ctx { roots, token, hidden, write, max_upload, tls, limiter: Mutex::new(HashMap::new()), per_ip: Mutex::new(HashMap::new()) }
+        Ctx { roots, token, hidden, write, max_upload, tls, auth: None, limiter: Mutex::new(HashMap::new()), per_ip: Mutex::new(HashMap::new()) }
     }
 
     /// Reserva un hueco de conexión para esa IP; `false` si ya tiene demasiadas abiertas.
@@ -111,7 +113,7 @@ fn open_nofollow(p: &Path) -> io::Result<File> {
     }
 }
 
-fn ct_eq(a: &str, b: &str) -> bool {
+pub fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut d = (a.len() ^ b.len()) as u32;
     for i in 0..a.len().max(b.len()) {
@@ -209,6 +211,16 @@ fn route(s: &mut Stream, ctx: &Ctx, req: &Req, ip: Option<IpAddr>) -> io::Result
     if !ct_eq(tok, &ctx.token) {
         ctx.fail(ip);
         return http::error(s, 404, req.head);
+    }
+    if let Some(c) = &ctx.auth {
+        if !c.check(req.auth.as_deref()) {
+            // los intentos fallidos cuentan para el bloqueo por IP, igual que un token erróneo
+            if req.auth.is_some() {
+                ctx.fail(ip);
+            }
+            let h = [("WWW-Authenticate", "Basic realm=\"filebrowser-server\", charset=\"UTF-8\"".to_string())];
+            return http::send(s, 401, "text/plain; charset=utf-8", b"Se necesita usuario y contrase\xc3\xb1a\n", req.head, &h);
+        }
     }
     if tail.is_empty() {
         return http::redirect(s, &format!("/s/{tok}/"), req.head);

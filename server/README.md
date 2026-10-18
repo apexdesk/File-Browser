@@ -51,3 +51,9 @@ reimplementación. Los archivos se leen del servidor por XHR (capa `src/vfs/`). 
 deja el resultado en `server/webui/`, y el servidor lo embebe al compilar (sin esos ficheros funciona igual, solo
 con los listados HTML). Es de **solo lectura** salvo que se arranque con `--write` (tope de subida: `--max-upload`
 en MiB); cada petición que modifica exige la cabecera `X-FB: 1` y un `Origin` igual al `Host`.
+
+## Usuario y contraseña
+`--user NOMBRE` exige, además del enlace secreto, usuario y contraseña (HTTP Basic; el navegador los pide y los
+recuerda). La contraseña (mínimo 8 caracteres) se toma de la variable `FB_PASSWORD`, de `--password-file ARCHIVO` o se
+pregunta al arrancar sin eco; nunca va en la línea de órdenes. Los intentos fallidos cuentan para el bloqueo por IP.
+Sin `--tls` (o un túnel) la contraseña viaja sin cifrar: el programa lo avisa si escuchas fuera de `127.0.0.1`.
