@@ -325,18 +325,32 @@ pub fn all_roots() -> Vec<PathBuf> {
     {
         (b'A'..=b'Z').map(|c| PathBuf::from(format!("{}:\\", c as char))).filter(|p| p.exists()).collect()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "android")))]
     {
         vec![PathBuf::from("/")]
+    }
+    // Android: sólo el almacenamiento compartido y las tarjetas SD (el resto no es legible ni útil)
+    #[cfg(target_os = "android")]
+    {
+        let mut v = vec![PathBuf::from("/storage/emulated/0")];
+        if let Ok(rd) = std::fs::read_dir("/storage") {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n != "emulated" && n != "self" && e.path().is_dir() {
+                    v.push(e.path());
+                }
+            }
+        }
+        v
     }
 }
 
 pub fn pseudo_fs(p: &Path) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         matches!(p.to_str(), Some("/proc" | "/sys" | "/dev" | "/run" | "/snap"))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = p;
         false

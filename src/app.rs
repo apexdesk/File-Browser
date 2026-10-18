@@ -3572,6 +3572,11 @@ impl App {
             self.run_cmd(Cmd::SelectAll);
             ui.close();
         }
+        if menu_row(ui, &pal, t("Filtrar esta carpeta"), false, None) {
+            self.ctx.data_mut(|d| d.insert_temp(egui::Id::new("phone_filter"), true));
+            self.filter_focus = true;
+            ui.close();
+        }
         if menu_row(ui, &pal, t("Buscar en subcarpetas"), false, None) {
             self.run_cmd(Cmd::Search);
             ui.close();
@@ -9482,6 +9487,34 @@ impl eframe::App for App {
                 .frame(bar(6, 4))
                 .show_separator_line(false)
                 .show(ui, |ui| self.phone_bar(ui));
+            // filtro por nombre de la carpeta actual (se abre desde el menú ⋮)
+            let pf_id = egui::Id::new("phone_filter");
+            let pf = ui.ctx().data(|d| d.get_temp::<bool>(pf_id)).unwrap_or(false);
+            if pf || !self.filter.is_empty() {
+                egui::Panel::top("phonefilter").frame(bar(6, 4)).show_separator_line(false).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let te = egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text(t("Filtrar…"))
+                            .desired_width((ui.available_width() - 60.0).max(80.0))
+                            .margin(egui::Margin::symmetric(12, 10));
+                        let r = ui.add(te);
+                        if self.filter_focus {
+                            r.request_focus();
+                            self.filter_focus = false;
+                        }
+                        if r.changed() {
+                            self.spawn_sort();
+                        }
+                        let (rc, resp) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+                        theme::draw_glyph(ui.painter(), rc.center(), 22.0, Glyph::Close, self.pal.text);
+                        if resp.clicked() {
+                            self.filter.clear();
+                            self.spawn_sort();
+                            ui.ctx().data_mut(|d| d.insert_temp(pf_id, false));
+                        }
+                    });
+                });
+            }
         } else {
             egui::Panel::top("titlebar")
                 .frame(bar(2, 0))
