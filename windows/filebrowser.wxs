@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Instalador MSI (WiX v4). Variables: Version, Exe (ruta al .exe), UpgradeCode, Root (raíz del repositorio). -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="File Browser" Manufacturer="apexdesk" Version="$(Version)" UpgradeCode="$(UpgradeCode)" Scope="perMachine" Compressed="yes">
+    <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="Ya hay instalada una versión más reciente de File Browser." />
+    <Icon Id="app.ico" SourceFile="$(Root)\assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="app.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/apexdesk/File-Browser" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="File Browser">
+        <Component Id="MainExe">
+          <File Id="FileBrowserExe" Name="filebrowser.exe" Source="$(Exe)" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseFile">
+          <File Id="LicenseTxt" Name="LICENSE.txt" Source="$(Root)\LICENSE" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="AppShortcut" Name="File Browser" Description="Fast, lightweight file manager"
+                  Target="[INSTALLFOLDER]filebrowser.exe" WorkingDirectory="INSTALLFOLDER" Icon="app.ico" />
+        <RegistryValue Root="HKCU" Key="Software\apexdesk\FileBrowser" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="File Browser" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="LicenseFile" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

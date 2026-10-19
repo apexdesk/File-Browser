@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Empaqueta libfilebrowser.so (aarch64) en un APK firmado con la clave de depuración.
+# Empaqueta libfilebrowser.so en un APK firmado. Uso: build-apk.sh [arm64-v8a|armeabi-v7a] (por defecto arm64-v8a).
+# Sin ANDROID_KEYSTORE se firma con la clave de depuración.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SDK=${ANDROID_HOME:-$HOME/android-sdk}
@@ -7,12 +8,19 @@ BT=$SDK/build-tools/34.0.0
 JAR=$SDK/platforms/android-34/android.jar
 NDK=${NDK:-$SDK/ndk/27.3.13750724}
 export PATH=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-CARGO_TARGET_DIR=target-android CC_aarch64_linux_android=aarch64-linux-android26-clang \
-  AR_aarch64_linux_android=llvm-ar CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android26-clang \
-  cargo build --release --lib --target aarch64-linux-android
-OUT=target-android/apk
-rm -rf "$OUT" && mkdir -p "$OUT/lib/arm64-v8a"
-cp target-android/aarch64-linux-android/release/libfilebrowser.so "$OUT/lib/arm64-v8a/"
+ABI=${1:-arm64-v8a}
+case "$ABI" in
+  arm64-v8a)   TRIPLE=aarch64-linux-android;   CLANG=aarch64-linux-android26-clang;   OUTAPK=FileBrowser.apk ;;
+  armeabi-v7a) TRIPLE=armv7-linux-androideabi; CLANG=armv7a-linux-androideabi26-clang; OUTAPK=FileBrowser-armv7.apk ;;
+  *) echo "ABI desconocida: $ABI" >&2; exit 1 ;;
+esac
+ENVT=${TRIPLE//-/_}
+UPT=$(echo "$ENVT" | tr a-z A-Z)
+export CARGO_TARGET_DIR=target-android "CC_$ENVT=$CLANG" "AR_$ENVT=llvm-ar" "CARGO_TARGET_${UPT}_LINKER=$CLANG"
+cargo build --release --lib --target "$TRIPLE"
+OUT=target-android/apk-$ABI
+rm -rf "$OUT" && mkdir -p "$OUT/lib/$ABI"
+cp "target-android/$TRIPLE/release/libfilebrowser.so" "$OUT/lib/$ABI/"
 mkdir -p "$OUT/res/mipmap-xxxhdpi" "$OUT/compiled"
 cp assets/icon-512.png "$OUT/res/mipmap-xxxhdpi/ic_launcher.png"
 "$BT/aapt2" compile --dir "$OUT/res" -o "$OUT/compiled"
@@ -28,5 +36,5 @@ if [ ! -f "$KS" ]; then
     -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
 "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" \
-  --out target-android/FileBrowser.apk "$OUT/aligned.apk"
-echo "APK: $(pwd)/target-android/FileBrowser.apk"
+  --out "target-android/$OUTAPK" "$OUT/aligned.apk"
+echo "APK: $(pwd)/target-android/$OUTAPK"

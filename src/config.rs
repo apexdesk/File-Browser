@@ -117,7 +117,23 @@ impl Default for Config {
     }
 }
 
+/// Modo portable: si junto al ejecutable hay un archivo `portable.txt`, la configuración se guarda en
+/// `data/config.txt` a su lado en vez de en la carpeta de configuración del usuario.
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+fn portable_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    dir.join("portable.txt").is_file().then(|| dir.join("data"))
+}
+
+#[cfg(any(target_os = "android", target_arch = "wasm32"))]
+fn portable_dir() -> Option<PathBuf> {
+    None
+}
+
 fn file() -> Option<PathBuf> {
+    if let Some(d) = portable_dir() {
+        return Some(d.join("config.txt"));
+    }
     dirs::config_dir().map(|d| d.join("filebrowser-rs").join("config.txt"))
 }
 
