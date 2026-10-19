@@ -1,0 +1,73 @@
+[package]
+name = "apex-view"
+version = "0.1.0"
+edition = "2024"
+license = "PolyForm-Strict-1.0.0"
+description = "View-only renderer of office documents and PDF: pages as RGBA pixels and their text"
+publish = false
+
+[features]
+default = ["docx", "xlsx", "pptx", "pdf", "odt", "ods", "odp", "rtf", "doc", "xls", "ppt"]
+docx = ["flow"]
+xlsx = ["grid"]
+pptx = ["ooxml"]
+odt = ["flow"]
+ods = ["grid"]
+odp = ["ooxml"]
+rtf = ["flow", "dep:encoding_rs"]
+doc = ["flow", "dep:encoding_rs"]
+xls = ["grid", "dep:encoding_rs"]
+ppt = ["ooxml", "dep:encoding_rs"]
+# Shared parts: documents laid out into pages, sheets drawn as grids, and
+# what every office format uses (zip, XML, pictures, text set in lines).
+flow = ["ooxml"]
+grid = ["ooxml"]
+ooxml = ["dep:image", "dep:zune-jpeg"]
+pdf = ["dep:aes", "dep:md-5", "dep:sha2", "dep:zune-jpeg", "dep:encoding_rs"]
+# Scanned PDFs: JPEG 2000, JBIG2 and CCITT fax pictures.
+pdf-scans = ["pdf", "dep:hayro-jpeg2000", "dep:hayro-jbig2", "dep:hayro-ccitt"]
+
+[dependencies]
+# One rasterizer for every format, single-threaded.
+vello_cpu = { version = "0.1.0", default-features = false, features = ["std", "u8_pipeline"] }
+skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
+miniz_oxide = "0.8"
+memchr = "2"
+image = { version = "0.25.10", default-features = false, features = ["png", "gif", "bmp", "webp"], optional = true }
+aes = { version = "0.8", optional = true }
+md-5 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+zune-jpeg = { version = "0.5.15", optional = true }
+hayro-jpeg2000 = { version = "0.4.1", default-features = false, optional = true }
+hayro-jbig2 = { version = "0.3.1", default-features = false, optional = true }
+hayro-ccitt = { version = "0.4.0", default-features = false, optional = true }
+encoding_rs = { version = "0.8", optional = true }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# Small for the same speed (README): what a program using this crate
+# should set too.
+[profile.release.package]
+apex-view.opt-level = "z"
+vello_cpu.opt-level = "s"
+vello_common.opt-level = "s"
+fearless_simd.opt-level = "s"
+skrifa.opt-level = "s"
+read-fonts.opt-level = "s"
+font-types.opt-level = "s"
+kurbo.opt-level = "s"
+peniko.opt-level = "s"
+color.opt-level = "s"
+encoding_rs.opt-level = "s"
+zune-jpeg.opt-level = "s"
+zune-core.opt-level = "s"
+
+[patch.crates-io]
+# CFF glyphs held to a budget of operators (vendor/README.md). A program
+# using this crate needs the same patch in its own Cargo.toml.
+read-fonts = { path = "vendor/read-fonts" }
