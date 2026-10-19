@@ -218,8 +218,7 @@ jobs:
           cd out
           for f in *; do
             case "$f" in
-              filebrowser-*) ;;
-              *) mv "$f" "filebrowser-$f" ;;
+              filebrowser_*) mv "$f" "${f/filebrowser_/filebrowser-}" ;;
             esac
           done
           ls -l
@@ -280,6 +279,7 @@ jobs:
             & $signtool sign /fd SHA256 /f sign.pfx /p filebrowser "out/filebrowser-windows-$name.msix"
             if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
           }
+          Remove-Item out/*.wixpdb
           Get-ChildItem out
       - uses: actions/upload-artifact@v4
         with:
