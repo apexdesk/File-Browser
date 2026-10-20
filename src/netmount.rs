@@ -3,7 +3,7 @@
 //! En Linux se usa GVFS (`gio`), ver `app.rs`.
 #[allow(unused_imports)]
 use crate::vfs::{KindV as _, PathV as _};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
 pub struct Login {
@@ -77,8 +77,16 @@ pub fn parse(uri: &str) -> Option<Parsed> {
     Some(Parsed { kind, host: host.to_string(), port, user, path })
 }
 
+/// SFTP con el `ssh` del sistema (ver `sftp.rs`) para una dirección sftp:// / ssh://.
+/// En Linux sólo se usa cuando GVFS monta el servidor pero no expone una carpeta local.
+#[cfg(target_os = "linux")]
+pub fn connect_sftp(l: &Login) -> Result<PathBuf, String> {
+    let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+    sftp_connect(l, &p)
+}
+
 /// SFTP con el `ssh` del sistema (ver `sftp.rs`): devuelve la carpeta espejo del servidor.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn sftp_connect(l: &Login, p: &Parsed) -> Result<PathBuf, String> {
     let user = if l.anon { String::new() } else if l.user.is_empty() { p.user.clone().unwrap_or_default() } else { l.user.clone() };
     let user = if user.is_empty() { std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default() } else { user };

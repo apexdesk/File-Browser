@@ -4174,6 +4174,16 @@ impl App {
                             return Ok(Some(p));
                         }
                     }
+                    // sólo un servidor SMB sin recurso tiene «recursos» entre los que elegir; en otro caso la
+                    // lista sería la de carpetas y elegir una volvería a listar la siguiente
+                    // (un recurso ya elegido que no se puede abrir da error, no otra lista)
+                    if !server_only {
+                        if uri.starts_with("sftp://") || uri.starts_with("ssh://") {
+                            let l = crate::netmount::Login { uri: uri.clone(), user: login.user.clone(), domain: String::new(), pass: login.pass.clone(), anon: login.anon };
+                            return crate::netmount::connect_sftp(&l).map(Some);
+                        }
+                        return Err(t("El servidor se ha montado pero no tiene carpeta local (¿falta gvfs-fuse?)").to_string());
+                    }
                     // servidor sin recurso: gvfs no lo expone como carpeta; se ofrecen sus recursos
                     // compartidos para elegir uno (sólo se monta ése)
                     let base = uri.trim_end_matches('/').to_string();
