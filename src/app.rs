@@ -3060,13 +3060,13 @@ impl App {
             .collect();
         bound.sort_by_key(|(_, m, _)| std::cmp::Reverse(m.alt as u8 + m.shift as u8 + (m.command || m.ctrl) as u8));
         if !self.filter.is_empty() {
-            // con un filtro escrito: Retroceso borra una letra y Espacio es una letra más
+            // con un filtro escrito: Retroceso borra una letra (Espacio sigue siendo la vista previa;
+            // sólo se escribe un espacio si se hace clic en el cuadro «Filtrar»)
             if k(Modifiers::NONE, Key::Backspace) {
                 self.filter.pop();
                 self.spawn_sort();
                 return;
             }
-            k(Modifiers::NONE, Key::Space);
         }
         for (cmd, m, key) in bound {
             if matches!(cmd, Cmd::SwitchPane | Cmd::CopyOther | Cmd::MoveOther) && self.other.is_none() {
@@ -3149,7 +3149,7 @@ impl App {
         let ok = !printable.is_empty()
             && self.palette.is_none()
             && self.rebinding.is_none()
-            && (printable.trim().len() == printable.len() || !self.filter.is_empty());
+            && printable.trim().len() == printable.len();
         if ok {
             self.filter.push_str(&printable);
             self.spawn_sort();
