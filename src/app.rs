@@ -634,6 +634,99 @@ pub struct App {
     rebinding: Option<Cmd>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SideKind {
+    Fav,
+    Bookmark,
+    Drive,
+}
+
+/// Lo que se ha elegido en el menú contextual de la barra lateral (se aplica al acabar de dibujarla).
+enum SideAct {
+    NewTab(PathBuf),
+    NewWin(PathBuf),
+    CopyPath(PathBuf),
+    Props(PathBuf),
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Native(PathBuf),
+    ToggleBookmark(PathBuf),
+    HideFav(PathBuf),
+    RestoreFavs,
+    Move(SideKind, usize, isize),
+    Go(PathBuf),
+}
+
+/// Menú contextual común de los accesos de la barra lateral (favoritos, marcadores y discos).
+fn side_menu(ui: &mut egui::Ui, path: &Path, kind: SideKind, idx: usize, len: usize, bookmarked: bool, can_restore: bool, act: &mut Option<SideAct>) {
+    ui.set_min_width(200.0);
+    let mut pick = |ui: &mut egui::Ui, label: &str, enabled: bool| -> bool {
+        let c = ui.add_enabled(enabled, egui::Button::new(label)).clicked();
+        if c {
+            ui.close();
+        }
+        c
+    };
+    if pick(ui, t("Abrir"), true) {
+        *act = Some(SideAct::Go(path.to_path_buf()));
+    }
+    if pick(ui, t("Abrir en una pestaña nueva"), true) {
+        *act = Some(SideAct::NewTab(path.to_path_buf()));
+    }
+    if !crate::vfs::WEB && pick(ui, t("Abrir en una ventana nueva"), true) {
+        *act = Some(SideAct::NewWin(path.to_path_buf()));
+    }
+    ui.separator();
+    match kind {
+        SideKind::Fav => {
+            if pick(ui, if bookmarked { t("Quitar de marcadores") } else { t("Añadir a marcadores") }, true) {
+                *act = Some(SideAct::ToggleBookmark(path.to_path_buf()));
+            }
+            if pick(ui, t("Ocultar de favoritos"), true) {
+                *act = Some(SideAct::HideFav(path.to_path_buf()));
+            }
+        }
+        SideKind::Bookmark => {
+            if pick(ui, t("Quitar marcador"), true) {
+                *act = Some(SideAct::ToggleBookmark(path.to_path_buf()));
+            }
+        }
+        SideKind::Drive => {
+            if pick(ui, if bookmarked { t("Quitar de marcadores") } else { t("Añadir a marcadores") }, true) {
+                *act = Some(SideAct::ToggleBookmark(path.to_path_buf()));
+            }
+        }
+    }
+    if kind != SideKind::Drive {
+        if pick(ui, t("Subir"), idx > 0) {
+            *act = Some(SideAct::Move(kind, idx, -1));
+        }
+        if pick(ui, t("Bajar"), idx + 1 < len) {
+            *act = Some(SideAct::Move(kind, idx, 1));
+        }
+    }
+    if kind == SideKind::Fav && can_restore && pick(ui, t("Restaurar favoritos"), true) {
+        *act = Some(SideAct::RestoreFavs);
+    }
+    ui.separator();
+    if pick(ui, t("Copiar ruta"), true) {
+        *act = Some(SideAct::CopyPath(path.to_path_buf()));
+    }
+    if pick(ui, t("Propiedades"), true) {
+        *act = Some(SideAct::Props(path.to_path_buf()));
+    }
+    #[cfg(windows)]
+    if pick(ui, t("Más opciones de Windows…"), true) {
+        *act = Some(SideAct::Native(path.to_path_buf()));
+    }
+}
+
+/// Aplica a los favoritos de serie lo que el usuario ha ocultado y el orden que ha elegido.
+fn arrange_places(mut v: Vec<Place>, hidden: &[PathBuf], order: &[PathBuf]) -> Vec<Place> {
+    v.retain(|p| !hidden.contains(&p.path));
+    v.sort_by_key(|p| order.iter().position(|o| *o == p.path).unwrap_or(usize::MAX));
+    v
+}
+
 fn standard_places() -> Vec<Place> {
     let mut v = Vec::new();
     let mut add = |name: &str, p: Option<PathBuf>, g: Glyph, sys: &'static str| {
@@ -1024,7 +1117,11 @@ fn list_drives() -> Vec<Place> {
     for c in b'A'..=b'Z' {
         let p = PathBuf::from(format!("{}:\\", c as char));
         if p.v_exists() {
-            v.push(Place { name: tf("Disco ({}:)", &[&(c as char)]), path: p, glyph: Glyph::Drive, sys: "drive" });
+            let name = match crate::winshell::volume_label(&p) {
+                Some(l) => format!("{l} ({}:)", c as char),
+                None => tf("Disco ({}:)", &[&(c as char)]),
+            };
+            v.push(Place { name, path: p, glyph: Glyph::Drive, sys: "drive" });
         }
     }
     #[cfg(target_os = "linux")]
@@ -1105,6 +1202,7 @@ impl App {
             }
         }
         cfg.sync_active();
+        let places = arrange_places(standard_places(), &cfg.fav_hidden, &cfg.fav_order);
         let pal = theme::resolve(&cfg, cfg.dark);
         theme::apply_style(&ctx, &pal, cfg.dark);
         let (load_tx, load_rx) = channel();
@@ -1250,7 +1348,7 @@ impl App {
             scroll_to: None,
             cols: 1,
             page_rows: 10,
-            places: standard_places(),
+            places,
             drives: list_drives(),
             network: Vec::new(),
             // vencido: la primera pasada de la lista de red se hace en segundo plano al arrancar
@@ -4243,7 +4341,7 @@ impl App {
         self.side_drop = None;
         self.bm_drop = false;
         let mut go: Option<PathBuf> = None;
-        let mut remove: Option<usize> = None;
+        let mut side_act: Option<SideAct> = None;
         let mut connect: Option<String> = None;
         let mut unmount: Option<PathBuf> = None;
         let mut show_recent = false;
@@ -4259,7 +4357,8 @@ impl App {
             };
             head(ui, t("Favoritos"));
             let sys_on = self.cfg.sys_icons;
-            for pl in &self.places {
+            let can_restore = !self.cfg.fav_hidden.is_empty() || !self.cfg.fav_order.is_empty();
+            for (i, pl) in self.places.iter().enumerate() {
                 let tex = if sys_on { self.sys.folder(&self.ctx, Some(pl.sys)) } else { None };
                 let r = side_item(ui, &pal, pl.glyph, tex, &pl.name, pl.path == cwd, false);
                 if dragging && ptr.map(|q| r.rect.contains(q)).unwrap_or(false) {
@@ -4267,6 +4366,14 @@ impl App {
                 }
                 if r.clicked() {
                     go = Some(pl.path.clone());
+                }
+                let bm = self.cfg.bookmarks.contains(&pl.path);
+                r.context_menu(|ui| side_menu(ui, &pl.path, SideKind::Fav, i, self.places.len(), bm, can_restore, &mut side_act));
+            }
+            if self.places.is_empty() && can_restore {
+                let r = side_item(ui, &pal, Glyph::Plus, None, t("Restaurar favoritos"), false, false);
+                if r.clicked() {
+                    side_act = Some(SideAct::RestoreFavs);
                 }
             }
             let r = side_item(ui, &pal, Glyph::Clock, None, t("Recientes"), cwd == Path::new(LOC_RECENT), false);
@@ -4308,12 +4415,8 @@ impl App {
                 if r.clicked() {
                     go = Some(b.clone());
                 }
-                r.on_hover_text(b.display().to_string()).context_menu(|ui| {
-                    if ui.button(t("Quitar marcador")).clicked() {
-                        remove = Some(i);
-                        ui.close();
-                    }
-                });
+                r.on_hover_text(b.display().to_string())
+                    .context_menu(|ui| side_menu(ui, b, SideKind::Bookmark, i, self.cfg.bookmarks.len(), true, false, &mut side_act));
             }
             if dragging {
                 let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
@@ -4328,7 +4431,8 @@ impl App {
                 head(ui, t("Dispositivos"));
             }
             for d in &self.drives {
-                let tex = if sys_on { self.sys.folder(&self.ctx, Some(d.sys)) } else { None };
+                // el icono propio de la unidad (Cryptomator, Dropbox…) y, si no, el genérico
+                let tex = if sys_on { self.sys.for_path(&self.ctx, &d.path).or_else(|| self.sys.folder(&self.ctx, Some(d.sys))) } else { None };
                 let r = side_item(ui, &pal, d.glyph, tex, &d.name, d.path == cwd, false);
                 if dragging && ptr.map(|q| r.rect.contains(q)).unwrap_or(false) {
                     self.side_drop = Some(d.path.clone());
@@ -4336,6 +4440,8 @@ impl App {
                 if r.clicked() {
                     go = Some(d.path.clone());
                 }
+                let bm = self.cfg.bookmarks.contains(&d.path);
+                r.context_menu(|ui| side_menu(ui, &d.path, SideKind::Drive, 0, 0, bm, false, &mut side_act));
             }
             head(ui, t("Red"));
             for n in &self.network {
@@ -4396,12 +4502,69 @@ impl App {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = unmount;
-        if let Some(i) = remove {
-            self.cfg.bookmarks.remove(i);
-            self.cfg.save();
+        if let Some(a) = side_act {
+            self.side_action(a);
         }
         if let Some(p) = go {
             self.navigate(p);
+        }
+    }
+
+    /// Menú contextual del Explorador de Windows (con las extensiones del sistema) para esas rutas.
+    #[cfg(windows)]
+    fn native_menu(&mut self, paths: Vec<PathBuf>, background: bool) {
+        if !crate::winshell::context_menu(&paths, background) {
+            self.say(t("No se pudo mostrar el menú de Windows").into(), true);
+        }
+        // el menú pudo cambiar archivos (comprimir, renombrar…)
+        self.refresh();
+    }
+
+    /// Aplica una acción del menú contextual de la barra lateral.
+    fn side_action(&mut self, a: SideAct) {
+        match a {
+            SideAct::Go(p) => self.navigate(p),
+            SideAct::NewTab(p) => self.new_tab_bg(p),
+            SideAct::NewWin(p) => self.new_window_at(&p),
+            SideAct::CopyPath(p) => self.ctx.copy_text(p.display().to_string()),
+            SideAct::Props(p) => self.open_props_paths(vec![p]),
+            SideAct::Native(p) => {
+                #[cfg(windows)]
+                self.native_menu(vec![p], false);
+                #[cfg(not(windows))]
+                let _ = p;
+            }
+            SideAct::ToggleBookmark(p) => self.toggle_bookmark(p),
+            SideAct::HideFav(p) => {
+                // el orden visible se guarda entero para que no se pierda al ocultar
+                self.cfg.fav_order = self.places.iter().map(|pl| pl.path.clone()).collect();
+                self.places.retain(|pl| pl.path != p);
+                if !self.cfg.fav_hidden.contains(&p) {
+                    self.cfg.fav_hidden.push(p);
+                }
+                self.cfg.save();
+            }
+            SideAct::RestoreFavs => {
+                self.cfg.fav_hidden.clear();
+                self.cfg.fav_order.clear();
+                self.places = standard_places();
+                self.cfg.save();
+            }
+            SideAct::Move(kind, i, d) => {
+                let j = i as isize + d;
+                match kind {
+                    SideKind::Fav if j >= 0 && (j as usize) < self.places.len() => {
+                        self.places.swap(i, j as usize);
+                        self.cfg.fav_order = self.places.iter().map(|pl| pl.path.clone()).collect();
+                        self.cfg.save();
+                    }
+                    SideKind::Bookmark if j >= 0 && (j as usize) < self.cfg.bookmarks.len() => {
+                        self.cfg.bookmarks.swap(i, j as usize);
+                        self.cfg.save();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -5834,6 +5997,10 @@ impl App {
         let id = if e.is_dir() {
             let sp = self.special_of(e);
             self.sys.folder(&self.ctx, sp)
+        } else if matches!(e.ext().to_ascii_lowercase().as_str(), "exe" | "lnk" | "ico" | "scr" | "url") {
+            // programas y accesos directos: su icono propio (el del juego o aplicación), no el genérico
+            let own = self.sys.for_path(&self.ctx, &self.cwd.join(&*e.name));
+            own.or_else(|| self.sys.file(&self.ctx, e.ext()))
         } else {
             self.sys.file(&self.ctx, e.ext())
         };
@@ -6029,6 +6196,11 @@ impl App {
                 self.open_props();
                 ui.close();
             }
+            #[cfg(windows)]
+            if ui.button(t("Más opciones de Windows…")).clicked() {
+                ui.close();
+                self.native_menu(self.selected_paths(), false);
+            }
         } else {
             ui.separator();
             if ui.button(t("Nueva carpeta")).clicked() {
@@ -6051,6 +6223,11 @@ impl App {
             if ui.button(t("Propiedades de la carpeta")).clicked() {
                 self.open_props();
                 ui.close();
+            }
+            #[cfg(windows)]
+            if self.vmode == VMode::Dir && ui.button(t("Más opciones de Windows…")).clicked() {
+                ui.close();
+                self.native_menu(vec![self.cwd.clone()], true);
             }
             if ui.button(t("Seleccionar todo   (Ctrl+A)")).clicked() {
                 self.select_range(0, self.order.len().saturating_sub(1), false);
@@ -6432,11 +6609,15 @@ impl App {
     }
 
     fn new_window(&self) {
+        self.new_window_at(&self.cwd);
+    }
+
+    fn new_window_at(&self, dir: &Path) {
         if let Ok(exe) = std::env::current_exe() {
             // la ventana nueva se abre desplazada para que no tape exactamente a la actual
             let pos = self.ctx.input(|i| i.viewport().outer_rect).map(|r| format!("{},{}", r.min.x + 40.0, r.min.y + 40.0));
             let mut cmd = std::process::Command::new(exe);
-            cmd.arg("--new-window").arg(&self.cwd);
+            cmd.arg("--new-window").arg(dir);
             if let Some(p) = pos {
                 cmd.env("FB_POS", p);
             }
@@ -7621,6 +7802,10 @@ impl App {
 
     fn open_props(&mut self) {
         let paths = if self.sel_count > 0 { self.selected_paths() } else { vec![self.cwd.clone()] };
+        self.open_props_paths(paths);
+    }
+
+    fn open_props_paths(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
         }

@@ -9,6 +9,9 @@ use std::collections::HashMap;
 pub struct SysIcons {
     cache: HashMap<String, Option<TextureHandle>>,
     budget: u32,
+    /// Iconos propios de cada archivo (.exe, .lnk, discos…): los resuelve un hilo aparte (Windows).
+    #[cfg(windows)]
+    by_path: Option<PathIcons>,
     /// El tema de iconos se carga en segundo plano para no retrasar el arranque.
     #[cfg(target_os = "linux")]
     lin: Option<linux::Lookup>,
@@ -21,6 +24,8 @@ impl SysIcons {
         SysIcons {
             cache: HashMap::new(),
             budget: 0,
+            #[cfg(windows)]
+            by_path: None,
             #[cfg(target_os = "linux")]
             lin: None,
             #[cfg(target_os = "linux")]
@@ -110,6 +115,18 @@ impl SysIcons {
         self.upload(ctx, key, d)
     }
 
+    /// Icono propio de un archivo o unidad (el del programa al que apunta un acceso directo, el de un disco…).
+    /// Se resuelve en segundo plano; mientras tanto (y fuera de Windows) devuelve `None`.
+    #[allow(unused_variables)]
+    pub fn for_path(&mut self, ctx: &Context, path: &std::path::Path) -> Option<TextureId> {
+        #[cfg(windows)]
+        {
+            return self.by_path.get_or_insert_with(PathIcons::new).get(ctx, path);
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
     #[cfg(target_os = "linux")]
     fn load_folder(&mut self, special: Option<&str>) -> Option<Decoded> {
         let names: &[&str] = match special {
@@ -148,6 +165,55 @@ impl SysIcons {
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     fn load_file(&mut self, _ext: &str) -> Option<Decoded> {
+        None
+    }
+}
+
+#[cfg(windows)]
+struct PathIcons {
+    tx: std::sync::mpsc::Sender<String>,
+    rx: std::sync::mpsc::Receiver<(String, Option<Decoded>)>,
+    cache: HashMap<String, Option<TextureHandle>>,
+    pending: std::collections::HashSet<String>,
+}
+
+#[cfg(windows)]
+impl PathIcons {
+    fn new() -> PathIcons {
+        let (tx, req) = std::sync::mpsc::channel::<String>();
+        let (res_tx, rx) = std::sync::mpsc::channel();
+        crate::vfs::thread::spawn(move || {
+            // el shell necesita COM en el hilo que pide los iconos
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            }
+            while let Ok(p) = req.recv() {
+                let d = win::icon_for_path(&p);
+                if res_tx.send((p, d)).is_err() {
+                    break;
+                }
+            }
+        });
+        PathIcons { tx, rx, cache: HashMap::new(), pending: Default::default() }
+    }
+
+    fn get(&mut self, ctx: &Context, path: &std::path::Path) -> Option<TextureId> {
+        while let Ok((k, d)) = self.rx.try_recv() {
+            self.pending.remove(&k);
+            let tex = d.map(|d| ctx.load_texture("pathicon", ColorImage::from_rgba_unmultiplied([d.w, d.h], &d.rgba), TextureOptions::LINEAR));
+            self.cache.insert(k, tex);
+            ctx.request_repaint();
+        }
+        let key = path.to_string_lossy().into_owned();
+        if let Some(t) = self.cache.get(&key) {
+            return t.as_ref().map(|t| t.id());
+        }
+        if self.cache.len() > 3000 {
+            self.cache.clear();
+        }
+        if self.pending.insert(key.clone()) {
+            let _ = self.tx.send(key);
+        }
         None
     }
 }
@@ -530,17 +596,25 @@ mod win {
     }
 
     pub fn icon_for(name: &str, dir: bool) -> Option<Decoded> {
+        icon_query(name, if dir { 0x10 } else { 0x80 }, SHGFI_USEFILEATTRIBUTES)
+    }
+
+    /// Icono del archivo o unidad real (no el genérico de su extensión).
+    pub fn icon_for_path(path: &str) -> Option<Decoded> {
+        icon_query(path, 0, 0)
+    }
+
+    fn icon_query(name: &str, attrs: u32, extra: u32) -> Option<Decoded> {
         unsafe {
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
             let mut fi: ShFileInfoW = std::mem::zeroed();
-            let attrs = if dir { 0x10 } else { 0x80 };
             // Primero el índice en la lista de imágenes del sistema (hasta 256 px).
             let r = SHGetFileInfoW(
                 wide.as_ptr(),
                 attrs,
                 &mut fi,
                 std::mem::size_of::<ShFileInfoW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES,
+                SHGFI_SYSICONINDEX | extra,
             );
             if r != 0 {
                 // IID_IImageList
@@ -571,7 +645,7 @@ mod win {
                 attrs,
                 &mut fi,
                 std::mem::size_of::<ShFileInfoW>() as u32,
-                SHGFI_ICON | SHGFI_USEFILEATTRIBUTES,
+                SHGFI_ICON | extra,
             );
             if r != 0 && fi.icon != 0 {
                 let d = hicon_to_rgba(fi.icon);

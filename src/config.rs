@@ -21,6 +21,9 @@ pub struct Config {
     pub theme_light: String,
     pub theme_dark: String,
     pub bookmarks: Vec<PathBuf>,
+    /// Favoritos de serie que el usuario ha ocultado y orden elegido para los visibles.
+    pub fav_hidden: Vec<PathBuf>,
+    pub fav_order: Vec<PathBuf>,
     pub grid: bool,
     pub zoom: f32,
     pub show_hidden: bool,
@@ -76,6 +79,8 @@ impl Default for Config {
             theme_light: String::new(),
             theme_dark: String::new(),
             bookmarks: Vec::new(),
+            fav_hidden: Vec::new(),
+            fav_order: Vec::new(),
             grid: true,
             zoom: 120.0,
             show_hidden: false,
@@ -152,6 +157,8 @@ impl Config {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
                 "bookmark" => c.bookmarks.push(PathBuf::from(v)),
+                "fav_hidden" => c.fav_hidden.push(PathBuf::from(v)),
+                "fav_order" => c.fav_order.push(PathBuf::from(v)),
                 "recent" => {
                     if c.recent.len() < 40 {
                         c.recent.push(PathBuf::from(v));
@@ -299,6 +306,11 @@ impl Config {
         let mut s = String::new();
         for b in &self.bookmarks {
             s.push_str(&format!("bookmark={}\n", b.display().to_string().replace(['\n', '\r'], " ")));
+        }
+        for (k, v) in [("fav_hidden", &self.fav_hidden), ("fav_order", &self.fav_order)] {
+            for b in v {
+                s.push_str(&format!("{k}={}\n", b.display().to_string().replace(['\n', '\r'], " ")));
+            }
         }
         s.push_str(&format!("grid={}\n", self.grid as u8));
         s.push_str(&format!("zoom={}\n", self.zoom));

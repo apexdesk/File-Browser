@@ -43,6 +43,8 @@ pub mod i18n_table;
 pub mod preview;
 pub mod sftp;
 pub mod sysicons;
+#[cfg(windows)]
+pub mod winshell;
 pub mod system;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod terminal;
