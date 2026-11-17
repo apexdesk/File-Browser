@@ -39,5 +39,5 @@ overrides:
     suggests: [gvfs, gvfs-fuse, gvfs-smb]
   archlinux:
     depends: [gcc-libs, alsa-lib]
-    # pacman no tiene «recommends»: dependencias opcionales
-    optdepends: ["openssh: SFTP", "ffmpeg: video thumbnails and playback", "gvfs: mounting SMB/WebDAV", "gvfs-smb: SMB shares"]
+    # pacman no tiene «recommends»: nfpm pasa `suggests` a dependencias opcionales (optdepend)
+    suggests: [openssh, ffmpeg, gvfs, gvfs-smb]
