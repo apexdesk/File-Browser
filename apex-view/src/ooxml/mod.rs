@@ -12,6 +12,8 @@ use vello_cpu::Pixmap;
 use crate::{Error, Limits};
 use xml::{Ev, Reader};
 pub(crate) use zip::ZipReader;
+#[cfg(test)]
+pub(crate) use zip::stored_zip;
 
 pub(crate) fn bad(msg: impl Into<String>) -> Error {
     Error::Malformed(msg.into())

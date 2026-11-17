@@ -24,7 +24,7 @@ pub fn decode(path: &Path, ext: &str, max: u32) -> Option<Decoded> {
     }
     match ext {
         "psd" | "psb" => decode_psd(path, max),
-        "blend" | "blend1" => blend_thumb(path),
+        "blend" | "blend1" => blend_thumb(path, max),
         _ => None,
     }
 }
@@ -58,6 +58,15 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
     if md.len() > 512 << 20 {
         return None;
     }
+    // la cabecera primero: si la imagen es grande se decodifica de una en una entre todos los hilos
+    let mut head = [0u8; 26];
+    crate::thumbs::open_regular(path)?.read_exact(&mut head).ok()?;
+    if &head[..4] != b"8BPS" {
+        return None;
+    }
+    let (hh, hw) = (be32(&head[14..]), be32(&head[18..]));
+    let big = md.len() > 48 << 20 || (hw as u64).saturating_mul(hh as u64).saturating_mul(4) > 48 << 20;
+    let _heavy = big.then(|| crate::thumbs::lock(&crate::thumbs::HEAVY));
     let data = crate::vfs::fs::read(path).ok()?;
     if data.len() < 30 || &data[..4] != b"8BPS" {
         return None;
@@ -67,7 +76,7 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
     let (h, w) = (be32(&data[14..]), be32(&data[18..]));
     let depth = be16(&data[22..]);
     let mode = be16(&data[24..]);
-    if w == 0 || h == 0 || w * h > 100_000_000 || !matches!(depth, 8 | 16) || channels == 0 || channels > 5 {
+    if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|p| p > 100_000_000) || !matches!(depth, 8 | 16) || channels == 0 || channels > 5 {
         return None;
     }
     // memoria real: planos de todos los canales a su profundidad (16 bits duplica)
@@ -109,7 +118,7 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
                 for r in 0..h {
                     let k = c * h + r;
                     let len = if version == 2 { be32(data.get(p + k * 4..p + k * 4 + 4)?) } else { be16(data.get(p + k * 2..p + k * 2 + 2)?) };
-                    let src = data.get(q..q + len)?;
+                    let src = data.get(q..q.checked_add(len)?)?;
                     q += len;
                     let start = pl.len();
                     let mut i = 0;
@@ -164,12 +173,17 @@ fn decode_psd(path: &Path, max: u32) -> Option<Decoded> {
 // .blend: el bloque «TEST» del principio guarda la miniatura (RGBA, de abajo arriba).
 // ---------------------------------------------------------------------------
 
-fn blend_thumb(path: &Path) -> Option<Decoded> {
-    let mut f = crate::vfs::fs::File::open(path).ok()?;
+/// Lado máximo de la miniatura guardada en un .blend (Blender la guarda de 128 px).
+const BLEND_MAX_SIDE: usize = 2048;
+/// Bytes como mucho que se descomprimen y descartan buscando la miniatura.
+const BLEND_SKIP_BUDGET: u64 = 256 << 20;
+
+fn blend_thumb(path: &Path, max: u32) -> Option<Decoded> {
+    let mut f = crate::thumbs::open_regular(path)?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).ok()?;
     drop(f);
-    let f = crate::vfs::fs::File::open(path).ok()?;
+    let f = crate::thumbs::open_regular(path)?;
     let mut r: Box<dyn Read> = if magic[..2] == [0x1F, 0x8B] {
         Box::new(flate2::read::MultiGzDecoder::new(f))
     } else if magic == [0x28, 0xB5, 0x2F, 0xFD] {
@@ -193,6 +207,7 @@ fn blend_thumb(path: &Path) -> Option<Decoded> {
         (if head[7] == b'-' { 8 } else { 4 }, head[8] == b'v')
     };
     let u32at = |b: &[u8]| if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) } as usize;
+    let mut skip_left = BLEND_SKIP_BUDGET;
     for _ in 0..64 {
         let mut code = [0u8; 4];
         r.read_exact(&mut code).ok()?;
@@ -201,7 +216,8 @@ fn blend_thumb(path: &Path) -> Option<Decoded> {
             let mut b = [0u8; 28];
             r.read_exact(&mut b).ok()?;
             let l: [u8; 8] = b[12..20].try_into().ok()?;
-            (if le { u64::from_le_bytes(l) } else { u64::from_be_bytes(l) }) as usize
+            // en 32 bits un tamaño enorme no se trunca: se toma como inválido
+            usize::try_from(if le { u64::from_le_bytes(l) } else { u64::from_be_bytes(l) }).unwrap_or(usize::MAX)
         } else {
             // tamaño(4) + puntero + sdna(4) + cuenta(4)
             let mut s = [0u8; 4];
@@ -211,27 +227,96 @@ fn blend_thumb(path: &Path) -> Option<Decoded> {
             u32at(&s)
         };
         if &code == b"TEST" {
-            if size < 8 || size > 64 << 20 {
+            if size < 8 || size > 16 << 20 {
                 return None;
             }
-            let mut b = vec![0u8; size];
-            r.read_exact(&mut b).ok()?;
-            let (w, h) = (u32at(&b[0..4]), u32at(&b[4..8]));
-            if w == 0 || h == 0 || w.checked_mul(h).and_then(|p| p.checked_mul(4)).and_then(|p| p.checked_add(8)).map(|p| p > b.len()).unwrap_or(true) {
+            // primero las dimensiones; el resto sólo si son razonables
+            let mut d = [0u8; 8];
+            r.read_exact(&mut d).ok()?;
+            let (w, h) = (u32at(&d[0..4]), u32at(&d[4..8]));
+            if w == 0 || h == 0 || w > BLEND_MAX_SIDE || h > BLEND_MAX_SIDE || w * h * 4 > size - 8 {
                 return None;
             }
-            let src = &b[8..8 + w * h * 4];
+            let mut src = vec![0u8; w * h * 4];
+            r.read_exact(&mut src).ok()?;
             let mut rgba = Vec::with_capacity(w * h * 4);
             for y in (0..h).rev() {
                 rgba.extend_from_slice(&src[y * w * 4..(y + 1) * w * 4]);
             }
-            return Some(Decoded { w, h, rgba });
+            let max = max.max(1) as usize;
+            if w <= max && h <= max {
+                return Some(Decoded { w, h, rgba });
+            }
+            let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)?;
+            let img = image::DynamicImage::ImageRgba8(img).thumbnail(max as u32, max as u32).into_rgba8();
+            return Some(Decoded { w: img.width() as usize, h: img.height() as usize, rgba: img.into_raw() });
         }
         if &code == b"ENDB" || &code == b"DNA1" || size > 1 << 28 {
             return None;
         }
+        skip_left = skip_left.checked_sub(size as u64)?;
         // bloques que no interesan: se descartan leyendo
         std::io::copy(&mut r.by_ref().take(size as u64), &mut std::io::sink()).ok()?;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// .blend clásico (punteros de 8, little endian) con un bloque TEST de `w`×`h`.
+    fn blend(w: u32, h: u32, size: u32) -> Vec<u8> {
+        let mut b = b"BLENDER-v300".to_vec();
+        b.extend_from_slice(b"TEST");
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&[0; 16]);
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        let px = (w as usize * h as usize * 4).min(size.saturating_sub(8) as usize).min(64 << 20);
+        b.extend((0..px).map(|i| i as u8));
+        b
+    }
+
+    #[test]
+    fn blend_thumbnail_is_validated_and_downscaled() {
+        let dir = std::env::temp_dir().join(format!("fb-imgx-blend-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("x.blend");
+        // tamaño normal: se devuelve tal cual
+        std::fs::write(&p, blend(128, 128, 8 + 128 * 128 * 4)).unwrap();
+        let d = decode(&p, "blend", 256).unwrap();
+        assert_eq!((d.w, d.h, d.rgba.len()), (128, 128, 128 * 128 * 4));
+        // grande: se reduce al máximo pedido
+        std::fs::write(&p, blend(1024, 512, 8 + 1024 * 512 * 4)).unwrap();
+        let d = decode(&p, "blend", 64).unwrap();
+        assert!(d.w <= 64 && d.h <= 64 && d.rgba.len() == d.w * d.h * 4);
+        // dimensiones absurdas o que no caben en el bloque
+        std::fs::write(&p, blend(4096, 4096, 16 << 20)).unwrap();
+        assert!(decode(&p, "blend", 64).is_none());
+        std::fs::write(&p, blend(100, 100, 8 + 100)).unwrap();
+        assert!(decode(&p, "blend", 64).is_none());
+        std::fs::write(&p, blend(1, 1, u32::MAX)).unwrap();
+        assert!(decode(&p, "blend", 64).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn psd_huge_dimensions_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("fb-imgx-psd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("x.psd");
+        let mut b = b"8BPS".to_vec();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0; 6]);
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        b.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        b.extend_from_slice(&8u16.to_be_bytes());
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.resize(64, 0);
+        std::fs::write(&p, &b).unwrap();
+        assert!(decode(&p, "psd", 64).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

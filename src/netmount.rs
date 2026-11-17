@@ -3,6 +3,8 @@
 //! En Linux se usa GVFS (`gio`), ver `app.rs`.
 #[allow(unused_imports)]
 use crate::vfs::{KindV as _, PathV as _};
+#[allow(unused_imports)]
+use crate::i18n::{t, tf};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
 
@@ -28,26 +30,60 @@ pub struct Parsed {
     pub host: String,
     pub port: Option<u16>,
     pub user: Option<String>,
+    /// contraseña escrita en la dirección («usuario:clave@»): no debe ir a ningún otro sitio
+    pub pass: Option<String>,
     /// segmentos de ruta sin vacíos (para SMB, el primero es el recurso)
     pub path: Vec<String>,
 }
 
+/// Codifica todo salvo los caracteres «no reservados» de una URL.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pct_encode(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
+}
+
 fn pct_decode(s: &str) -> String {
+    String::from_utf8_lossy(&pct_decode_bytes(s)).into_owned()
+}
+
+/// Como `pct_decode` pero sin pasar a texto: un «%FF» es el byte 0xFF (nombres SFTP que no son UTF-8).
+fn pct_decode_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(if b[i + 1..i + 3].iter().all(u8::is_ascii_hexdigit) { std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz") } else { "zz" }, 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(if b[i + 1..i + 3].iter().all(u8::is_ascii_hexdigit) { std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz") } else { "zz" }, 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// Ruta de una dirección («sftp://h/a/b%FF» -> «/a/b\xFF») con los bytes tal cual.
+#[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn raw_path(uri: &str) -> Vec<u8> {
+    let rest = uri.trim().split_once("://").map(|(_, r)| r).unwrap_or("");
+    let mut out = Vec::new();
+    for seg in rest.split('/').skip(1).filter(|s| !s.is_empty()) {
+        out.push(b'/');
+        out.extend_from_slice(&pct_decode_bytes(seg));
+    }
+    out
 }
 
 pub fn parse(uri: &str) -> Option<Parsed> {
@@ -62,26 +98,77 @@ pub fn parse(uri: &str) -> Option<Parsed> {
     };
     let mut parts = rest.split('/');
     let auth = parts.next()?;
-    let (user, hostport) = match auth.rsplit_once('@') {
-        Some((u, h)) => (Some(pct_decode(u)), h),
-        None => (None, auth),
+    let (user, pass, hostport) = match auth.rsplit_once('@') {
+        Some((u, h)) => match u.split_once(':') {
+            Some((u, pw)) => (Some(pct_decode(u)), Some(pct_decode(pw)), h),
+            None => (Some(pct_decode(u)), None, h),
+        },
+        None => (None, None, auth),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse().ok()),
-        _ => (hostport, None),
-    };
+    let (host, port) = split_host_port(hostport);
     if host.is_empty() {
         return None;
     }
     let path = parts.filter(|s| !s.is_empty()).map(pct_decode).collect();
-    Some(Parsed { kind, host: host.to_string(), port, user, path })
+    Some(Parsed { kind, host: host.to_string(), port, user, pass, path })
+}
+
+/// «servidor:puerto» -> (servidor, puerto). IPv6 entre corchetes («[::1]:22» -> «::1»); sin
+/// corchetes y con varios «:» es una IPv6 sin puerto («fe80::1»).
+pub fn split_host_port(hp: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = hp.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((h, tail)) => (h, tail.strip_prefix(':').and_then(|p| p.parse().ok())),
+            None => (rest, None),
+        };
+    }
+    match hp.split_once(':') {
+        Some((h, p)) if !p.contains(':') && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse().ok()),
+        Some((h, "")) => (h, None),
+        _ => (hp, None),
+    }
+}
+
+/// Quita la contraseña de una dirección («sftp://ana:clave@h/x» -> «sftp://ana@h/x») y la devuelve
+/// aparte (descodificada): la dirección se enseña, se guarda y se pasa a otros programas.
+pub fn strip_pass(uri: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = uri.split_once("://") else { return (uri.to_string(), None) };
+    let (auth, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    match auth.rsplit_once('@') {
+        Some((ui, host)) => match ui.split_once(':') {
+            Some((u, pw)) => (format!("{scheme}://{u}@{host}{path}"), Some(pct_decode(pw))),
+            None => (uri.to_string(), None),
+        },
+        None => (uri.to_string(), None),
+    }
+}
+
+/// Conexiones hechas desde aquí (Windows y macOS): (dirección, carpeta). Se enseñan en «Red» con
+/// «Desconectar».
+#[cfg(any(windows, target_os = "macos"))]
+static CONNS: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(windows, target_os = "macos"))]
+fn remember(uri: &str, p: &std::path::Path) {
+    let mut g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|(_, q)| q == p) {
+        g.push((strip_pass(uri).0, p.to_path_buf()));
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub fn connections() -> Vec<(String, PathBuf)> {
+    CONNS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// SFTP con el `ssh` del sistema (ver `sftp.rs`) para una dirección sftp:// / ssh://.
 /// En Linux sólo se usa cuando GVFS monta el servidor pero no expone una carpeta local.
 #[cfg(target_os = "linux")]
 pub fn connect_sftp(l: &Login) -> Result<PathBuf, String> {
-    let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+    let p = parse(&l.uri).ok_or_else(|| t("Dirección no válida").to_string())?;
     sftp_connect(l, &p)
 }
 
@@ -90,14 +177,15 @@ pub fn connect_sftp(l: &Login) -> Result<PathBuf, String> {
 fn sftp_connect(l: &Login, p: &Parsed) -> Result<PathBuf, String> {
     let user = if l.anon { String::new() } else if l.user.is_empty() { p.user.clone().unwrap_or_default() } else { l.user.clone() };
     let user = if user.is_empty() { std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default() } else { user };
+    let pass = if l.pass.is_empty() { p.pass.clone().unwrap_or_default() } else { l.pass.clone() };
     let conn = crate::sftp::Conn {
         host: p.host.clone(),
         port: p.port,
         user,
-        pass: if l.pass.is_empty() || l.anon { None } else { Some(l.pass.clone()) },
+        pass: if pass.is_empty() || l.anon { None } else { Some(pass) },
     };
-    let path = if p.path.is_empty() { String::new() } else { format!("/{}", p.path.join("/")) };
-    crate::sftp::connect(conn, &path)
+    // la ruta sale de la dirección con sus bytes (`p.path` es texto: perdería los que no son UTF-8)
+    crate::sftp::connect(conn, &raw_path(&l.uri))
 }
 
 #[cfg(windows)]
@@ -128,26 +216,26 @@ mod imp {
 
     fn message(code: u32) -> String {
         match code {
-            53 | 67 => "no se encuentra el servidor o el recurso compartido".into(),
-            86 | 1326 => "usuario o contraseña incorrectos".into(),
-            1219 => "ya hay una conexión con otras credenciales; ciérrala antes (net use /delete)".into(),
-            1244 | 5 => "acceso denegado".into(),
-            1222 => "no hay red".into(),
-            1231 => "no se puede llegar al servidor".into(),
-            1203 | 1208 | 66 | 1214 => "el servicio de WebDAV (WebClient) no está disponible o la dirección no es válida".into(),
-            n => format!("error de Windows {n}"),
+            53 | 67 => t("No se encuentra el servidor o el recurso compartido").into(),
+            86 | 1326 => t("Usuario o contraseña incorrectos").into(),
+            1219 => t("Ya hay una conexión con ese servidor con otras credenciales: desconéctala (en «Red», o con «net use \\\\servidor /delete») y vuelve a intentarlo").into(),
+            1244 | 5 => t("Acceso denegado").into(),
+            1222 => t("No hay red").into(),
+            1231 => t("No se puede llegar al servidor").into(),
+            1203 | 1208 | 66 | 1214 => t("El servicio de WebDAV (WebClient) no está disponible o la dirección no es válida").into(),
+            n => tf("Error de Windows {}", &[&n]),
         }
     }
 
     pub fn connect(l: &Login) -> Result<PathBuf, String> {
-        let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+        let p = parse(&l.uri).ok_or_else(|| t("Dirección no válida").to_string())?;
         if p.kind == Kind::Sftp {
             return sftp_connect(l, &p);
         }
         let remote = match &p.kind {
             Kind::Smb => {
                 if p.path.is_empty() {
-                    return Err("indica el recurso compartido: smb://servidor/recurso".into());
+                    return Err(t("Indica también el recurso compartido: smb://servidor/recurso").into());
                 }
                 format!(r"\\{}\{}", p.host, p.path.join(r"\"))
             }
@@ -168,10 +256,11 @@ mod imp {
                 s
             }
             Kind::Sftp => unreachable!(),
-            Kind::Unsupported(sc) => return Err(format!("«{sc}» no está disponible en este sistema")),
+            Kind::Unsupported(sc) => return Err(tf("«{}» no está disponible en este sistema", &[sc])),
         };
         // ya accesible (sesión previa): no hace falta reconectar
         if crate::vfs::fs::read_dir(&remote).is_ok() {
+            remember(&l.uri, std::path::Path::new(&remote));
             return Ok(PathBuf::from(remote));
         }
         let user = if l.anon {
@@ -196,8 +285,12 @@ mod imp {
             comment: std::ptr::null_mut(),
             provider: std::ptr::null_mut(),
         };
-        let (wu, wp) = (wide(&user), wide(&l.pass));
+        // invitado: sin contraseña (no se manda lo que hubiera quedado escrito en el campo)
+        let pass = if l.anon { String::new() } else if l.pass.is_empty() { p.pass.clone().unwrap_or_default() } else { l.pass.clone() };
+        let (wu, wp) = (wide(&user), wide(&pass));
         let have_user = !user.is_empty();
+        // SAFETY: `res` apunta a `rname`, y las cadenas `wu`/`wp` (anchas, terminadas en NUL) viven
+        // hasta después de la llamada; los punteros nulos son opcionales según la API.
         let code = unsafe {
             WNetAddConnection2W(
                 &res,
@@ -209,17 +302,24 @@ mod imp {
         if code != 0 {
             return Err(message(code));
         }
+        remember(&l.uri, std::path::Path::new(&remote));
         Ok(PathBuf::from(remote))
     }
 
-    pub fn disconnect(path: &std::path::Path) {
+    pub fn disconnect(path: &std::path::Path) -> Result<(), String> {
         #[link(name = "mpr")]
         unsafe extern "system" {
             fn WNetCancelConnection2W(name: *const u16, flags: u32, force: i32) -> u32;
         }
         let w = wide(&path.display().to_string());
-        unsafe {
-            WNetCancelConnection2W(w.as_ptr(), 0, 1);
+        // SAFETY: cadena ancha terminada en NUL que vive durante la llamada.
+        let code = unsafe { WNetCancelConnection2W(w.as_ptr(), 0, 1) };
+        if code == 0 || code == 2250 {
+            // 2250: ya no estaba conectada
+            CONNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, q)| q != path);
+            Ok(())
+        } else {
+            Err(message(code))
         }
     }
 }
@@ -236,33 +336,39 @@ mod imp {
     }
 
     pub fn connect(l: &Login) -> Result<PathBuf, String> {
-        let p = parse(&l.uri).ok_or_else(|| "dirección no válida".to_string())?;
+        let p = parse(&l.uri).ok_or_else(|| t("Dirección no válida").to_string())?;
         if p.kind == Kind::Sftp {
             return sftp_connect(l, &p);
         }
+        let user = if l.anon { String::new() } else if l.user.is_empty() { p.user.clone().unwrap_or_default() } else { l.user.clone() };
+        let host = if p.host.contains(':') { format!("[{}]", p.host) } else { p.host.clone() };
+        // los segmentos ya vienen descodificados: se vuelven a codificar (espacios en el recurso…)
+        let segs = p.path.iter().map(|s| pct_encode(s)).collect::<Vec<_>>().join("/");
         let (url, want) = match &p.kind {
             Kind::Smb => {
                 if p.path.is_empty() {
-                    return Err("indica el recurso compartido: smb://servidor/recurso".into());
+                    return Err(t("Indica también el recurso compartido: smb://servidor/recurso").into());
                 }
-                (format!("smb://{}/{}", p.host, p.path.join("/")), p.path[0].clone())
+                // el dominio va en la dirección: smb://DOMINIO;usuario@servidor/recurso
+                let d = l.domain.trim();
+                let auth = if !user.is_empty() && !d.is_empty() && !d.eq_ignore_ascii_case("WORKGROUP") { format!("{};{}@", pct_encode(d), pct_encode(&user)) } else { String::new() };
+                (format!("smb://{auth}{host}/{segs}"), p.path[0].clone())
             }
             Kind::Dav { tls } => {
-                let mut u = format!("{}://{}", if *tls { "https" } else { "http" }, p.host);
+                let mut u = format!("{}://{host}", if *tls { "https" } else { "http" });
                 if let Some(port) = p.port {
                     u.push_str(&format!(":{port}"));
                 }
-                for s in &p.path {
+                if !segs.is_empty() {
                     u.push('/');
-                    u.push_str(s);
+                    u.push_str(&segs);
                 }
                 (u, p.path.last().cloned().unwrap_or_else(|| p.host.clone()))
             }
             Kind::Sftp => unreachable!(),
-            Kind::Unsupported(sc) => return Err(format!("«{sc}» no está disponible en este sistema")),
+            Kind::Unsupported(sc) => return Err(tf("«{}» no está disponible en este sistema", &[sc])),
         };
         let before = volumes();
-        let user = if l.anon { String::new() } else if l.user.is_empty() { p.user.clone().unwrap_or_default() } else { l.user.clone() };
         let mut cmd = Command::new("osascript");
         if user.is_empty() {
             cmd.args(["-e", "on run argv", "-e", "mount volume (item 1 of argv)", "-e", "end run", &url]);
@@ -278,7 +384,7 @@ mod imp {
                 &user,
             ]);
             // la contraseña va por el entorno, no por la línea de órdenes (visible con `ps`)
-            cmd.env("FB_MNT_PW", &l.pass);
+            cmd.env("FB_MNT_PW", if l.pass.is_empty() { p.pass.clone().unwrap_or_default() } else { l.pass.clone() });
         }
         let out = cmd.stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
         if !out.status.success() {
@@ -293,13 +399,24 @@ mod imp {
             .or_else(|| after.iter().find(|v| !before.contains(v)))
             .or_else(|| after.iter().find(|v| v.to_lowercase().starts_with(&w)));
         match pick {
-            Some(v) => Ok(PathBuf::from("/Volumes").join(v)),
+            Some(v) => {
+                let dir = PathBuf::from("/Volumes").join(v);
+                remember(&l.uri, &dir);
+                Ok(dir)
+            }
             None => Ok(PathBuf::from("/Volumes")),
         }
     }
 
-    pub fn disconnect(path: &std::path::Path) {
-        let _ = Command::new("diskutil").arg("unmount").arg(path).stdin(Stdio::null()).output();
+    pub fn disconnect(path: &std::path::Path) -> Result<(), String> {
+        let o = Command::new("diskutil").arg("unmount").arg(path).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+        if o.status.success() || !path.v_exists() {
+            CONNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, q)| q != path);
+            Ok(())
+        } else {
+            let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if e.is_empty() { "diskutil".into() } else { e })
+        }
     }
 }
 
@@ -325,5 +442,19 @@ mod tests {
         assert!(matches!(parse("nfs://h").unwrap().kind, Kind::Unsupported(_)));
         assert!(parse("sin-esquema").is_none());
         assert_eq!(parse("smb://nas/My%20Share").unwrap().path, vec!["My Share"]);
+        // contraseña en la dirección: aparte
+        let p = parse("sftp://ana:se%40creto@h:2222/x").unwrap();
+        assert_eq!((p.user.as_deref(), p.pass.as_deref(), p.port), (Some("ana"), Some("se@creto"), Some(2222)));
+        assert_eq!(strip_pass("sftp://ana:se%40creto@h:2222/x"), ("sftp://ana@h:2222/x".to_string(), Some("se@creto".to_string())));
+        assert_eq!(strip_pass("smb://nas/a:b"), ("smb://nas/a:b".to_string(), None));
+        // IPv6
+        let p = parse("sftp://[::1]:2222/srv").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("::1", Some(2222)));
+        let p = parse("sftp://u@fe80::1/srv").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("fe80::1", None));
+        assert_eq!(pct_encode("My Share"), "My%20Share");
+        // ruta SFTP con bytes que no son UTF-8
+        assert_eq!(raw_path("sftp://ana@h:22/home/ana/caf%E9/50%25"), b"/home/ana/caf\xE9/50%".to_vec());
+        assert_eq!(raw_path("sftp://h"), Vec::<u8>::new());
     }
 }

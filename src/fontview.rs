@@ -96,9 +96,9 @@ fn wrap(font: &FontRef, text: &str, px: f32, max: f32) -> Vec<String> {
 }
 
 pub fn specimen(path: &Path) -> Result<Decoded, String> {
-    let fail = || t("No se pudo mostrar el documento").to_string();
+    let fail = || t("No se pudo leer la fuente").to_string();
     if crate::vfs::fs::metadata(path).map(|m| m.len() > 64 << 20).unwrap_or(true) {
-        return Err(t("El documento es demasiado grande para mostrarlo").into());
+        return Err(t("La fuente es demasiado grande para mostrarla").into());
     }
     let data = crate::vfs::fs::read(path).map_err(|_| fail())?;
     let font = open(&data).ok_or_else(fail)?;
@@ -107,6 +107,8 @@ pub fn specimen(path: &Path) -> Result<Decoded, String> {
     let pad = 40.0;
     let inner = w - 2.0 * pad;
     let title = if name.is_empty() { path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() } else { name };
+    // sólo caben dos líneas: un nombre larguísimo haría el ajuste de líneas cuadrático
+    let title: String = title.chars().take(200).collect();
     let blocks: [(&str, f32); 8] = [
         (&title, 60.0),
         ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 42.0),

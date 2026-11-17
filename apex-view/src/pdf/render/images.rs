@@ -120,8 +120,10 @@ fn gray(f: &PdfFile, d: &Dict, raw: &[u8], stencil: bool) -> Option<Rgba> {
         return Some(reduce(&dec.data, w, h, 1, k, |s| if (s == 0) != inverted { 255 } else { 0 }));
     }
     match dec.codec.as_deref() {
-        Some("DCTDecode" | "DCT") if k == 1 => Some(Rgba { w, h, data: jpeg(&dec.data, &Cs::Gray, &decode_arr, NO_SIZE)?.data.chunks_exact(4).map(|p| p[0]).collect() }),
-        Some("JPXDecode") if k == 1 => Some(Rgba { w, h, data: jpx(&dec.data, &Cs::Gray, true, &decode_arr, false, NO_SIZE)?.data.chunks_exact(4).map(|p| p[0]).collect() }),
+        // The size the picture itself has, not the dictionary's: the two
+        // may differ, and the values must fill the size they claim.
+        Some("DCTDecode" | "DCT") if k == 1 => jpeg(&dec.data, &Cs::Gray, &decode_arr, NO_SIZE).map(first_channel),
+        Some("JPXDecode") if k == 1 => jpx(&dec.data, &Cs::Gray, true, &decode_arr, false, NO_SIZE).map(first_channel),
         Some(_) => None,
         None => {
             let bpc = if bilevel { 1 } else { f.key_num(d, "BitsPerComponent").unwrap_or(8.0) as usize };
@@ -133,6 +135,11 @@ fn gray(f: &PdfFile, d: &Dict, raw: &[u8], stencil: bool) -> Option<Rgba> {
             Some(reduce(&dec.data, w, h, bpc, k, |s| ((lo + s as f32 / max * (hi - lo)).clamp(0.0, 1.0) * 255.0).round() as u8))
         }
     }
+}
+
+/// The first channel of RGBA pixels.
+fn first_channel(p: Rgba) -> Rgba {
+    Rgba { w: p.w, h: p.h, data: p.data.chunks_exact(4).map(|p| p[0]).collect() }
 }
 
 /// One-channel samples mapped to 0 to 255, each `k` x `k` block averaged.
@@ -177,6 +184,9 @@ fn reduce(data: &[u8], w: usize, h: usize, bpc: usize, k: usize, map: impl Fn(u1
 /// Sets the alpha of `px` from mask values (one byte per pixel), scaled to
 /// the image's size.
 fn apply_alpha(px: &mut Rgba, a: &Rgba) {
+    if a.w == 0 || a.h == 0 || a.data.len() < a.w * a.h || px.data.len() < px.w * px.h * 4 {
+        return;
+    }
     // A finer mask: the image enlarged to it first, so the mask's shape
     // stays (as pdfium does).
     if a.w > px.w && a.h > px.h && a.w * a.h <= MASK_PIXELS {
@@ -306,21 +316,22 @@ fn shrink(n: usize, drawn: f64) -> usize {
 /// Four-byte pixels averaged over `fx` x `fy` blocks.
 fn box_down(px: &[u8], w: usize, h: usize, fx: usize, fy: usize) -> (usize, usize, Vec<u8>) {
     let (nw, nh) = (w.div_ceil(fx), h.div_ceil(fy));
-    let mut sum = vec![0u32; nw * nh * 4];
+    // 64 bits: a block of millions of pixels overflows 32.
+    let mut sum = vec![0u64; nw * nh * 4];
     for y in 0..h {
         let row = &px[y * w * 4..(y + 1) * w * 4];
         let base = y / fy * nw;
         for (x, p) in row.chunks_exact(4).enumerate() {
             let s = &mut sum[(base + x / fx) * 4..][..4];
             for k in 0..4 {
-                s[k] += p[k] as u32;
+                s[k] += p[k] as u64;
             }
         }
     }
     let mut out = vec![0u8; nw * nh * 4];
     for (i, o) in out.chunks_exact_mut(4).enumerate() {
         let (x, y) = (i % nw, i / nw);
-        let n = ((((x + 1) * fx).min(w) - x * fx) * (((y + 1) * fy).min(h) - y * fy)).max(1) as u32;
+        let n = ((((x + 1) * fx).min(w) - x * fx) * (((y + 1) * fy).min(h) - y * fy)).max(1) as u64;
         for k in 0..4 {
             o[k] = ((sum[i * 4 + k] + n / 2) / n) as u8;
         }
@@ -411,14 +422,14 @@ impl Bits {
         if self.y >= self.h {
             return;
         }
-        let end = (self.x + count).min(self.w);
+        let end = self.x.saturating_add(count).min(self.w);
         if one {
             let base = self.y * self.row;
             for x in self.x..end {
                 self.out[base + x / 8] |= 0x80 >> (x % 8);
             }
         }
-        self.x += count;
+        self.x = self.x.saturating_add(count);
     }
 
     fn line(&mut self) {
@@ -613,3 +624,25 @@ fn samples_rgba(cs: &Cs, data: &[u8], w: usize, h: usize, bpc: usize, decode: &[
     Rgba { w, h, data: out }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mask_short_of_its_size_is_left_out() {
+        // A JPEG mask's own size may not be the dictionary's.
+        let mut px = Rgba { w: 4, h: 4, data: vec![255; 64] };
+        apply_alpha(&mut px, &Rgba { w: 8, h: 8, data: vec![0; 4] });
+        assert!(px.data.iter().all(|&b| b == 255));
+        apply_alpha(&mut px, &Rgba { w: 2, h: 2, data: vec![0; 4] });
+        assert_eq!(px.data[3], 0);
+    }
+
+    #[test]
+    fn big_blocks_average_without_overflow() {
+        let (w, h) = (4000, 4000);
+        let (nw, nh, out) = box_down(&vec![255; w * h * 4], w, h, 4000, 4000);
+        assert_eq!((nw, nh), (1, 1));
+        assert_eq!(out, vec![255; 4]);
+    }
+}

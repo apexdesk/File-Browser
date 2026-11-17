@@ -103,6 +103,27 @@ fn cell_ref(r: &str) -> Option<(u32, u32)> {
     (col >= 1 && row >= 1).then(|| (row - 1, col - 1))
 }
 
+/// Most cells one sheet keeps (the area shown has 10 000; the same cell
+/// written again and again is kept each time).
+pub(crate) const MAX_CELLS: usize = 100_000;
+/// Most bytes one cell's text keeps (Excel's own limit is 32 767
+/// characters).
+const MAX_CELL_TEXT: usize = 32 * 1024;
+/// Most bytes of text the cells of one sheet may copy in all (a long
+/// shared string named by every cell would be copied each time).
+pub(crate) const SHEET_TEXT_BUDGET: usize = 64 << 20;
+
+/// A copy of a cell's text, cut to [`MAX_CELL_TEXT`] and charged to
+/// `left` (nothing once it's spent).
+pub(crate) fn cell_text_of(s: &str, left: &mut usize) -> String {
+    let mut n = s.len().min(MAX_CELL_TEXT).min(*left);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    *left -= n;
+    s[..n].to_string()
+}
+
 /// A width in characters of the default font as points.
 pub(crate) fn chars_to_pt(w: f32) -> f32 {
     // Excel's maximum digit width for Calibri 11 is 7 pixels.
@@ -117,6 +138,8 @@ fn read_sheet(book: &Book, part: &str, limits: &Limits) -> Result<Sheet, Error> 
     }
     let mut sh = Sheet::new(chars_to_pt(8.43), 15.0);
     let mut r = Reader::new(&src);
+    // Where `r` starts in `src` (it is started again past skipped rows).
+    let mut base = 0usize;
     let mut row = 0u32;
     let mut next_row = 0u32;
     let mut next_col = 0u32;
@@ -125,6 +148,7 @@ fn read_sheet(book: &Book, part: &str, limits: &Limits) -> Result<Sheet, Error> 
     let mut value: Option<String> = None;
     let mut inline = String::new();
     let mut drawing_id = None;
+    let mut text_left = SHEET_TEXT_BUDGET;
     // Read as a stream: nesting needs no bound, nothing recurses.
     loop {
         let ev = r.next();
@@ -158,15 +182,16 @@ fn read_sheet(book: &Book, part: &str, limits: &Limits) -> Result<Sheet, Error> 
                 }
                 "row" => {
                     row = t.attr("r").and_then(|v| v.parse::<u32>().ok()).map_or(next_row, |v| v.saturating_sub(1));
-                    next_row = row + 1;
+                    next_row = row.saturating_add(1);
                     next_col = 0;
                     if row >= MAX_ROWS {
                         // The rest of the cells are not shown: on to what
                         // follows them.
-                        let at = r.pos();
+                        let at = base + r.pos();
                         match memchr::memmem::find(&src.as_bytes()[at..], b"</sheetData>").or_else(|| memchr::memmem::find(&src.as_bytes()[at..], b"sheetData>")) {
                             Some(k) => {
-                                r = Reader::new(&src[at + k..]);
+                                base = at + k;
+                                r = Reader::new(&src[base..]);
                                 continue;
                             }
                             None => break,
@@ -182,10 +207,10 @@ fn read_sheet(book: &Book, part: &str, limits: &Limits) -> Result<Sheet, Error> 
                 "c" => {
                     let [rf, ty, s] = t.attrs_of(["r", "t", "s"]);
                     let (rr, cc) = rf.as_deref().and_then(cell_ref).unwrap_or((row, next_col));
-                    next_col = cc + 1;
+                    next_col = cc.saturating_add(1);
                     let xf = s.and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
                     let ty = ty.map(|v| v.into_owned()).unwrap_or_default();
-                    if rr < MAX_ROWS && cc < MAX_COLS {
+                    if rr < MAX_ROWS && cc < MAX_COLS && sh.cells.len() < MAX_CELLS {
                         if empty {
                             sh.cells.push(Cell { row: rr, col: cc, xf, val: None });
                         } else {
@@ -218,9 +243,9 @@ fn read_sheet(book: &Book, part: &str, limits: &Limits) -> Result<Sheet, Error> 
                     && let Some((rr, cc, ty, xf)) = cur.take()
                 {
                     let val = match ty.as_str() {
-                        "s" => value.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).and_then(|i| book.shared.get(i)).map(|s| Val::Text(s.clone())),
-                        "inlineStr" => Some(Val::Text(std::mem::take(&mut inline))),
-                        "str" | "d" => value.take().map(Val::Text),
+                        "s" => value.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).and_then(|i| book.shared.get(i)).map(|s| Val::Text(cell_text_of(s, &mut text_left))),
+                        "inlineStr" => Some(Val::Text(cell_text_of(&std::mem::take(&mut inline), &mut text_left))),
+                        "str" | "d" => value.take().map(|v| Val::Text(cell_text_of(&v, &mut text_left))),
                         "b" => value.as_deref().map(|v| Val::Bool(v.trim() == "1")),
                         "e" => value.take().map(Val::Err),
                         _ => value.as_deref().and_then(|v| v.trim().parse::<f64>().ok()).filter(|n| n.is_finite()).map(Val::Num),
@@ -362,6 +387,10 @@ pub(crate) fn draw(sh: &Sheet, styles: &Styles, numbers: &Numbers, fonts: &mut F
         let (r1, c1) = (r1.min(MAX_ROWS), c1.min(MAX_COLS));
         merged_at.insert((r0, c0), (r1, c1));
         for r in r0..=r1 {
+            // Many large merged areas: at most so many cells covered.
+            if covered.len() >= 200_000 {
+                break;
+            }
             for c in c0..=c1 {
                 if (r, c) != (r0, c0) && covered.len() < 200_000 {
                     covered.insert((r, c));
@@ -509,7 +538,7 @@ fn cell_text(fonts: &mut FontCache, items: &mut Vec<Item>, text: &mut Vec<TextRu
         line: LineRule::Multiple(1.0),
         ..ParaFormat::default()
     };
-    let shown = if c.align == HAlign::Fill && !c.shown.is_empty() { c.shown.repeat(64) } else { c.shown };
+    let shown = if c.align == HAlign::Fill && !c.shown.is_empty() { c.shown.repeat((4096 / c.shown.len()).clamp(1, 64)) } else { c.shown };
     let spans = [Span::new(shown.replace('\r', ""), c.style.clone())];
     let set_width = if wrap { inner } else { 100_000.0 };
     let mut lines = typeset::set(&spans, &fmt, set_width, fonts);
@@ -609,4 +638,47 @@ pub(crate) fn shared_strings(pkg: &Package, part: Option<&str>, limits: &Limits)
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(sheet: &str, shared: &str, styles: &str) -> crate::Document {
+        let data = crate::xlsx::tiny_xlsx(sheet, shared, styles);
+        let mut d = crate::Document::open_with(data, Limits::default(), crate::Fonts::none()).unwrap();
+        d.page_size(0).unwrap();
+        d.render_page(0, 64, &|| false).unwrap();
+        d
+    }
+
+    #[test]
+    fn rows_and_columns_at_the_end_of_u32() {
+        // The row and column after the last ones a reference can name.
+        open(r#"<worksheet><sheetData><row r="1"><c r="MWLQKWU1"/><c/><c/></row><row r="4294967295"/></sheetData><row/><row/><sheetData></sheetData><row/></worksheet>"#, "<sst/>", "<styleSheet/>");
+    }
+
+    #[test]
+    fn a_long_shared_string_in_every_cell_is_copied_within_a_budget() {
+        let long = "x".repeat(1 << 20);
+        let shared = format!("<sst><si><t>{long}</t></si></sst>");
+        let cells = r#"<c r="A1" t="s"><v>0</v></c>"#.repeat(20_000);
+        let sheet = format!("<worksheet><sheetData><row r=\"1\">{cells}</row></sheetData></worksheet>");
+        open(&sheet, &shared, "<styleSheet/>");
+        let mut left = 9;
+        assert_eq!(cell_text_of("ab\u{e9}cd", &mut left), "ab\u{e9}cd");
+        assert_eq!(cell_text_of("\u{e9}\u{e9}\u{e9}", &mut left), "\u{e9}");
+        assert_eq!(left, 1);
+        assert_eq!(cell_text_of(&long, &mut left), "x");
+        assert_eq!(cell_text_of(&long, &mut left), "");
+    }
+
+    #[test]
+    fn hostile_number_formats_and_fill_alignment() {
+        let code = format!("0.{}", "0".repeat(100_000));
+        let styles = format!(r#"<styleSheet><numFmts><numFmt numFmtId="200" formatCode="{code}"/></numFmts><cellXfs><xf numFmtId="200"/><xf numFmtId="0"><alignment horizontal="fill"/></xf></cellXfs></styleSheet>"#);
+        let text = "y".repeat(100_000);
+        let sheet = format!(r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1.5</v></c><c r="B1" s="1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData><mergeCells><mergeCell ref="A2:ZZ9999"/><mergeCell ref="B2:ZZ9999"/></mergeCells></worksheet>"#);
+        open(&sheet, "<sst/>", &styles);
+    }
 }

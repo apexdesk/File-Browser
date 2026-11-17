@@ -1,5 +1,6 @@
 //! HTML de los listados. Sin JavaScript; todo nombre de archivo se escapa.
 
+use crate::http::Lang;
 use crate::jail::pct_encode;
 use crate::timefmt;
 
@@ -11,6 +12,9 @@ pub struct Row {
 }
 
 const PREVIEW_MAX: u64 = 1 << 20;
+/// Tope del HTML de un listado o una búsqueda: con nombres largos y llenos de caracteres a escapar,
+/// 20 000 filas podrían ocupar cientos de MiB en memoria. Pasado el tope se recorta (y se avisa).
+pub const MAX_PAGE: usize = 4 << 20;
 
 fn is_image(name: &str) -> bool {
     matches!(name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"))
@@ -59,26 +63,42 @@ td.n{width:100%;word-break:break-all}td.s,td.d{white-space:nowrap;color:#777}.ba
 input[type=text]{padding:4px 8px;border:1px solid #8886;border-radius:4px;background:transparent;color:inherit}\
 @media(prefers-color-scheme:dark){body{background:#17181c;color:#e6e6e9}a{color:#8ab4ff}}";
 
-fn shell(title: &str, body: &str) -> String {
+fn shell(l: Lang, title: &str, body: &str) -> String {
     format!(
-        "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+        "<!doctype html><html lang=\"{}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>{CSS}</style></head><body>{body}</body></html>",
+        l.code(),
         esc(title)
     )
 }
 
-fn crumbs(token: &str, comps: &[String]) -> String {
-    let mut h = format!("<a href=\"/s/{token}/\">Inicio</a>");
+fn crumbs(l: Lang, token: &str, comps: &[String]) -> String {
+    let mut h = format!("<a href=\"/s/{token}/\">{}</a>", l.tr("Inicio", "Home"));
     for i in 0..comps.len() {
         h.push_str(&format!(" / <a href=\"{}\">{}</a>", base_url(token, &comps[..=i]), esc(&comps[i])));
     }
     h
 }
 
-pub fn roots_page(token: &str, names: &[String], web: bool) -> String {
-    let mut b = String::from("<h1>Carpetas compartidas</h1>");
+/// Aviso cuando el servidor deja escribir pero el binario no lleva la interfaz web: estas páginas no
+/// tienen acciones de escritura.
+fn ro_note(l: Lang) -> String {
+    format!(
+        "<p><em>{}</em></p>",
+        l.tr(
+            "Solo lectura desde esta página: el servidor permite escribir, pero este binario no incluye la interfaz web.",
+            "Read-only from this page: the server allows writing, but this build does not include the web interface."
+        )
+    )
+}
+
+pub fn roots_page(l: Lang, token: &str, names: &[String], web: bool, write: bool) -> String {
+    let title = l.tr("Carpetas compartidas", "Shared folders");
+    let mut b = format!("<h1>{title}</h1>");
     if web {
-        b.push_str(&format!("<p><a href=\"/s/{token}/app/\">Abrir la interfaz web</a></p>"));
+        b.push_str(&format!("<p><a href=\"/s/{token}/app/\">{}</a></p>", l.tr("Abrir la interfaz web", "Open the web interface")));
+    } else if write {
+        b.push_str(&ro_note(l));
     }
     b.push_str("<table>");
     for n in names {
@@ -89,27 +109,45 @@ pub fn roots_page(token: &str, names: &[String], web: bool) -> String {
         ));
     }
     b.push_str("</table>");
-    shell("Carpetas compartidas", &b)
+    shell(l, title, &b)
 }
 
-pub fn dir_page(token: &str, comps: &[String], rows: &[Row], sort: &str, desc: bool, truncated: bool) -> String {
+/// `ro`: el servidor deja escribir pero no hay interfaz web (ver `ro_note`).
+#[allow(clippy::too_many_arguments)]
+pub fn dir_page(l: Lang, token: &str, comps: &[String], rows: &[Row], sort: &str, desc: bool, mut truncated: bool, ro: bool) -> String {
     let base = base_url(token, comps);
     let th = |k: &str, label: &str| {
         let d = if sort == k && !desc { "&amp;o=d" } else { "" };
         format!("<th><a href=\"?sort={k}{d}\">{label}</a></th>")
     };
-    let mut b = format!("<h1>{}</h1>", crumbs(token, comps));
+    let mut b = format!("<h1>{}</h1>", crumbs(l, token, comps));
+    if ro {
+        b.push_str(&ro_note(l));
+    }
     b.push_str(&format!(
-        "<div class=\"bar\"><form method=\"get\" action=\"{base}\"><input type=\"text\" name=\"q\" placeholder=\"Buscar por nombre\"> <input type=\"submit\" value=\"Buscar\"></form>\
-         <a href=\"{base}?zip=1\">Descargar carpeta (ZIP)</a></div>"
+        "<div class=\"bar\"><form method=\"get\" action=\"{base}\"><input type=\"text\" name=\"q\" placeholder=\"{}\"> <input type=\"submit\" value=\"{}\"></form>\
+         <a href=\"{base}?zip=1\">{}</a></div>",
+        l.tr("Buscar por nombre", "Search by name"),
+        l.tr("Buscar", "Search"),
+        l.tr("Descargar carpeta (ZIP)", "Download folder (ZIP)")
     ));
-    b.push_str(&format!("<table><tr>{}{}{}</tr>", th("name", "Nombre"), th("size", "Tamaño"), th("date", "Modificado")));
+    b.push_str(&format!(
+        "<table><tr>{}{}{}</tr>",
+        th("name", l.tr("Nombre", "Name")),
+        th("size", l.tr("Tamaño", "Size")),
+        th("date", l.tr("Modificado", "Modified"))
+    ));
+    let dl = l.tr("Descargar", "Download");
     if comps.len() > 1 {
         b.push_str(&format!("<tr><td class=\"n\"><a href=\"{}\">..</a></td><td></td><td></td></tr>", base_url(token, &comps[..comps.len() - 1])));
     } else {
         b.push_str(&format!("<tr><td class=\"n\"><a href=\"/s/{token}/\">..</a></td><td></td><td></td></tr>"));
     }
     for r in rows {
+        if b.len() > MAX_PAGE {
+            truncated = true;
+            break;
+        }
         let e = pct_encode(&r.name);
         if r.is_dir {
             b.push_str(&format!(
@@ -125,7 +163,7 @@ pub fn dir_page(token: &str, comps: &[String], rows: &[Row], sort: &str, desc: b
                 String::new()
             };
             b.push_str(&format!(
-                "<tr><td class=\"n\">{thumb}<a href=\"{base}{e}\">{}</a> <a href=\"{base}{e}?dl=1\" title=\"Descargar\">⬇</a></td><td class=\"s\">{}</td><td class=\"d\">{}</td></tr>",
+                "<tr><td class=\"n\">{thumb}<a href=\"{base}{e}\">{}</a> <a href=\"{base}{e}?dl=1\" title=\"{dl}\">⬇</a></td><td class=\"s\">{}</td><td class=\"d\">{}</td></tr>",
                 esc(&r.name),
                 human(r.size),
                 timefmt::short(r.mtime)
@@ -134,9 +172,9 @@ pub fn dir_page(token: &str, comps: &[String], rows: &[Row], sort: &str, desc: b
     }
     b.push_str("</table>");
     if truncated {
-        b.push_str("<p>Listado recortado: hay más entradas de las que se muestran.</p>");
+        b.push_str(l.tr("<p>Listado recortado: hay más entradas de las que se muestran.</p>", "<p>Listing cut short: there are more entries than shown.</p>"));
     }
-    shell(comps.last().map(String::as_str).unwrap_or("Carpeta"), &b)
+    shell(l, comps.last().map(String::as_str).unwrap_or(l.tr("Carpeta", "Folder")), &b)
 }
 
 pub struct Hit {
@@ -145,10 +183,22 @@ pub struct Hit {
     pub size: u64,
 }
 
-pub fn search_page(token: &str, comps: &[String], q: &str, hits: &[Hit], truncated: bool) -> String {
+/// `unreadable`: carpetas que no se pudieron leer durante la búsqueda.
+#[allow(clippy::too_many_arguments)]
+pub fn search_page(l: Lang, token: &str, comps: &[String], q: &str, hits: &[Hit], mut truncated: bool, unreadable: usize) -> String {
     let base = base_url(token, comps);
-    let mut b = format!("<h1>{}</h1><p>Resultados para «{}»: <a href=\"{base}\">volver</a></p><table>", crumbs(token, comps), esc(q));
+    let mut b = format!(
+        "<h1>{}</h1><p>{} «{}»: <a href=\"{base}\">{}</a></p><table>",
+        crumbs(l, token, comps),
+        l.tr("Resultados para", "Results for"),
+        esc(q),
+        l.tr("volver", "back")
+    );
     for h in hits {
+        if b.len() > MAX_PAGE {
+            truncated = true;
+            break;
+        }
         let mut u = base.clone();
         for (i, c) in h.rel.iter().enumerate() {
             u.push_str(&pct_encode(c));
@@ -161,12 +211,15 @@ pub fn search_page(token: &str, comps: &[String], q: &str, hits: &[Hit], truncat
     }
     b.push_str("</table>");
     if hits.is_empty() {
-        b.push_str("<p>Sin resultados.</p>");
+        b.push_str(l.tr("<p>Sin resultados.</p>", "<p>No results.</p>"));
     }
     if truncated {
-        b.push_str("<p>Búsqueda recortada por tamaño o tiempo; afina el término.</p>");
+        b.push_str(l.tr("<p>Búsqueda recortada por tamaño o tiempo; afina el término.</p>", "<p>Search cut short by size or time; refine the term.</p>"));
     }
-    shell("Búsqueda", &b)
+    if unreadable > 0 {
+        b.push_str(&format!("<p>{}: {unreadable}</p>", l.tr("Carpetas que no se pudieron leer", "Folders that could not be read")));
+    }
+    shell(l, l.tr("Búsqueda", "Search"), &b)
 }
 
 #[cfg(test)]
@@ -176,7 +229,7 @@ mod tests {
     #[test]
     fn escapa_nombres_hostiles() {
         let rows = vec![Row { name: "<script>alert(1)</script>\"'&.txt".into(), is_dir: false, size: 1, mtime: 0 }];
-        let h = dir_page("tok", &["r".into()], &rows, "name", false, false);
+        let h = dir_page(Lang::Es, "tok", &["r".into()], &rows, "name", false, false, false);
         assert!(!h.contains("<script>"));
         assert!(h.contains("&lt;script&gt;"));
         assert!(h.contains("%3Cscript%3E"));
@@ -189,8 +242,31 @@ mod tests {
             Row { name: "grande.jpg".into(), is_dir: false, size: PREVIEW_MAX + 1, mtime: 0 },
             Row { name: "v.svg".into(), is_dir: false, size: 10, mtime: 0 },
         ];
-        let h = dir_page("t", &["r".into()], &rows, "name", false, false);
+        let h = dir_page(Lang::Es, "t", &["r".into()], &rows, "name", false, false, false);
         assert_eq!(h.matches("<img ").count(), 1);
+    }
+
+    #[test]
+    fn el_listado_tiene_tope_de_bytes() {
+        // 255 caracteres que se escapan a 5-6 bytes cada uno y además se codifican en la URL
+        let name: String = "<&\"'>".chars().cycle().take(255).collect();
+        let rows: Vec<Row> = (0..20_000).map(|_| Row { name: name.clone(), is_dir: false, size: 1, mtime: 0 }).collect();
+        let h = dir_page(Lang::Es, "t", &["r".into()], &rows, "name", false, false, false);
+        assert!(h.len() < MAX_PAGE + 64 * 1024, "{}", h.len());
+        assert!(h.contains("Listado recortado"));
+        let hits: Vec<Hit> = (0..300).map(|_| Hit { rel: vec![name.clone(); 64], is_dir: false, size: 1 }).collect();
+        let h = search_page(Lang::Es, "t", &["r".into()], "x", &hits, false, 0);
+        assert!(h.len() < MAX_PAGE + 256 * 1024, "{}", h.len());
+        assert!(h.contains("recortada"));
+    }
+
+    #[test]
+    fn paginas_en_ingles_y_aviso_de_solo_lectura() {
+        let h = dir_page(Lang::En, "t", &["r".into()], &[], "name", false, true, true);
+        assert!(h.contains("lang=\"en\"") && h.contains("Download folder") && h.contains("Listing cut short") && h.contains("Read-only"));
+        let h = roots_page(Lang::Es, "t", &["r".into()], false, true);
+        assert!(h.contains("lang=\"es\"") && h.contains("Solo lectura"));
+        assert!(!roots_page(Lang::Es, "t", &["r".into()], true, true).contains("Solo lectura"));
     }
 
     #[test]

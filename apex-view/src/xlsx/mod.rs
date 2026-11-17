@@ -37,6 +37,21 @@ pub(crate) struct Doc {
     limits: Limits,
 }
 
+/// A workbook of one sheet, its shared strings and styles, for tests.
+#[cfg(test)]
+pub(crate) fn tiny_xlsx(sheet: &str, shared: &str, styles: &str) -> Vec<u8> {
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+    let wb = r#"<workbook xmlns:r="r"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    let rels = format!(r#"<Relationships><Relationship Id="rId1" Type="{R}worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{R}sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId3" Type="{R}styles" Target="styles.xml"/></Relationships>"#);
+    crate::ooxml::stored_zip(&[
+        ("xl/workbook.xml", wb.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ("xl/sharedStrings.xml", shared.as_bytes()),
+        ("xl/styles.xml", styles.as_bytes()),
+    ])
+}
+
 impl Doc {
     pub fn open(data: Vec<u8>, limits: &Limits, fonts: &Fonts) -> Result<Doc, Error> {
         let pkg = Package::open(data, limits)?;

@@ -8,6 +8,8 @@ use std::path::Path;
 /// Límite de triángulos admitidos (memoria: 36 bytes por triángulo).
 const MAX_TRIS: usize = 3_000_000;
 const MAX_BYTES: u64 = 400 << 20;
+/// vértices como mucho (12 bytes cada uno)
+const MAX_VERTS: usize = 10_000_000;
 
 pub struct Mesh {
     /// 9 floats por triángulo (x, y, z de cada vértice)
@@ -26,13 +28,13 @@ impl Mesh {
 
     fn finish(tris: Vec<f32>) -> Result<Mesh, String> {
         if tris.len() < 9 {
-            return Err("sin geometría".into());
+            return Err(crate::i18n::t("sin geometría").into());
         }
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for v in tris.chunks_exact(3) {
             for k in 0..3 {
                 if !v[k].is_finite() {
-                    return Err("coordenadas no válidas".into());
+                    return Err(crate::i18n::t("coordenadas no válidas").into());
                 }
                 lo[k] = lo[k].min(v[k]);
                 hi[k] = hi[k].max(v[k]);
@@ -53,16 +55,16 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let len = crate::vfs::fs::metadata(path).map_err(|e| e.to_string())?.len();
     if len > MAX_BYTES {
-        return Err("archivo demasiado grande".into());
+        return Err(crate::i18n::t("archivo demasiado grande").into());
     }
-    let f = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
+    let f = crate::thumbs::open_regular(path).ok_or(crate::i18n::t("no es un archivo normal"))?;
     match ext.as_str() {
         "stl" => load_stl(f, len),
         "obj" => load_obj(f),
         "ply" => load_ply(f),
         "glb" | "gltf" => load_gltf(path),
         "3mf" => load_3mf(path),
-        _ => Err("formato no admitido".into()),
+        _ => Err(crate::i18n::t("formato no admitido").into()),
     }
 }
 
@@ -74,7 +76,7 @@ fn load_stl(f: crate::vfs::fs::File, len: u64) -> Result<Mesh, String> {
         let count = u32::from_le_bytes([head[80], head[81], head[82], head[83]]) as u64;
         if 84 + 50 * count == len {
             if count as usize > MAX_TRIS {
-                return Err("demasiados triángulos".into());
+                return Err(crate::i18n::t("demasiados triángulos").into());
             }
             let mut tris = Vec::with_capacity(count as usize * 9);
             let mut rec = [0u8; 50];
@@ -113,7 +115,7 @@ fn load_stl(f: crate::vfs::fs::File, len: u64) -> Result<Mesh, String> {
         let Ok(l) = l else { break };
         parse(&l, &mut tris);
         if tris.len() / 9 > MAX_TRIS {
-            return Err("demasiados triángulos".into());
+            return Err(crate::i18n::t("demasiados triángulos").into());
         }
     }
     tris.truncate(tris.len() / 9 * 9);
@@ -130,6 +132,9 @@ fn load_obj(f: crate::vfs::fs::File) -> Result<Mesh, String> {
         if let Some(rest) = l.strip_prefix("v ") {
             let v: Vec<f32> = rest.split_whitespace().take(3).filter_map(|x| x.parse().ok()).collect();
             if v.len() == 3 {
+                if verts.len() >= MAX_VERTS {
+                    return Err(crate::i18n::t("demasiados vértices").into());
+                }
                 verts.push([v[0], v[1], v[2]]);
             }
         } else if let Some(rest) = l.strip_prefix("f ") {
@@ -149,7 +154,7 @@ fn load_obj(f: crate::vfs::fs::File) -> Result<Mesh, String> {
                 }
             }
             if tris.len() / 9 > MAX_TRIS {
-                return Err("demasiados triángulos".into());
+                return Err(crate::i18n::t("demasiados triángulos").into());
             }
         }
     }
@@ -353,7 +358,7 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
     };
     read_line(&mut r, &mut line)?;
     if line.trim() != "ply" {
-        return Err("no es un PLY".into());
+        return Err(crate::i18n::t("no es un PLY").into());
     }
     // (nombre, cuenta, propiedades (nombre, tipo, tipo del contador si es lista, tipo de elemento))
     struct Prop {
@@ -365,12 +370,12 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
     let mut elems: Vec<(String, usize, Vec<Prop>)> = Vec::new();
     loop {
         if !read_line(&mut r, &mut line)? {
-            return Err("cabecera incompleta".into());
+            return Err(crate::i18n::t("cabecera incompleta").into());
         }
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.as_slice() {
             ["format", f, ..] => format = f.to_string(),
-            ["element", n, c] => elems.push((n.to_string(), c.parse().map_err(|_| "cuenta no válida")?, Vec::new())),
+            ["element", n, c] => elems.push((n.to_string(), c.parse().map_err(|_| crate::i18n::t("cuenta no válida"))?, Vec::new())),
             ["property", "list", ct, it, n] => {
                 if let Some(e) = elems.last_mut() {
                     e.2.push(Prop { name: n.to_string(), ty: it.to_string(), list: Some(ct.to_string()) });
@@ -403,13 +408,13 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
             while tok_i >= toks.len() {
                 let mut l = String::new();
                 if r.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
-                    return Err("datos incompletos".into());
+                    return Err(crate::i18n::t("datos incompletos").into());
                 }
                 toks = l.split_whitespace().map(|s| s.to_string()).collect();
                 tok_i = 0;
             }
             tok_i += 1;
-            return toks[tok_i - 1].parse().map_err(|_| "número no válido".into());
+            return toks[tok_i - 1].parse().map_err(|_| crate::i18n::t("número no válido").into());
         }
         let mut b = [0u8; 8];
         let n = size(ty);
@@ -430,7 +435,7 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
     };
     for (name, count, props) in &elems {
         if *count > 20_000_000 {
-            return Err("demasiado grande".into());
+            return Err(crate::i18n::t("demasiado grande").into());
         }
         for _ in 0..*count {
             let mut xyz = [0f32; 3];
@@ -439,7 +444,7 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
                 if let Some(ct) = &p.list {
                     let n = next_val(&mut r, ct)? as usize;
                     if n > 1000 {
-                        return Err("polígono no válido".into());
+                        return Err(crate::i18n::t("polígono no válido").into());
                     }
                     let mut v = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -462,18 +467,18 @@ fn load_ply(f: crate::vfs::fs::File) -> Result<Mesh, String> {
             }
             if name == "vertex" {
                 // tope global: elementos sin propiedades agotarían la memoria sin leer ni un byte
-                if verts.len() >= 10_000_000 {
-                    return Err("demasiados vértices".into());
+                if verts.len() >= MAX_VERTS {
+                    return Err(crate::i18n::t("demasiados vértices").into());
                 }
                 verts.push(xyz);
             } else if name == "face" {
                 for w in 1..idx.len().saturating_sub(1) {
                     for &i in &[idx[0], idx[w], idx[w + 1]] {
-                        tris.extend_from_slice(verts.get(i).ok_or("índice fuera de rango")?);
+                        tris.extend_from_slice(verts.get(i).ok_or(crate::i18n::t("índice fuera de rango"))?);
                     }
                 }
                 if tris.len() / 9 > MAX_TRIS {
-                    return Err("demasiados triángulos".into());
+                    return Err(crate::i18n::t("demasiados triángulos").into());
                 }
             }
         }
@@ -500,24 +505,29 @@ fn load_3mf(path: &Path) -> Result<Mesh, String> {
             }
         }
     }
-    let name = name.ok_or("sin modelo")?;
+    let name = name.ok_or(crate::i18n::t("sin modelo"))?;
     let mut text = String::new();
     ar.by_name(&name).map_err(|e| e.to_string())?.take(MAX_BYTES).read_to_string(&mut text).map_err(|e| e.to_string())?;
     let mut verts: Vec<[f32; 3]> = Vec::new();
     let mut tris: Vec<f32> = Vec::new();
-    for t in markup::tokens(&text, false) {
+    for t in markup::iter_tokens(&text, false) {
         let Tok::Open { name, attrs, .. } = t else { continue };
         let num = |k: &str| markup::attr(&attrs, k).and_then(|v| v.parse::<f32>().ok());
         match markup::local(&name) {
             "mesh" => verts.clear(),
-            "vertex" => verts.push([num("x").unwrap_or(0.0), num("y").unwrap_or(0.0), num("z").unwrap_or(0.0)]),
+            "vertex" => {
+                if verts.len() >= MAX_VERTS {
+                    return Err(crate::i18n::t("demasiados vértices").into());
+                }
+                verts.push([num("x").unwrap_or(0.0), num("y").unwrap_or(0.0), num("z").unwrap_or(0.0)])
+            }
             "triangle" => {
                 for k in ["v1", "v2", "v3"] {
-                    let i = num(k).ok_or("triángulo no válido")? as usize;
-                    tris.extend_from_slice(verts.get(i).ok_or("índice fuera de rango")?);
+                    let i = num(k).ok_or(crate::i18n::t("triángulo no válido"))? as usize;
+                    tris.extend_from_slice(verts.get(i).ok_or(crate::i18n::t("índice fuera de rango"))?);
                 }
                 if tris.len() / 9 > MAX_TRIS {
-                    return Err("demasiados triángulos".into());
+                    return Err(crate::i18n::t("demasiados triángulos").into());
                 }
             }
             _ => {}
@@ -707,7 +717,7 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
         while p + 8 <= data.len() {
             let len = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
             let ty = &data[p + 4..p + 8];
-            let body = data.get(p + 8..p + 8 + len).ok_or("trozo incompleto")?;
+            let body = data.get(p + 8..p + 8 + len).ok_or(crate::i18n::t("trozo incompleto"))?;
             if ty == b"JSON" {
                 json = Some(String::from_utf8_lossy(body).into_owned());
             } else if ty == b"BIN\0" {
@@ -715,13 +725,13 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
             }
             p += 8 + len.next_multiple_of(4);
         }
-        (json.ok_or("sin JSON")?, bin)
+        (json.ok_or(crate::i18n::t("sin JSON"))?, bin)
     } else {
         (String::from_utf8_lossy(&data).into_owned(), None)
     };
-    let json = parse_json(&json_text).ok_or("JSON no válido")?;
+    let json = parse_json(&json_text).ok_or(crate::i18n::t("JSON no válido"))?;
     if json.get("extensionsRequired").map(|e| e.arr().iter().any(|x| x.str() == Some("KHR_draco_mesh_compression"))).unwrap_or(false) {
-        return Err("compresión Draco no admitida".into());
+        return Err(crate::i18n::t("compresión Draco no admitida").into());
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut buffers: Vec<Vec<u8>> = Vec::new();
@@ -733,20 +743,20 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
                 let rel = u.replace("%20", " ");
                 // sólo dentro de la carpeta del modelo
                 if rel.contains("..") || rel.starts_with('/') || rel.contains([':', '\\']) {
-                    return Err("ruta no permitida".into());
+                    return Err(crate::i18n::t("ruta no permitida").into());
                 }
                 // solo archivos normales y de tamaño razonable (una FIFO o /dev/zero colgaría el hilo)
                 let bp = dir.join(rel);
                 match crate::vfs::fs::metadata(&bp) {
                     Ok(m) if m.v_is_file() && m.len() <= 512 << 20 => {}
-                    _ => return Err("buffer no válido".into()),
+                    _ => return Err(crate::i18n::t("buffer no válido").into()),
                 }
                 // presupuesto total: el mismo archivo grande repetido en cientos de buffers no se lee cientos de veces
                 let sz = crate::vfs::fs::metadata(&bp).map(|m| m.len() as usize).unwrap_or(0);
-                budget = budget.checked_sub(sz).ok_or("buffers demasiado grandes")?;
+                budget = budget.checked_sub(sz).ok_or(crate::i18n::t("buffers demasiado grandes"))?;
                 crate::vfs::fs::read(bp).map_err(|e| e.to_string())?
             }
-            None if i == 0 => glb_bin.clone().ok_or("sin datos binarios")?,
+            None if i == 0 => glb_bin.clone().ok_or(crate::i18n::t("sin datos binarios"))?,
             None => Vec::new(),
         });
     }
@@ -758,11 +768,11 @@ fn load_gltf(path: &Path) -> Result<Mesh, String> {
     if roots.is_empty() {
         // sin escena: todas las mallas tal cual
         for i in 0..g.json.get("meshes").map(|m| m.arr().len()).unwrap_or(0) {
-            g.mesh_into(i, &ident, &mut tris).ok_or("malla no válida")?;
+            g.mesh_into(i, &ident, &mut tris).ok_or(crate::i18n::t("malla no válida"))?;
         }
     } else {
         for &r in &roots {
-            g.walk(r, &ident, &mut tris, 0).ok_or("malla no válida")?;
+            g.walk(r, &ident, &mut tris, 0).ok_or(crate::i18n::t("malla no válida"))?;
         }
     }
     let mut mesh = Mesh::finish(tris)?;

@@ -158,7 +158,10 @@ mod wl {
                 wl_data_device::Event::Enter { serial, surface, id: offer, .. } => {
                     st.last_enter = serial;
                     st.over_ours = st.surface_id.as_ref().map(|id| *id == surface.id()).unwrap_or(false) && !st.source_active;
-                    st.cur_offer = offer.clone();
+                    // cada oferta es un objeto del compositor: la anterior sin usar se destruye
+                    if let Some(old) = std::mem::replace(&mut st.cur_offer, offer.clone()) {
+                        old.destroy();
+                    }
                     if let Some(o) = offer {
                         if st.over_ours && st.offer_has_uri {
                             o.accept(serial, Some(URI.into()));
@@ -169,11 +172,25 @@ mod wl {
                     }
                 }
                 wl_data_device::Event::DataOffer { .. } => st.offer_has_uri = false,
-                wl_data_device::Event::Leave => st.over_ours = false,
+                wl_data_device::Event::Leave => {
+                    st.over_ours = false;
+                    if let Some(o) = st.cur_offer.take() {
+                        o.destroy();
+                    }
+                }
+                // el portapapeles no se lee por aquí: su oferta se suelta en cuanto llega
+                wl_data_device::Event::Selection { id: Some(o) } => o.destroy(),
                 wl_data_device::Event::Drop => {
-                    if let (true, Some(offer)) = (st.over_ours, st.cur_offer.take()) {
+                    let Some(offer) = st.cur_offer.take() else { return };
+                    if !st.over_ours {
+                        offer.destroy();
+                    } else {
                         let mut fds = [0i32; 2];
-                        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                        // SAFETY: `fds` tiene sitio para los dos descriptores que escribe pipe2.
+                        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                            offer.destroy();
+                        } else {
+                            // SAFETY: pipe2 acaba de crear estos dos descriptores y nadie más los posee.
                             let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
                             offer.receive(URI.into(), wr.as_fd());
                             drop(wr);
@@ -254,6 +271,7 @@ mod wl {
 
     impl Wl {
         pub fn new(display: usize, surface: usize, wake: Arc<dyn Fn() + Send + Sync>) -> Option<Wl> {
+            // SAFETY: `display` es el wl_display de winit, que vive mientras la ventana (y este objeto).
             let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
             let conn = Connection::from_backend(backend);
             let (globals, mut queue) = registry_queue_init::<St>(&conn).ok()?;
@@ -284,6 +302,7 @@ mod wl {
                 return None;
             }
             let pointer = seat.get_pointer(&qh, ());
+            // SAFETY: `surface` es el wl_surface de la ventana de winit en esa misma conexión.
             let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface as *mut _) }.ok()?;
             let origin = WlSurface::from_id(&conn, id.clone()).ok()?;
             st.surface_id = Some(id);
@@ -341,10 +360,12 @@ mod wl {
         fn make_icon(&mut self) -> Option<(WlSurface, WlBuffer)> {
             let (comp, shm) = (self.compositor.as_ref()?, self.shm.as_ref()?);
             let px = icon_pixels();
+            // SAFETY: nombre terminado en NUL; el descriptor devuelto pasa a ser nuestro.
             let fd = unsafe { libc::memfd_create(c"fb-drag-icon".as_ptr(), libc::MFD_CLOEXEC) };
             if fd < 0 {
                 return None;
             }
+            // SAFETY: `fd` es válido (>= 0) y no tiene otro dueño.
             let file = crate::vfs::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
             (&file).write_all(&px).ok()?;
             let pool = shm.create_pool(file.as_fd(), px.len() as i32, &self.qh, ());
@@ -532,7 +553,22 @@ use web_time::{Instant};
         let mut last_sent = Instant::now() - Duration::from_secs(1);
         let started = Instant::now();
         let mut dropped_at: Option<Instant> = None;
+        let mut released_at: Option<Instant> = None;
         let mut finished = false;
+        // teclas que producen Escape: con ella pulsada se cancela el arrastre (no hay captura de teclado)
+        let esc_keys: Vec<u8> = {
+            let (min, max) = (c.setup().min_keycode, c.setup().max_keycode);
+            match c.get_keyboard_mapping(min, (max - min).saturating_add(1))?.reply() {
+                Ok(m) if m.keysyms_per_keycode > 0 => m
+                    .keysyms
+                    .chunks(m.keysyms_per_keycode as usize)
+                    .enumerate()
+                    .filter(|(_, ks)| ks.contains(&0xff1b))
+                    .map(|(i, _)| min.saturating_add(i as u8))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
 
         let serve = |ev: Event, accepted: &mut bool, finished: &mut bool| match ev {
             Event::SelectionRequest(r) if r.selection == a.selection => {
@@ -602,7 +638,18 @@ use web_time::{Instant};
                     last_sent = Instant::now();
                 }
             }
-            if !held {
+            if !esc_keys.is_empty() {
+                let k = c.query_keymap()?.reply()?.keys;
+                if esc_keys.iter().any(|&e| k[e as usize / 8] & (1 << (e % 8)) != 0) {
+                    if let Some((w, _)) = target {
+                        msg(&c, w, a.leave, [src, 0, 0, 0, 0]);
+                    }
+                    break;
+                }
+            }
+            // soltado antes de que el destino conteste (XdndStatus): se le deja un momento para aceptar
+            let wait = !held && !accepted && target.is_some() && released_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_millis(400);
+            if !held && !wait {
                 match target {
                     Some((w, _)) if accepted => {
                         msg(&c, w, a.drop_, [src, 0, CURRENT_TIME, 0, 0]);

@@ -57,7 +57,9 @@ unsafe extern "C" {
     fn AMediaCodec_getInputBuffer(c: *mut c_void, idx: usize, size: *mut usize) -> *mut u8;
     fn AMediaCodec_getOutputBuffer(c: *mut c_void, idx: usize, size: *mut usize) -> *mut u8;
     fn AMediaCodec_dequeueInputBuffer(c: *mut c_void, timeout_us: i64) -> isize;
-    fn AMediaCodec_queueInputBuffer(c: *mut c_void, idx: usize, offset: i64, size: usize, time: u64, flags: u32) -> Status;
+    // `_off_t_compat` del NDK: int32_t en 32 bits y off_t (long) en 64, es decir siempre `long`
+    // (NdkMediaCodec.h lo comprueba con static_assert); con i64 en armv7 se desplazan los argumentos
+    fn AMediaCodec_queueInputBuffer(c: *mut c_void, idx: usize, offset: std::ffi::c_long, size: usize, time: u64, flags: u32) -> Status;
     fn AMediaCodec_dequeueOutputBuffer(c: *mut c_void, info: *mut BufInfo, timeout_us: i64) -> isize;
     fn AMediaCodec_getOutputFormat(c: *mut c_void) -> *mut c_void;
     fn AMediaCodec_releaseOutputBuffer(c: *mut c_void, idx: usize, render: bool) -> Status;
@@ -84,6 +86,7 @@ unsafe extern "C" {
     fn AAudioStreamBuilder_setSampleRate(b: *mut c_void, r: i32);
     fn AAudioStreamBuilder_setPerformanceMode(b: *mut c_void, m: c_int);
     fn AAudioStreamBuilder_setDataCallback(b: *mut c_void, cb: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32) -> c_int, user: *mut c_void);
+    fn AAudioStreamBuilder_setErrorCallback(b: *mut c_void, cb: extern "C" fn(*mut c_void, *mut c_void, c_int), user: *mut c_void);
     fn AAudioStreamBuilder_openStream(b: *mut c_void, out: *mut *mut c_void) -> c_int;
     fn AAudioStream_requestStart(s: *mut c_void) -> c_int;
     fn AAudioStream_requestStop(s: *mut c_void) -> c_int;
@@ -102,11 +105,21 @@ struct CbState {
     ring: Ring,
     played: Arc<AtomicU64>,
     ch: usize,
+    /// El flujo ha muerto (salida desconectada: auriculares Bluetooth, USB…).
+    dead: std::sync::atomic::AtomicBool,
+}
+
+extern "C" fn audio_err(_s: *mut c_void, user: *mut c_void, _err: c_int) {
+    // SAFETY: como en `audio_cb`. Aquí no se puede cerrar el flujo: lo hace el bucle al verlo muerto.
+    let st = unsafe { &*(user as *const CbState) };
+    st.dead.store(true, Ordering::Release);
 }
 
 extern "C" fn audio_cb(_s: *mut c_void, user: *mut c_void, data: *mut c_void, frames: i32) -> c_int {
     // SAFETY: `user` es el `CbState` que `Sink` mantiene vivo hasta cerrar el flujo.
     let st = unsafe { &*(user as *const CbState) };
+    // SAFETY: AAudio entrega `frames` fotogramas de `ch` muestras f32 (formato PCM_FLOAT pedido en
+    // `Sink::open` y canales comprobados) en `data`, válido durante la llamada.
     let out = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, frames.max(0) as usize * st.ch) };
     let mut n = 0;
     if let Ok(mut q) = st.ring.try_lock() {
@@ -134,11 +147,14 @@ pub struct Sink {
 impl Sink {
     /// `rate` 0 = la nativa del dispositivo.
     pub fn open(rate: u32, ch: usize, ring: Ring, played: Arc<AtomicU64>) -> Result<Sink, String> {
-        let mut state = Box::new(CbState { ring, played, ch });
+        let mut state = Box::new(CbState { ring, played, ch, dead: Default::default() });
+        // SAFETY: llamadas a AAudio con punteros que nos devuelve la propia AAudio (comprobados no
+        // nulos); `state` está en una caja que guarda `Sink`, así que el puntero del callback vive tanto
+        // como el flujo (se cierra en `Drop` antes de soltar la caja). En los errores se cierra el flujo.
         unsafe {
             let mut b = std::ptr::null_mut();
             if AAudio_createStreamBuilder(&mut b) != 0 || b.is_null() {
-                return Err("AAudio no disponible".into());
+                return Err(crate::i18n::t("AAudio no disponible").into());
             }
             AAudioStreamBuilder_setDirection(b, 0);
             AAudioStreamBuilder_setFormat(b, 2); // PCM_FLOAT
@@ -148,28 +164,36 @@ impl Sink {
             }
             AAudioStreamBuilder_setPerformanceMode(b, 10); // NONE: menos consumo
             AAudioStreamBuilder_setDataCallback(b, audio_cb, &mut *state as *mut CbState as *mut c_void);
+            AAudioStreamBuilder_setErrorCallback(b, audio_err, &mut *state as *mut CbState as *mut c_void);
             let mut s = std::ptr::null_mut();
             let r = AAudioStreamBuilder_openStream(b, &mut s);
             AAudioStreamBuilder_delete(b);
             if r != 0 || s.is_null() {
-                return Err(format!("no se pudo abrir la salida de audio ({r})"));
+                return Err(crate::i18n::tf("no se pudo abrir la salida de audio ({})", &[&r]));
             }
             let (rate, got_ch) = (AAudioStream_getSampleRate(s).max(1) as u32, AAudioStream_getChannelCount(s).max(1) as usize);
             if got_ch != ch {
                 AAudioStream_close(s);
-                return Err("canales de salida distintos a los pedidos".into());
+                return Err(crate::i18n::t("canales de salida distintos a los pedidos").into());
             }
             if AAudioStream_requestStart(s) != 0 {
                 AAudioStream_close(s);
-                return Err("no se pudo iniciar el audio".into());
+                return Err(crate::i18n::t("no se pudo iniciar el audio").into());
             }
             Ok(Sink { stream: s, _state: state, rate, ch })
         }
+    }
+
+    /// ¿Ha muerto el flujo? Hay que soltarlo y abrir otro (irá a la salida nueva).
+    pub fn dead(&self) -> bool {
+        self._state.dead.load(Ordering::Acquire)
     }
 }
 
 impl Drop for Sink {
     fn drop(&mut self) {
+        // SAFETY: `stream` es el flujo abierto en `open` y sólo se cierra aquí, una vez; tras cerrarlo
+        // AAudio ya no llama al callback, así que `_state` puede soltarse después.
         unsafe {
             AAudioStream_requestStop(self.stream);
             AAudioStream_close(self.stream);
@@ -184,6 +208,7 @@ impl Drop for Sink {
 struct Extractor(*mut c_void);
 impl Drop for Extractor {
     fn drop(&mut self) {
+        // SAFETY: extractor creado con AMediaExtractor_new (no nulo) y borrado sólo aquí.
         unsafe { AMediaExtractor_delete(self.0) };
     }
 }
@@ -191,6 +216,7 @@ impl Drop for Extractor {
 struct Codec(*mut c_void);
 impl Drop for Codec {
     fn drop(&mut self) {
+        // SAFETY: códec creado por AMediaCodec_createDecoderByType (no nulo) y borrado sólo aquí.
         unsafe {
             AMediaCodec_stop(self.0);
             AMediaCodec_delete(self.0);
@@ -201,6 +227,8 @@ impl Drop for Codec {
 struct Reader(*mut c_void);
 impl Drop for Reader {
     fn drop(&mut self) {
+        // SAFETY: lector creado por AImageReader_new (no nulo) y borrado sólo aquí, después del códec
+        // que escribe en su superficie (se declara antes en `run` y se suelta después).
         unsafe { AImageReader_delete(self.0) };
     }
 }
@@ -209,14 +237,17 @@ struct Fmt(*mut c_void);
 impl Fmt {
     fn i32(&self, k: &CStr) -> Option<i32> {
         let mut v = 0;
+        // SAFETY: formato válido (no nulo, de la NDK), clave terminada en NUL y salida local.
         unsafe { AMediaFormat_getInt32(self.0, k.as_ptr(), &mut v) }.then_some(v)
     }
     fn i64(&self, k: &CStr) -> Option<i64> {
         let mut v = 0;
+        // SAFETY: ídem.
         unsafe { AMediaFormat_getInt64(self.0, k.as_ptr(), &mut v) }.then_some(v)
     }
     fn string(&self, k: &CStr) -> Option<String> {
         let mut p = std::ptr::null();
+        // SAFETY: ídem; la cadena devuelta es del formato y vale mientras éste viva: se copia ya.
         if unsafe { AMediaFormat_getString(self.0, k.as_ptr(), &mut p) } && !p.is_null() {
             Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
         } else {
@@ -226,6 +257,7 @@ impl Fmt {
 }
 impl Drop for Fmt {
     fn drop(&mut self) {
+        // SAFETY: formato propio (de AMediaExtractor_getTrackFormat / AMediaCodec_getOutputFormat), no nulo, borrado sólo aquí.
         unsafe { AMediaFormat_delete(self.0) };
     }
 }
@@ -238,13 +270,16 @@ struct Track {
 
 fn open_extractor(file: &crate::vfs::fs::File) -> Result<(Extractor, Option<Track>, Option<Track>, i64), String> {
     let len = file.metadata().map_err(|e| e.to_string())?.len() as i64;
+    // SAFETY: el extractor se comprueba no nulo y se libera con `Extractor`; el descriptor es el de
+    // `file`, abierto mientras dure el extractor (quien llama mantiene `file` vivo); los índices de
+    // pista van de 0 a getTrackCount.
     unsafe {
         let ex = Extractor(AMediaExtractor_new());
         if ex.0.is_null() {
-            return Err("sin extractor de medios".into());
+            return Err(crate::i18n::t("sin extractor de medios").into());
         }
         if AMediaExtractor_setDataSourceFd(ex.0, file.as_raw_fd(), 0, len) != 0 {
-            return Err("formato no admitido por el sistema".into());
+            return Err(crate::i18n::t("formato no admitido por el sistema").into());
         }
         let (mut video, mut audio, mut dur) = (None, None, 0i64);
         for i in 0..AMediaExtractor_getTrackCount(ex.0) {
@@ -279,20 +314,25 @@ pub fn probe(path: &Path) -> Option<Info> {
 }
 
 fn make_codec(t: &Track, surface: *mut c_void) -> Result<Codec, String> {
+    // SAFETY: tipo MIME terminado en NUL, formato válido de la pista y superficie nula o la de un
+    // AImageReader vivo; el códec se libera con `Codec`.
     unsafe {
         let c = AMediaCodec_createDecoderByType(t.mime.as_ptr());
         if c.is_null() {
-            return Err(format!("el móvil no tiene decodificador para {}", t.mime.to_string_lossy()));
+            return Err(crate::i18n::tf("el móvil no tiene decodificador para {}", &[&t.mime.to_string_lossy()]));
         }
         let c = Codec(c);
         if AMediaCodec_configure(c.0, t.fmt.0, surface, std::ptr::null_mut(), 0) != 0 || AMediaCodec_start(c.0) != 0 {
-            return Err(format!("no se pudo iniciar el decodificador de {}", t.mime.to_string_lossy()));
+            return Err(crate::i18n::tf("no se pudo iniciar el decodificador de {}", &[&t.mime.to_string_lossy()]));
         }
         Ok(c)
     }
 }
 
 /// Convierte una imagen YUV_420_888 a RGBA reduciéndola a como mucho `max_w` de ancho.
+///
+/// # Safety
+/// `img` debe ser una AImage válida (adquirida y aún no borrada).
 unsafe fn image_to_rgba(img: *mut c_void, max_w: usize) -> Option<(usize, usize, Vec<u8>)> {
     unsafe {
         let (mut w, mut h) = (0i32, 0i32);
@@ -321,14 +361,21 @@ unsafe fn image_to_rgba(img: *mut c_void, max_w: usize) -> Option<(usize, usize,
 type Plane = (*mut u8, usize, usize, usize); // datos, longitud, bytes por fila, bytes por píxel
 
 /// YUV 4:2:0 (tres planos) a RGBA, reduciendo a como mucho `max_w` de ancho.
+///
+/// # Safety
+/// Cada plano debe apuntar a `longitud` bytes legibles (o tener longitud 0).
 unsafe fn convert(pl: [Plane; 3], w: usize, h: usize, max_w: usize) -> Option<(usize, usize, Vec<u8>)> {
+    // SAFETY: todas las lecturas están dentro de `longitud` por la comprobación `need` de abajo.
     unsafe {
         if w < 2 || h < 2 {
             return None;
         }
-        // que ningún acceso se salga del búfer
+        // que ningún acceso se salga del búfer (aritmética comprobada: en 32 bits los saltos de fila
+        // que declara el códec podrían desbordar)
         let (cw, ch) = (w / 2, h / 2);
-        let need = |p: usize, rows: usize, cols: usize| (rows - 1) * pl[p].2 + (cols - 1) * pl[p].3 < pl[p].1;
+        let need = |p: usize, rows: usize, cols: usize| {
+            (rows - 1).checked_mul(pl[p].2).zip((cols - 1).checked_mul(pl[p].3)).and_then(|(a, b)| a.checked_add(b)).is_some_and(|n| n < pl[p].1)
+        };
         if !need(0, h, w) || !need(1, ch, cw) || !need(2, ch, cw) {
             return None;
         }
@@ -358,7 +405,12 @@ unsafe fn convert(pl: [Plane; 3], w: usize, h: usize, max_w: usize) -> Option<(u
 
 /// Fotograma en un búfer de salida del códec (sin superficie): NV12 o I420 con el stride y las
 /// alturas que declara el formato de salida.
+///
+/// # Safety
+/// `p` debe apuntar a `len` bytes legibles (el búfer de salida del códec).
 unsafe fn buffer_to_rgba(p: *mut u8, len: usize, f: &Fmt, max_w: usize) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+    // SAFETY: los planos se construyen con `wrapping_add` (un desplazamiento fuera del búfer no es
+    // UB al calcularlo) y una longitud restante saturada, que `convert` respeta.
     unsafe {
         let w = f.i32(c"width").unwrap_or(0).max(0) as usize;
         let h = f.i32(c"height").unwrap_or(0).max(0) as usize;
@@ -374,21 +426,21 @@ unsafe fn buffer_to_rgba(p: *mut u8, len: usize, f: &Fmt, max_w: usize) -> Resul
             return Ok(None);
         }
         let ybase = stride * sh;
-        let y: Plane = (p.add(top * stride + left), len - (top * stride + left), stride, 1);
+        let y: Plane = (p.wrapping_add(top * stride + left), len - (top * stride + left), stride, 1);
         let (u, v): (Plane, Plane) = match cf {
             // semiplanar (NV12): UVUV…; 0x7F420888 («flexible») casi siempre llega así
             21 | 0x7F42_0888 => {
                 let (off, rs) = (ybase + (top / 2) * stride + (left / 2) * 2, stride);
-                ((p.add(off), len.saturating_sub(off), rs, 2), (p.add(off + 1), len.saturating_sub(off + 1), rs, 2))
+                ((p.wrapping_add(off), len.saturating_sub(off), rs, 2), (p.wrapping_add(off + 1), len.saturating_sub(off + 1), rs, 2))
             }
             // planar (I420)
             19 => {
                 let cs = stride / 2;
                 let uoff = ybase + (top / 2) * cs + left / 2;
                 let voff = ybase + cs * (sh / 2) + (top / 2) * cs + left / 2;
-                ((p.add(uoff), len.saturating_sub(uoff), cs, 1), (p.add(voff), len.saturating_sub(voff), cs, 1))
+                ((p.wrapping_add(uoff), len.saturating_sub(uoff), cs, 1), (p.wrapping_add(voff), len.saturating_sub(voff), cs, 1))
             }
-            other => return Err(format!("formato de color de vídeo no admitido ({other:#x})")),
+            other => return Err(crate::i18n::tf("formato de color de vídeo no admitido ({})", &[&format!("{other:#x}")])),
         };
         Ok(convert([y, u, v], cw, chh, max_w))
     }
@@ -432,8 +484,11 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
     let (ex, video, audio, _dur) = open_extractor(&file)?;
     let audio = if o.audio { audio } else { None };
     if video.is_none() && audio.is_none() {
-        return Err("sin pistas reproducibles".into());
+        return Err(crate::i18n::t("sin pistas reproducibles").into());
     }
+    // SAFETY: todos los objetos de la NDK se comprueban no nulos al crearse y los liberan sus
+    // envoltorios (`Extractor`, `Codec`, `Reader`, `Fmt`, `Sink`); los búferes de entrada y salida
+    // sólo se usan entre su obtención y su devolución al códec, con el tamaño que éste declara.
     unsafe {
         let mut reader = None;
         let mut vcodec = None;
@@ -442,7 +497,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             let w = v.fmt.i32(c"width").unwrap_or(0);
             let h = v.fmt.i32(c"height").unwrap_or(0);
             if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
-                return Err("tamaño de vídeo no válido".into());
+                return Err(crate::i18n::t("tamaño de vídeo no válido").into());
             }
             if o.bytes {
                 // salida en búfer: se pide un formato plano/semiplano de 8 bits
@@ -451,12 +506,12 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             } else {
                 let mut r = std::ptr::null_mut();
                 if AImageReader_new(w, h, YUV_420_888, 3, &mut r) != 0 || r.is_null() {
-                    return Err("no se pudo crear el lector de imágenes".into());
+                    return Err(crate::i18n::t("no se pudo crear el lector de imágenes").into());
                 }
                 let r = Reader(r);
                 let mut win = std::ptr::null_mut();
                 if AImageReader_getWindow(r.0, &mut win) != 0 || win.is_null() {
-                    return Err("sin superficie de salida".into());
+                    return Err(crate::i18n::t("sin superficie de salida").into());
                 }
                 vcodec = Some(make_codec(v, win)?);
                 reader = Some(r);
@@ -500,6 +555,21 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
 
         while alive() && !(v_done && a_done) {
             let mut busy = false;
+
+            // --- salida de sonido perdida (auriculares desconectados…): otra en la salida actual, con
+            // el mismo reloj (`played` sigue contando); si no se puede, el vídeo sigue mudo con reloj propio
+            if let Some(old) = sink.as_ref().filter(|s| s.dead()).map(|s| s.rate) {
+                let now = clock(&sink, &anchor);
+                sink = None;
+                match Sink::open(a_rate, a_ch, ring.clone(), played.clone()) {
+                    Ok(s) if s.rate == old => sink = Some(s),
+                    _ => {
+                        audio_off = true;
+                        a_done = true;
+                        anchor = Some((Instant::now(), now));
+                    }
+                }
+            }
 
             // --- entrada: la siguiente muestra va al códec de su pista
             for _ in 0..8 {
@@ -642,7 +712,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
                                 pending = Some((i as usize, info.pts, info));
                             }
                         } else if i != TRY_AGAIN && i != FORMAT_CHANGED && i != -3 {
-                            return Err(format!("error del decodificador de vídeo ({i})"));
+                            return Err(crate::i18n::tf("error del decodificador de vídeo ({})", &[&i]));
                         }
                     }
                     if let Some((i, pts, info)) = pending {
@@ -715,7 +785,7 @@ pub fn run(path: &Path, start_us: i64, o: &Opts, alive: &dyn Fn() -> bool, on_fr
             } else {
                 idle_rounds += 1;
                 if !o.realtime && idle_rounds > 1500 {
-                    return Err("tiempo agotado decodificando".into());
+                    return Err(crate::i18n::t("tiempo agotado decodificando").into());
                 }
                 crate::vfs::thread::sleep(Duration::from_millis(3));
             }

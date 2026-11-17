@@ -18,8 +18,21 @@ pub struct Tree {
     nodes: Vec<Node>,
 }
 
+/// Letras como mucho en el nombre y en el valor de una fila (se maquetan en cada fotograma).
+const MAX_LABEL: usize = 200;
+const MAX_VALUE: usize = 400;
+
+/// Recorta `s` a `max` letras, con «…» si sobra.
+fn clip(mut s: String, max: usize) -> String {
+    if let Some((k, _)) = s.char_indices().nth(max) {
+        s.truncate(k);
+        s.push('…');
+    }
+    s
+}
+
 fn add(nodes: &mut Vec<Node>, label: String, value: String, kind: u8) -> u32 {
-    nodes.push(Node { label, value, kids: Vec::new(), kind });
+    nodes.push(Node { label: clip(label, MAX_LABEL), value: clip(value, MAX_VALUE), kids: Vec::new(), kind });
     (nodes.len() - 1) as u32
 }
 
@@ -73,13 +86,23 @@ pub fn from_xml(text: &str) -> Option<Tree> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut stack: Vec<u32> = Vec::new();
     let mut roots = 0;
-    for tok in markup::tokens(text, false) {
+    for tok in markup::iter_tokens(text, false) {
         if nodes.len() >= MAX_NODES {
             break;
         }
         match tok {
             Tok::Open { name, attrs, empty } => {
-                let a: String = attrs.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect::<Vec<_>>().join("  ");
+                // sólo lo que se va a mostrar: miles de atributos no se juntan enteros
+                let mut a = String::new();
+                for (k, v) in &attrs {
+                    if a.len() > MAX_VALUE * 4 {
+                        break;
+                    }
+                    if !a.is_empty() {
+                        a.push_str("  ");
+                    }
+                    a.push_str(&format!("{k}=\"{}\"", clip(v.clone(), MAX_VALUE)));
+                }
                 let id = add(&mut nodes, name, a, 3);
                 match stack.last() {
                     Some(&p) => nodes[p as usize].kids.push(id),
@@ -113,12 +136,15 @@ pub struct TreeView {
     tree: Tree,
     open: std::collections::HashSet<u32>,
     rows: Vec<(u32, u16)>,
-    scroll: f32,
+    pub scroll: f32,
+    /// desplazamiento horizontal y ancho de la fila más larga dibujada
+    scroll_x: f32,
+    wide: f32,
 }
 
 impl TreeView {
     pub fn new(tree: Tree) -> TreeView {
-        let mut v = TreeView { tree, open: Default::default(), rows: Vec::new(), scroll: 0.0 };
+        let mut v = TreeView { tree, open: Default::default(), rows: Vec::new(), scroll: 0.0, scroll_x: 0.0, wide: 0.0 };
         v.open.insert(0);
         // los hijos directos de la raíz que son pequeños se abren
         let kids = v.tree.nodes.first().map(|n| n.kids.clone()).unwrap_or_default();
@@ -162,7 +188,9 @@ impl TreeView {
         self.scroll = 0.0;
     }
 
-    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, pointer: Option<egui::Pos2>, clicked: bool) {
+    /// `hot`: puntero encima; `active`: acepta el ratón; `keys`: el teclado es suyo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, pointer: Option<egui::Pos2>, clicked: bool, active: bool, keys: bool) {
         p.rect_filled(area, CornerRadius::same(10), pal.bg);
         let cp = p.with_clip_rect(area);
         // botones de expandir / contraer arriba a la derecha
@@ -183,7 +211,18 @@ impl TreeView {
         let top = area.top() + 40.0;
         let body = Rect::from_min_max(pos2(area.left(), top), area.max);
         let total = self.rows.len() as f32 * ROW_H + 12.0;
-        crate::rich::scroll_input(ctx, body, total, &mut self.scroll, hot);
+        crate::rich::scroll_input(ctx, body, total, &mut self.scroll, hot, keys);
+        // horizontal: rueda lateral, Mayús+rueda o dedo; el ancho es el de la fila más larga ya vista
+        if hot {
+            let dx = ctx.input(|i| {
+                let touch = cfg!(target_os = "android") || i.any_touches();
+                let drag = touch && i.pointer.primary_down() && !crate::preview::edge_start(i) && i.pointer.press_origin().is_some_and(|o| body.contains(o));
+                i.smooth_scroll_delta.x + if drag { i.pointer.delta().x } else { 0.0 }
+            });
+            self.scroll_x -= dx;
+        }
+        let max_x = (self.wide - body.width() + 24.0).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max_x);
         let first = (self.scroll / ROW_H) as usize;
         let n = (body.height() / ROW_H) as usize + 2;
         let mono = FontId::monospace(13.0);
@@ -191,8 +230,8 @@ impl TreeView {
         for (k, &(id, depth)) in self.rows.iter().enumerate().skip(first).take(n) {
             let y = top + 6.0 + k as f32 * ROW_H - self.scroll;
             let node = &self.tree.nodes[id as usize];
-            let x = area.left() + 14.0 + depth as f32 * 18.0;
-            let row = Rect::from_min_size(pos2(area.left() + 4.0, y), vec2(area.width() - 12.0, ROW_H));
+            let x = area.left() + 14.0 + depth as f32 * 18.0 - self.scroll_x;
+            let row = Rect::from_min_size(pos2(area.left() + 4.0, y), vec2(area.width() - 18.0, ROW_H));
             let over = pointer.map(|q| row.contains(q) && body.contains(q)).unwrap_or(false);
             if over {
                 cp.rect_filled(row, CornerRadius::same(5), pal.hover);
@@ -217,14 +256,15 @@ impl TreeView {
             }
             let col = match node.kind {
                 1 => pal.text,
-                2 => egui::Color32::from_rgb(214, 160, 90),
+                // ámbar del tema: se lee (≥ 4.5:1) también en el tema claro
+                2 => crate::theme::warn_color(pal),
                 _ => pal.subtle,
             };
             if !node.value.is_empty() {
-                let max = ((area.right() - tx - 20.0) / 7.8).max(4.0) as usize;
-                let v: String = if node.value.chars().count() > max { node.value.chars().take(max - 1).collect::<String>() + "…" } else { node.value.clone() };
-                cp.text(pos2(tx, mid), Align2::LEFT_CENTER, v, mono.clone(), col);
+                let r = cp.text(pos2(tx, mid), Align2::LEFT_CENTER, &node.value, mono.clone(), col);
+                tx = r.right();
             }
+            self.wide = self.wide.max(tx + self.scroll_x - area.left());
         }
         if let Some(id) = toggle {
             if !self.open.remove(&id) {
@@ -232,7 +272,11 @@ impl TreeView {
             }
             self.rebuild();
         }
-        crate::rich::scrollbar(&cp, body, total, self.scroll, pal);
+        crate::rich::scrollbar(ctx, &cp, body, total, &mut self.scroll, pal, active);
+        if max_x > 0.0 {
+            let track = Rect::from_min_max(pos2(body.left() + 8.0, body.bottom() - 11.0), pos2(body.right() - 16.0, body.bottom() - 1.0));
+            crate::rich::scrollbar_track(ctx, &cp, track, body.width() - 24.0, self.wide, &mut self.scroll_x, pal, active, false);
+        }
     }
 }
 
@@ -249,5 +293,16 @@ mod tests {
         assert_eq!(t.nodes[0].label, "r");
         assert_eq!(t.nodes[0].kids.len(), 2);
         assert_eq!(t.nodes[1].kids.len(), 1);
+    }
+
+    #[test]
+    fn labels_and_values_are_capped() {
+        let key = "k".repeat(100_000);
+        let t = from_json(&format!("{{\"{key}\": {}}}", "9".repeat(100_000))).unwrap();
+        assert!(t.nodes.iter().all(|n| n.label.chars().count() <= MAX_LABEL + 1 && n.value.chars().count() <= MAX_VALUE + 1));
+        let attrs: String = (0..5000).map(|i| format!(" a{i}=\"{}\"", "v".repeat(50))).collect();
+        let t = from_xml(&format!("<{key}{attrs}/>")).unwrap();
+        assert!(t.nodes[0].label.chars().count() <= MAX_LABEL + 1);
+        assert!(t.nodes[0].value.chars().count() <= MAX_VALUE + 1);
     }
 }

@@ -337,6 +337,10 @@ pub(crate) fn collapse(s: &str, after_space: &mut bool) -> String {
     out
 }
 
+/// Most times a letter label repeats its letter ("aaa..."): past it the
+/// number is written in digits.
+pub(crate) const MAX_LETTER_REPEAT: u32 = 64;
+
 /// A list number in an OpenDocument number format ("1", "a", "I"...).
 pub(crate) fn number(n: i32, fmt: &str) -> String {
     let n = n.max(0);
@@ -346,6 +350,10 @@ pub(crate) fn number(n: i32, fmt: &str) -> String {
                 return "0".into();
             }
             let i = (n - 1) as u32;
+            // Huge numbers (from the file) as digits, not megabytes of letters.
+            if i / 26 >= MAX_LETTER_REPEAT {
+                return n.to_string();
+            }
             let c = (b'a' + (i % 26) as u8) as char;
             let s = c.to_string().repeat((i / 26) as usize + 1);
             if fmt == "A" { s.to_uppercase() } else { s }
@@ -470,5 +478,41 @@ mod tests {
         assert_eq!(number(28, "a"), "bb");
         let mut sp = false;
         assert_eq!(collapse("a  \n b", &mut sp), "a b");
+    }
+
+    /// An OpenDocument package of type `kind` with `body` in its content.
+    fn package(kind: &str, body: &str) -> Vec<u8> {
+        let content = format!(r#"<office:document-content><office:automatic-styles><style:style style:name="P1" style:family="paragraph"><style:paragraph-properties/></style:style><text:list-style style:name="L1"><text:list-level-style-number text:level="1" style:num-format="a"/></text:list-style></office:automatic-styles><office:body>{body}</office:body></office:document-content>"#);
+        crate::ooxml::stored_zip(&[("mimetype", format!("application/vnd.oasis.opendocument.{kind}").as_bytes()), ("content.xml", content.as_bytes())])
+    }
+
+    fn open(data: Vec<u8>) {
+        let mut d = crate::Document::open_with(data, crate::Limits::default(), crate::Fonts::none()).unwrap();
+        d.page_size(0).unwrap();
+        d.render_page(0, 64, &|| false).unwrap();
+    }
+
+    #[test]
+    fn huge_list_numbers() {
+        assert_eq!(number(i32::MAX, "a"), i32::MAX.to_string());
+        assert_eq!(number(26 * 64, "A").len(), 64);
+        let start = r#"<text:list text:style-name="L1"><text:list-item text:start-value="2147483647"><text:p>a</text:p></text:list-item><text:list-item><text:p>b</text:p></text:list-item><text:list-item><text:p>c</text:p></text:list-item></text:list>"#;
+        open(package("text", &format!("<office:text>{start}</office:text>")));
+    }
+
+    #[test]
+    fn repeated_rows_and_cells_stay_bounded() {
+        // A table of repeated cells holding a table of repeated cells, and so on.
+        let mut t = String::from("<text:p>x</text:p>");
+        for _ in 0..6 {
+            t = format!(r#"<table:table><table:table-row table:number-rows-repeated="100"><table:table-cell table:number-columns-repeated="64">{t}</table:table-cell></table:table-row></table:table>"#);
+        }
+        let t0 = std::time::Instant::now();
+        open(package("text", &format!("<office:text>{t}</office:text>")));
+        assert!(t0.elapsed().as_secs() < 60);
+        // A sheet whose rows repeat a long text.
+        let long = "z".repeat(1 << 20);
+        let sheet = format!(r#"<office:spreadsheet><table:table><table:table-row table:number-rows-repeated="1000"><table:table-cell table:number-columns-repeated="16384" office:value-type="string"><text:p>{long}</text:p></table:table-cell></table:table-row><table:table-row table:number-rows-repeated="4294967295"/><table:table-row/></table:table></office:spreadsheet>"#);
+        open(package("spreadsheet", &sheet));
     }
 }

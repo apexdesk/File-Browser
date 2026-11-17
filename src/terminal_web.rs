@@ -11,7 +11,7 @@ pub fn default_shell() -> String {
 
 impl Terminal {
     pub fn spawn(_ctx: &egui::Context, _cwd: &Path, _shell: &str) -> Result<Terminal, String> {
-        Err("no disponible en la web".into())
+        Err(crate::i18n::t("no disponible en la web").into())
     }
 
     pub fn alive(&self) -> bool {
@@ -20,5 +20,5 @@ impl Terminal {
 
     pub fn send(&mut self, _bytes: &[u8]) {}
 
-    pub fn show(&mut self, _ui: &mut egui::Ui, _rect: Rect, _pal: &Pal, _focused: bool) {}
+    pub fn show(&mut self, _ui: &mut egui::Ui, _rect: Rect, _resp: &egui::Response, _pal: &Pal, _focused: bool) {}
 }

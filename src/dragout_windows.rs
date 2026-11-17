@@ -35,6 +35,8 @@ pub struct Imp {
 
 impl Imp {
     pub fn new(_: &eframe::Frame, _: &egui::Context) -> Option<Imp> {
+        // SAFETY: OleInitialize sin reservado; en el hilo de la interfaz (STA). Si ya estaba iniciado
+        // devuelve S_FALSE y no pasa nada.
         unsafe {
             let _ = OleInitialize(None);
         }
@@ -58,6 +60,9 @@ impl Imp {
     /// Bloquea hasta que termina el arrastre (bucle modal de OLE).
     pub fn start(&mut self, paths: &[PathBuf]) -> bool {
         use std::os::windows::ffi::OsStrExt;
+        // SAFETY: cadenas anchas terminadas en NUL que viven durante la llamada; cada PIDL no nulo de
+        // SHParseDisplayName se libera una vez con ILFree después de DoDragDrop (SHCreateDataObject
+        // copia los que necesita); DoDragDrop corre en este hilo, iniciado con OLE en `new`.
         unsafe {
             let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
             for p in paths {

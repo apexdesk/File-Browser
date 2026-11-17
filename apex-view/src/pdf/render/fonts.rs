@@ -432,7 +432,7 @@ impl Glyphs {
             && self.name(code).is_none()
         {
             for base in [0, 0xF000, 0xF100, 0xF200] {
-                if let Some(g) = found(map_cp(s, base + code)) {
+                if let Some(g) = found(map_cp(s, code.wrapping_add(base))) {
                     return Some(g);
                 }
             }
@@ -464,7 +464,7 @@ impl Glyphs {
         }
         if let Some(s) = &sym {
             for base in [0xF000, 0] {
-                if let Some(g) = found(map_cp(s, base + code)) {
+                if let Some(g) = found(map_cp(s, code.wrapping_add(base))) {
                     return Some(g);
                 }
             }

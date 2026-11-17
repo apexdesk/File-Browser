@@ -58,6 +58,8 @@ mod typeset;
 mod xlsx;
 #[cfg(feature = "pdf")]
 mod pdf;
+#[cfg(all(test, feature = "pdf", feature = "rtf", feature = "docx", feature = "xlsx"))]
+mod robust_tests;
 
 use std::path::Path;
 

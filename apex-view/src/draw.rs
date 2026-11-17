@@ -225,3 +225,29 @@ pub(crate) fn tidy(p: BezPath) -> BezPath {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_items_draw_without_panic() {
+        let mut items = Vec::new();
+        for v in [f32::NAN, f32::INFINITY, -f32::INFINITY, 1e30, -1e30, 0.0, 1e-30] {
+            items.push(Item::Rect { x: v, y: 1.0, w: v, h: 5.0, color: Rgba::BLACK });
+            items.push(Item::Line { x0: 0.0, y0: v, x1: v, y1: 3.0, width: v, color: Rgba::BLACK });
+            items.push(Item::Clip { x: v, y: v, w: 10.0, h: v });
+            items.push(Item::Image { x: v, y: 0.0, w: v, h: 1.0, key: Arc::from("a") });
+            items.push(Item::Unclip);
+        }
+        for _ in 0..100 {
+            items.push(Item::Clip { x: 0.0, y: 0.0, w: 10.0, h: 10.0 });
+        }
+        let mut fonts = FontCache::new(crate::Fonts::none());
+        let pic = pixmap(2, 2, &[255; 16]);
+        for (w, h) in [(100.0, 100.0), (f32::NAN, f32::NAN), (0.0, 1e30), (1e-30, 1.0)] {
+            let page = Page { width: w, height: h, background: None, items: items.clone(), text: Vec::new() };
+            let _ = render(&page, 64, &mut fonts, &mut |_| pic.clone(), &crate::Limits::default(), &|| false);
+        }
+    }
+}

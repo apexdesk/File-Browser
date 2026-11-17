@@ -200,7 +200,8 @@ fn gps(v: &[(u32, u32)], r: &str) -> Option<String> {
 /// Datos de la toma como pares (etiqueta, valor), ya traducidos.
 pub fn summary(path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(mut f) = crate::vfs::fs::File::open(path) else { return out };
+    // sólo archivos normales: un FIFO dejaría bloqueado el hilo
+    let Some(mut f) = crate::thumbs::open_regular(path) else { return out };
     let Some(base) = tiff_base(path, &mut f) else { return out };
     let Some(mut tf) = Tiff::new(f, base) else { return out };
     let Some(first) = tf.first_ifd() else { return out };

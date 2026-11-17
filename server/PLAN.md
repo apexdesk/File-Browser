@@ -22,7 +22,7 @@ sin panel de administración.
 ```
 filebrowser-server ~/Documentos ~/Fotos        # comparte esas carpetas
 filebrowser-server --port 8080 --bind 0.0.0.0  # por defecto: 127.0.0.1 y puerto aleatorio
-filebrowser-server --ttl 2h --read-only        # caduca; solo lectura (modo por defecto)
+filebrowser-server --ttl 2h ~/Fotos            # caduca a las 2 h; solo lectura (modo por defecto)
 ```
 Al arrancar imprime una URL con token: `http://192.168.1.20:41873/s/<token>/` y un QR en terminal.
 Ctrl+C la invalida. El token no se guarda en disco.
@@ -36,16 +36,17 @@ Ctrl+C la invalida. El token no se guarda en disco.
    componente simbólico cuando se pueda (`O_NOFOLLOW`).
 3. **Solo ficheros regulares y directorios**: nada de dispositivos, FIFOs ni sockets.
 4. **Límites**: máx. conexiones simultáneas, cabeceras ≤ 8 KiB, timeout de lectura/escritura,
-   máx. entradas por listado, sin `Transfer-Encoding` raro, solo GET/HEAD.
+   máx. entradas y bytes por listado, sin `Transfer-Encoding`, solo GET/HEAD (PUT/POST solo con `--write`).
 5. **Cabeceras**: `Content-Security-Policy` estricta, `X-Content-Type-Options: nosniff`,
    `Content-Disposition: attachment` por defecto (previsualización inline solo de imágenes/vídeo/PDF
    con tipos MIME de una lista cerrada; SVG y HTML siempre como descarga).
 6. **Escape de HTML** en nombres de archivo en el listado; nombres con saltos de línea o control, saneados.
-7. **Red**: por defecto solo `127.0.0.1`. `--bind` explícito para LAN, con aviso de que no hay HTTPS.
-   Opción posterior: HTTPS con certificado propio generado (rustls) y huella impresa en consola.
+7. **Red**: por defecto solo `127.0.0.1`. `--bind` explícito para LAN, con aviso si no se usa `--tls`
+   (HTTPS con certificado propio generado con rustls y huella impresa en consola, ver M3).
 8. **Sin ejecución**: ningún endpoint lanza procesos. Miniaturas solo con decodificadores acotados
    (los mismos topes de píxeles/memoria ya auditados en el gestor).
-9. **Privilegios**: se niega a arrancar como root/Administrador salvo `--i-know`.
+9. **Privilegios**: se niega a arrancar como root (Unix) o como administrador elevado (Windows, token con
+   elevación) salvo `--i-know`.
 
 ## Funciones v1
 - Listado de directorio (HTML sin JS obligatorio, ordenable, responsive).
@@ -72,8 +73,14 @@ Ctrl+C la invalida. El token no se guarda en disco.
 
 ## Distribución
 - Artefacto separado: `filebrowser-server-{linux,windows,macos}` (perfil de release propio del crate); objetivo < 2 MB (`opt-level="z"`, LTO, strip).
-- Pruebas: unitarias de `jail` (traversal, simbólicos, codificaciones dobles, Unicode, Windows `\\?\`),
-  fuzz de parseo de petición y de rutas, prueba de integración con `curl`.
+- Pruebas (`cargo test -p filebrowser-server`): unitarias de `jail` (traversal, simbólicos, codificaciones dobles,
+  Unicode), del analizador HTTP, rangos, ZIP (leído con la crate `zip`) y HTML; de extremo a extremo en `e2e.rs` y
+  `write.rs`, con el servidor real en 127.0.0.1 y puerto efímero dentro del proceso de pruebas (listado, descarga,
+  rangos, 304, ZIP, búsqueda, token en todas las rutas, Basic y bloqueo, escritura, ocultos, árboles profundos,
+  conexiones mudas y HTTPS con la huella fijada); y una prueba de humo del analizador con 30 000 mutaciones
+  deterministas (semilla fija, sin dependencias) más 300 peticiones mutadas contra el servidor vivo.
+  **No hay** fuzzing guiado por cobertura (cargo-fuzz) ni pruebas con `curl`; las pruebas propias de Windows
+  (nombres 8.3, uniones, `MoveFileEx`) solo se comprueban compilando (`cargo xwin check`), no se ejecutan aquí.
 
 ## Estado y hitos
 - **M0 (hecho)** crate `server/`, `jail` con tests (traversal, `%2e%2e`, doble codificación, enlaces que salen o apuntan a ocultos,
@@ -89,7 +96,8 @@ Ctrl+C la invalida. El token no se guarda en disco.
   Entrada **«Compartir esta carpeta…»** en el gestor (menú contextual y menú principal; no en Android): solo busca
   `filebrowser-server` junto al gestor o en el PATH y lo ejecuta a la vista en el terminal integrado (consola nueva en Windows) con
   `--bind 0.0.0.0 --ttl 2h`. El gestor no enlaza código de red; sin el servidor instalado muestra un aviso.
-- **Auditoría (hecha, 3 agentes a ciegas: rutas/HTTP, DoS/ZIP/TLS, HTML/cabeceras).** Sin lectura fuera de la raíz ni caídas.
+- **Auditoría (hecha, 3 agentes a ciegas: rutas/HTTP, DoS/ZIP/TLS, HTML/cabeceras).** Sin lectura fuera de la raíz ni caídas
+  en el modo de solo lectura (con `--write`, la auditoría de 2026 encontró una: ver más abajo).
   Corregido: plazo total para handshake TLS y cabeceras (antes un byte cada pocos segundos retenía el hilo), IPv6 agrupada por /64 en
   los límites, `O_NOFOLLOW` al abrir archivos y ZIP (carrera con enlaces), rechazo de marcas bidi/ancho cero en nombres, cabeceras con
   espacio antes de `:` (400), nombres reservados de Windows con espacio final y `COM¹²³`.
@@ -116,7 +124,8 @@ Ctrl+C la invalida. El token no se guarda en disco.
 - **Auditoría web (hecha, 3 agentes a ciegas: rutas y escritura, HTTP/auth/DoS, navegador y contenido).** Sin salida de las raíces,
   sin XSS, sin ejecución de contenido activo, sin saltos de autenticación ni de CSRF.
   Corregido: `PUT` sin `Content-Length` vaciaba el archivo (ahora 411); con `--tls` una conexión muda retenía un hilo para siempre (la
-  respuesta de error tiene plazo); el bloqueo por IP ya no deja fuera a quien trae el enlace correcto (y la contraseña, si la hay);
+  respuesta de error tiene plazo); el bloqueo por IP ya no deja fuera a quien trae el enlace correcto (con contraseña, esto convertía el
+  bloqueo en un oráculo: rehecho en la auditoría 2026, ver abajo);
   `mv` ya no pisa un archivo distinto que solo difiere en mayúsculas; `rmrf`/`mv` de carpetas se niegan (409) si arrastrarían contenido
   oculto; las raíces anidadas no se pueden borrar ni mover desde la exterior; `cp` respeta `--max-upload`; barrido al arrancar de los
   `.fbtmp-*` huérfanos de más de una hora; un `PUT` que reemplaza conserva los permisos; cabeceras repetidas (`Content-Length`, `Host`,
@@ -129,6 +138,40 @@ Ctrl+C la invalida. El token no se guarda en disco.
   sin `sandbox` (lo contiene el visor del navegador); `filebrowser.config` en `localStorage` se comparte por `host:puerto` (el token
   cambia en cada arranque, así que no puede ser parte de la clave sin perder la persistencia); el token vive en la URL; el mapa del
   limitador se vacía al superar 4096 IPs; el 503 por exceso de conexiones va en claro aunque haya `--tls`.
+
+- **Auditoría 2026 (hecha).** Sin salida de la jaula, salto de autenticación, XSS ni pánico alcanzable por red. Corregido:
+  - **Bloqueo por IP ineficaz con contraseña:** con la IP bloqueada se seguía comprobando la contraseña y se dejaba pasar la buena,
+    así que el bloqueo no frenaba a nadie (era un oráculo). Ahora, bloqueado, la contraseña no se evalúa y la respuesta es siempre
+    el mismo 429 (`Retry-After`). Solo se libra del bloqueo un navegador que ya se autenticó: recibe entonces una cookie de sesión
+    aleatoria de 128 bits (`HttpOnly`, `SameSite=Lax`, `Path=/s/<tok>/`, `Secure` con `--tls`) que no sustituye a la contraseña, solo
+    exime del bloqueo; si pierde las credenciales recibe 401 para volver a pedirlas. Además hay un tope global de 100 contraseñas
+    fallidas por minuto sumando todas las IPs. Sin `--user`, el token (128 bits) correcto sigue entrando con la IP bloqueada.
+  - **(Windows, `--write`)** los nombres cortos 8.3 (`GIT~1`, `ENV~1`) se saltaban el filtro de ocultos en `PUT`/`mv`/`rm`: si un
+    nombre con `~` existe y su nombre largo real (GetFinalPathNameByHandle) es otro, 403.
+  - **(`--write`)** la comprobación de ocultos antes de `rmrf`/`mv` era recursiva en la pila de 512 KiB del manejador y daba «nada
+    oculto» si una carpeta no se podía leer: ahora es iterativa, con topes (1 000 000 entradas, 1024 niveles) y ante la duda niega
+    (409); `remove_dir_all` corre en un hilo con pila de 64 MiB.
+  - Huecos de conexión: el plazo de handshake + cabeceras baja a 5 s y, con todos los huecos ocupados, la conexión sin autenticar
+    más antigua (≥ 1 s) se corta para dejar entrar a la nueva; las ya autenticadas no se tocan.
+  - `mv` nunca pisa: Windows con `MoveFileEx` sin reemplazo e identidad de archivo real (antes «mismo archivo» era siempre sí);
+    Linux con `renameat2(RENAME_NOREPLACE)`; otros Unix, comprobación previa por dev/ino.
+  - Listados HTML/JSON y búsqueda con tope de 4 MiB (antes 20 000 filas sin tope de bytes).
+  - Windows: negativa a correr elevado (salvo `--i-know`), contraseña sin eco en la consola, apertura sin seguir enlaces/uniones
+    (`FILE_FLAG_OPEN_REPARSE_POINT`; los demás puntos de análisis, p. ej. OneDrive, se reabren y se exige el mismo identificador).
+  - Raíces llamadas `app` o `api` (tapadas por las rutas propias) se renombran a `app-2`/`api-2`.
+  - La guarda de raíces anidadas compara también la identidad de archivo (sistemas sin distinción de mayúsculas, nombres cortos).
+  - Al caducar `--ttl` se borran los temporales de las subidas en curso; el barrido al arrancar solo toca nombres exactos
+    `.fbtmp-` + 16 hex.
+  - `FB_PASSWORD` se borra del entorno tras leerla (en Linux también se sobrescribe en el bloque que muestra `/proc/<pid>/environ`).
+  - `--ttl` con un sufijo de varios bytes ya no provoca pánico; la ayuda ya no dice «No hay HTTPS».
+  **Evaluado y no hecho: lista de `Host` permitidos (DNS rebinding).** Un sitio que rebinde su nombre a la IP del servidor solo
+  obtiene el mismo origen que un desconocido: sin el token de la ruta todo es 404 (y con `--user`, además, 401/429), y las escrituras
+  piden `X-FB` + `Origin` = `Host`, que tampoco sirven sin token. Una lista cerrada (IPs + `localhost`) rompería el acceso por nombre
+  en la LAN (`pc.local`, nombres de Tailscale) sin cerrar nada que el token no cierre ya; con `--tls` un nombre ajeno además da error
+  de certificado.
+  **Aceptado:** con `--user` y la IP o el total bloqueados, un navegador nuevo (sin cookie) espera hasta un minuto; la cookie de sesión
+  no caduca hasta 24 h o hasta reiniciar el servidor; Ctrl+C (sin `--ttl`) puede dejar `.fbtmp-*`, que barre el siguiente arranque con
+  `--write` pasada una hora.
 
 ## Decisiones abiertas
 - ~~`tiny_http` o servidor propio~~: resuelto, servidor propio sobre `std::net` (sin dependencias de red, ~400 líneas de HTTP/enrutado a auditar).

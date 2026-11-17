@@ -1,5 +1,6 @@
 //! Iconos del sistema: tema de iconos freedesktop en Linux, Shell (SHGetFileInfo / lista de imágenes)
-//! en Windows. En otras plataformas devuelve `None` y se usan los iconos vectoriales propios.
+//! en Windows, NSWorkspace (sólo iconos por ruta) en macOS. En otras plataformas devuelve `None` y se
+//! usan los iconos vectoriales propios.
 #[allow(unused_imports)]
 use crate::vfs::{KindV as _, PathV as _};
 use crate::thumbs::Decoded;
@@ -10,7 +11,7 @@ pub struct SysIcons {
     cache: HashMap<String, Option<TextureHandle>>,
     budget: u32,
     /// Iconos propios de cada archivo (.exe, .lnk, discos…): los resuelve un hilo aparte (Windows).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     by_path: Option<PathIcons>,
     /// El tema de iconos se carga en segundo plano para no retrasar el arranque.
     #[cfg(target_os = "linux")]
@@ -24,7 +25,7 @@ impl SysIcons {
         SysIcons {
             cache: HashMap::new(),
             budget: 0,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             by_path: None,
             #[cfg(target_os = "linux")]
             lin: None,
@@ -54,7 +55,9 @@ impl SysIcons {
                         ctx.request_repaint_after(std::time::Duration::from_millis(20));
                         return false;
                     }
-                    _ => return false,
+                    // el hilo del tema terminó sin resultado (pánico): listo, sin iconos del tema
+                    // (si no, «Icono del tema…» esperaría para siempre redibujando)
+                    _ => self.lin_rx = None,
                 }
             }
         }
@@ -115,16 +118,62 @@ impl SysIcons {
         self.upload(ctx, key, d)
     }
 
-    /// Icono propio de un archivo o unidad (el del programa al que apunta un acceso directo, el de un disco…).
-    /// Se resuelve en segundo plano; mientras tanto (y fuera de Windows) devuelve `None`.
+    /// Icono propio de un archivo o unidad (el del programa al que apunta un acceso directo, el de un disco,
+    /// el de una carpeta con icono personalizado…). Se resuelve en segundo plano; mientras tanto (y fuera
+    /// de Windows y macOS) devuelve `None`.
     #[allow(unused_variables)]
     pub fn for_path(&mut self, ctx: &Context, path: &std::path::Path) -> Option<TextureId> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             return self.by_path.get_or_insert_with(PathIcons::new).get(ctx, path);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         None
+    }
+
+    /// Icono del tema por nombre (el primero de `names` que exista), p. ej. el `custom-icon-name`
+    /// que GNOME guarda para una carpeta. Fuera de Linux, `None`.
+    #[allow(unused_variables)]
+    pub fn named(&mut self, ctx: &Context, names: &[&str]) -> Option<TextureId> {
+        let key = format!("name:{}", names.first()?);
+        if let Some(t) = self.cache.get(&key) {
+            return t.as_ref().map(|t| t.id());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !self.ready(ctx) {
+                return None;
+            }
+            if self.budget == 0 {
+                ctx.request_repaint();
+                return None;
+            }
+            self.budget -= 1;
+            if self.cache.len() > 4000 {
+                self.cache.retain(|k, _| !k.starts_with("name:"));
+            }
+            let d = self.lin.as_mut()?.load_any(names);
+            return self.upload(ctx, key, d);
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
+    /// Carpetas del tema actual (y los que hereda) con iconos de lugares y carpetas, para buscar
+    /// «Icono del tema…». `None` mientras se carga el tema; vacío fuera de Linux.
+    pub fn theme_dirs(&mut self, ctx: &Context) -> Option<Vec<std::path::PathBuf>> {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.ready(ctx) {
+                return None;
+            }
+            return Some(self.lin.as_ref().map(|l| l.place_dirs()).unwrap_or_default());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ctx;
+            Some(Vec::new())
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -137,6 +186,9 @@ impl SysIcons {
             Some("videos") => &["folder-videos", "folder"],
             Some("desktop") => &["user-desktop", "folder"],
             Some("home") => &["user-home", "folder"],
+            Some("projects") => &["folder-projects", "folder-development", "folder-code", "folder"],
+            Some("templates") => &["folder-templates", "folder"],
+            Some("publicshare") => &["folder-publicshare", "folder-public", "folder"],
             Some("drive") => &["drive-harddisk", "drive-removable-media", "folder"],
             _ => &["folder"],
         };
@@ -169,7 +221,7 @@ impl SysIcons {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct PathIcons {
     tx: std::sync::mpsc::Sender<String>,
     rx: std::sync::mpsc::Receiver<(String, Option<Decoded>)>,
@@ -177,18 +229,23 @@ struct PathIcons {
     pending: std::collections::HashSet<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl PathIcons {
     fn new() -> PathIcons {
         let (tx, req) = std::sync::mpsc::channel::<String>();
         let (res_tx, rx) = std::sync::mpsc::channel();
         crate::vfs::thread::spawn(move || {
             // el shell necesita COM en el hilo que pide los iconos
+            // SAFETY: se inicializa COM una vez en este hilo propio, que vive hasta el final.
+            #[cfg(windows)]
             unsafe {
                 let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
             }
             while let Ok(p) = req.recv() {
+                #[cfg(windows)]
                 let d = win::icon_for_path(&p);
+                #[cfg(target_os = "macos")]
+                let d = crate::thumbs::guarded(|| mac::icon_for_path(&p)).flatten();
                 if res_tx.send((p, d)).is_err() {
                     break;
                 }
@@ -462,6 +519,19 @@ mod linux {
             res
         }
 
+        /// Carpetas no simbólicas de «places» (iconos de carpetas), del tema y los que hereda.
+        pub fn place_dirs(&self) -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = Vec::new();
+            for t in &self.themes {
+                for d in t {
+                    if !d.symbolic && d.path.components().any(|c| c.as_os_str() == "places") && !v.contains(&d.path) {
+                        v.push(d.path.clone());
+                    }
+                }
+            }
+            v
+        }
+
         pub fn load_any(&mut self, names: &[&str]) -> Option<Decoded> {
             for n in names {
                 if let Some(p) = self.find(n, 96) {
@@ -472,6 +542,38 @@ mod linux {
             }
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS: icono que el Finder muestra para una ruta (también el personalizado de una carpeta).
+// No se puede compilar en Linux: está escrito para objc2 0.5 / objc2-app-kit 0.2 sin probar.
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::Decoded;
+    use objc2_app_kit::{NSImage, NSWorkspace};
+    use objc2_foundation::{NSSize, NSString};
+
+    pub fn icon_for_path(path: &str) -> Option<Decoded> {
+        objc2::rc::autoreleasepool(|_| {
+            #[allow(unused_unsafe)]
+            // SAFETY: llamadas de AppKit seguras en cualquier hilo (NSWorkspace e NSImage lo son);
+            // los objetos devueltos son `Retained` y se liberan solos.
+            let bytes: Vec<u8> = unsafe {
+                let ws = NSWorkspace::sharedWorkspace();
+                let img: objc2::rc::Retained<NSImage> = ws.iconForFile(&NSString::from_str(path));
+                img.setSize(NSSize::new(128.0, 128.0));
+                let tiff = img.TIFFRepresentation()?;
+                tiff.bytes().to_vec()
+            };
+            if bytes.len() > 64 << 20 {
+                return None;
+            }
+            let im = image::load_from_memory(&bytes).ok()?;
+            let im = if im.width() > 128 || im.height() > 128 { im.thumbnail(128, 128) } else { im };
+            let rgba = im.into_rgba8();
+            Some(Decoded { w: rgba.width() as usize, h: rgba.height() as usize, rgba: rgba.into_raw() })
+        })
     }
 }
 
@@ -548,6 +650,8 @@ mod win {
     const SHGFI_USEFILEATTRIBUTES: u32 = 0x10;
 
     unsafe fn hicon_to_rgba(icon: isize) -> Option<Decoded> {
+        // SAFETY: `icon` es un HICON válido del llamante; GetIconInfo crea dos mapas de bits que se
+        // borran aquí; `buf` tiene w*h*4 bytes, justo lo que GetDIBits escribe a 32 bpp.
         unsafe {
             let mut ii = IconInfo { is_icon: 0, xh: 0, yh: 0, mask: 0, color: 0 };
             if GetIconInfo(icon, &mut ii) == 0 {
@@ -605,6 +709,8 @@ mod win {
     }
 
     fn icon_query(name: &str, attrs: u32, extra: u32) -> Option<Decoded> {
+        // SAFETY: `wide` termina en NUL y vive durante las llamadas; las estructuras son #[repr(C)] con
+        // la disposición de SHFILEINFOW; cada HICON obtenido se destruye una sola vez.
         unsafe {
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
             let mut fi: ShFileInfoW = std::mem::zeroed();
@@ -623,17 +729,24 @@ mod win {
                     // SHIL_JUMBO (256) y SHIL_EXTRALARGE (48)
                     let mut il: *mut c_void = std::ptr::null_mut();
                     if SHGetImageList(list, &iid, &mut il) == 0 && !il.is_null() {
-                        // IImageList::GetIcon es el método nº 10 de la vtable.
+                        // SAFETY: `il` es un IImageList válido (S_OK y no nulo) con una referencia nuestra;
+                        // su vtable empieza por IUnknown (Release = nº 2) y GetIcon es el método nº 10.
                         let vtbl = *(il as *mut *const usize);
                         let get_icon: unsafe extern "system" fn(*mut c_void, i32, u32, *mut isize) -> i32 =
                             std::mem::transmute(*vtbl.add(10));
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
                         let mut hicon: isize = 0;
-                        if get_icon(il, fi.index, 0, &mut hicon) == 0 && hicon != 0 {
+                        let d = if get_icon(il, fi.index, 0, &mut hicon) == 0 && hicon != 0 {
                             let d = hicon_to_rgba(hicon);
                             DestroyIcon(hicon);
-                            if d.is_some() {
-                                return d;
-                            }
+                            d
+                        } else {
+                            None
+                        };
+                        // SHGetImageList entrega la interfaz con una referencia que hay que soltar
+                        release(il);
+                        if d.is_some() {
+                            return d;
                         }
                     }
                 }

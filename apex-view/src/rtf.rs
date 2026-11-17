@@ -24,6 +24,12 @@ const MAX_FONTS: usize = 4096;
 const MAX_COLORS: usize = 4096;
 const MAX_CELLS: usize = 256;
 const MAX_SECTIONS: usize = 10_000;
+/// Cell definitions all the rows read may copy (`\row` repeated copies
+/// the row's up to `MAX_CELLS` definitions each time).
+const MAX_ROW_DEFS: usize = 1 << 20;
+/// Table edges (twips) kept within this: far past any page, and the
+/// differences between them fit an i32.
+const MAX_EDGE: i32 = 1 << 24;
 
 pub(crate) fn open(data: Vec<u8>, limits: &Limits, fonts: &Fonts) -> Result<Doc, Error> {
     let (model, blobs) = read(&data, limits)?;
@@ -200,6 +206,13 @@ struct RowDef {
     borders: [Border; 4],
 }
 
+impl RowDef {
+    /// The row's settings without its cells.
+    fn clone_head(&self) -> RowDef {
+        RowDef { cells: Vec::new(), left: self.left, align: self.align, height: self.height, header: self.header, gap: self.gap, borders: self.borders }
+    }
+}
+
 /// Where `\brdrw`, `\brdrcf` and `\brdrnone` go: a cell's or a row's side.
 #[derive(Clone, Copy)]
 enum Edge {
@@ -298,6 +311,8 @@ struct Reader {
     blobs: HashMap<Arc<str>, Vec<u8>>,
     blob_bytes: u64,
     blocks: usize,
+    /// Cell definitions rows may still copy.
+    row_defs_left: usize,
     style: Option<(Chr, Arc<Style>)>,
     max_part: u64,
     max_total: u64,
@@ -622,11 +637,25 @@ impl Reader {
         }
     }
 
+    /// The current row's definition for a row read, its cells' within
+    /// what rows may still copy (past that, the cells an inch each).
+    fn row_def(&mut self) -> RowDef {
+        let n = self.row.cells.len();
+        match self.row_defs_left.checked_sub(n) {
+            Some(left) => {
+                self.row_defs_left = left;
+                self.row.clone()
+            }
+            None => self.row.clone_head(),
+        }
+    }
+
     /// Turns the rows read into a table.
     fn flush_table(&mut self) {
-        let row = self.row.clone();
         let story = self.story();
         if !story.cells.is_empty() || !story.cell.is_empty() {
+            let row = self.row_def();
+            let story = self.story();
             // A row without `\row`.
             let mut cells = std::mem::take(&mut story.cells);
             if !story.cell.is_empty() {
@@ -634,6 +663,7 @@ impl Reader {
             }
             story.rows.push((row, cells));
         }
+        let story = self.story();
         if story.rows.is_empty() {
             return;
         }
@@ -646,7 +676,7 @@ impl Reader {
             edges.extend(d.cells.iter().map(|c| c.right));
         }
         edges.sort_unstable();
-        edges.dedup_by(|a, b| (*a - *b).abs() < 30);
+        edges.dedup_by(|a, b| a.abs_diff(*b) < 30);
         if edges.len() < 2 {
             let n = rows.iter().map(|r| r.1.len()).max().unwrap_or(1).clamp(1, MAX_CELLS) as i32;
             edges = (0..=n).map(|i| i * 1440).collect();
@@ -961,7 +991,7 @@ impl Reader {
                 self.cell_def = CellDef::default();
                 self.edge = None;
             }
-            "trleft" => self.row.left = v,
+            "trleft" => self.row.left = v.clamp(-MAX_EDGE, MAX_EDGE),
             "trqc" => self.row.align = Align::Center,
             "trqr" => self.row.align = Align::Right,
             "trql" => self.row.align = Align::Left,
@@ -1006,7 +1036,7 @@ impl Reader {
             "clvertalt" => self.cell_def.valign = 0,
             "cellx" => {
                 let mut d = std::mem::take(&mut self.cell_def);
-                d.right = v;
+                d.right = v.clamp(-MAX_EDGE, MAX_EDGE);
                 self.edge = None;
                 if self.row.cells.len() < MAX_CELLS {
                     self.row.cells.push(d);
@@ -1018,7 +1048,11 @@ impl Reader {
                 self.end_para(false);
             }
             "row" => {
-                let row = self.row.clone();
+                if self.blocks >= MAX_BLOCKS {
+                    return;
+                }
+                self.blocks += 1;
+                let row = self.row_def();
                 let st = self.story();
                 if !st.cell.is_empty() {
                     let c = std::mem::take(&mut st.cell);
@@ -1274,6 +1308,7 @@ fn read(data: &[u8], limits: &Limits) -> Result<(DocModel, HashMap<Arc<str>, Vec
         blobs: HashMap::new(),
         blob_bytes: 0,
         blocks: 0,
+        row_defs_left: MAX_ROW_DEFS,
         style: None,
         max_part: limits.max_part_bytes,
         max_total: limits.max_unpacked_bytes,
@@ -1365,6 +1400,41 @@ mod tests {
         assert_eq!(text(r"{\rtf1\ansi\ansicpg1251{\fonttbl{\f0 Arial;}}\f0 \'cf\'f0\'e8\par x\u8364?y\par}"), "При|x€y|");
         assert_eq!(text(r"{\rtf1{\fonttbl{\f0\fcharset2 Symbol;}{\f1 Arial;}}{\f0 \'b7}\tab {\f1 a}\par}"), "•\ta|");
         assert_eq!(text(r"{\rtf1 {\field{\*\fldinst PAGE}{\fldrslt 3}} of {\field{\*\fldinst NUMPAGES}{\fldrslt 9}}}"), "\u{E000} of \u{E001}|");
+    }
+
+    fn open_and_draw(rtf: &[u8]) {
+        let mut d = crate::Document::open_bytes(rtf.to_vec()).unwrap();
+        d.page_size(0).unwrap();
+        d.render_page(0, 64, &|| false).unwrap();
+    }
+
+    #[test]
+    fn extreme_parameters() {
+        open_and_draw(br"{\rtf1\ansi\trowd\trleft-2147483647\cellx2147483647 a\cell\row}");
+        open_and_draw(br"{\rtf1\ansi\trowd\trleft2147483647\cellx-2147483648\cellx2147483647\cellx-5 a\cell b\cell\row}");
+        open_and_draw(br"{\rtf1\ansi\trowd\trleft-2147483647 a\cell b\cell\row\pard x\par}");
+        open_and_draw(br"{\rtf1\ansi\trowd\trgaph2147483647\trrh-2147483648\cellx1000\clcbpat-2147483648\cellx2000 a\cell\row}");
+        open_and_draw(br"{\rtf1\fs2147483647\li-2147483648\ri2147483647\fi-2147483648\sb2147483647\sa-2147483647\sl-2147483647\slmult1 x\par\sl2147483647 y\par}");
+        open_and_draw(br"{\rtf1\paperw2147483647\paperh-2147483647\margl2147483647\margr-2147483647\pgnstarts2147483647\pgnrestart\uc2147483647\u-2147483647 x\u2147483647 y\tx-2147483648\tx2147483647\par}");
+        open_and_draw(br"{\rtf1{\colortbl;\red2147483647\green-2147483647\blue9;}\cf2147483647\highlight-2147483647\f-2147483648\deff2147483647 x\par}");
+        open_and_draw(br"{\rtf1{\pict\pngblip\picw2147483647\pich-2147483647\picwgoal2147483647\pichgoal2147483647\picscalex-2147483647\picscaley2147483647 89504e47}\bin2147483647}");
+        open_and_draw(br"{\rtf1\ansicpg-2147483647\brdrw2147483647\brdrcf-2147483647 x\cellx99999999999999999999\row}");
+    }
+
+    #[test]
+    fn repeated_rows_stay_bounded() {
+        // One row of the most cells, then `\row` over and over: each copies
+        // the row's definitions, within a budget.
+        let mut rtf = String::from(r"{\rtf1\trowd");
+        for i in 0..MAX_CELLS {
+            rtf.push_str(&format!(r"\cellx{}", (i + 1) * 100));
+        }
+        rtf.push_str(r"\intbl a\cell");
+        rtf.push_str(&r"\row".repeat(50_000));
+        rtf.push('}');
+        let (m, _) = read(rtf.as_bytes(), &Limits::default()).unwrap();
+        let rows: usize = m.body.iter().map(|b| if let Block::Table(t) = b { t.rows.len() } else { 0 }).sum();
+        assert!(rows > 0 && rows <= 50_000);
     }
 
     #[test]

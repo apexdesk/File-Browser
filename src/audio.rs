@@ -6,6 +6,7 @@ use crate::vfs::{KindV as _, PathV as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use crate::thumbs::lock;
 use web_time::Instant;
 
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -31,7 +32,8 @@ struct Meta {
 }
 
 fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, String> {
-    let file = crate::vfs::fs::File::open(path).map_err(|e| e.to_string())?;
+    // sólo archivos normales (un FIFO bloquearía el hilo)
+    let file = crate::thumbs::open_regular(path).ok_or_else(|| crate::i18n::t("No se pudo abrir").to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -76,7 +78,7 @@ fn cover_image(data: &[u8]) -> Option<egui::ColorImage> {
 
 fn read_meta(path: &Path) -> Meta {
     let mut m = Meta::default();
-    let Ok(file) = crate::vfs::fs::File::open(path) else { return m };
+    let Some(file) = crate::thumbs::open_regular(path) else { return m };
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -121,13 +123,38 @@ fn read_meta(path: &Path) -> Meta {
 }
 
 /// Estado de una sesión de reproducción (cada arranque o salto crea una nueva).
-#[derive(Default)]
 struct Session {
     /// fotogramas realmente entregados al dispositivo
     played: AtomicU64,
     rate: AtomicU32,
     ended: AtomicBool,
     error: Mutex<Option<String>>,
+    /// segundo real donde empezó la sesión tras el salto (bits de f64; NaN = aún no se sabe)
+    from: AtomicU64,
+}
+
+impl Session {
+    fn new() -> Session {
+        Session { played: AtomicU64::new(0), rate: AtomicU32::new(0), ended: AtomicBool::new(false), error: Mutex::new(None), from: AtomicU64::new(f64::NAN.to_bits()) }
+    }
+
+    /// Inicio real de la sesión, si ya se conoce.
+    fn from(&self) -> Option<f64> {
+        Some(f64::from_bits(self.from.load(Ordering::Relaxed))).filter(|v| v.is_finite())
+    }
+}
+
+/// Segundo al que ha llegado de verdad un salto (`None` si falló: se empieza desde el principio).
+fn seeked_secs(r: Result<symphonia::core::formats::SeekedTo, SymErr>, tb: Option<symphonia::core::units::TimeBase>, asked: f64) -> f64 {
+    match (r, tb) {
+        (Ok(s), Some(tb)) => {
+            let t = tb.calc_time(s.actual_ts);
+            let v = t.seconds as f64 + t.frac;
+            if v.is_finite() { v } else { asked }
+        }
+        (Ok(_), None) => asked,
+        (Err(_), _) => 0.0,
+    }
 }
 
 pub struct AudioPlayer {
@@ -151,9 +178,9 @@ impl AudioPlayer {
         let meta = Arc::new(Mutex::new(None));
         {
             let (meta, p, ctx) = (meta.clone(), path.to_path_buf(), ctx.clone());
-            crate::vfs::thread::spawn(move || {
-                let m = read_meta(&p);
-                *meta.lock().unwrap() = Some(m);
+            crate::thumbs::spawn_decoder("etiquetas de audio", move || {
+                let m = crate::thumbs::guarded(|| read_meta(&p)).unwrap_or_default();
+                *lock(&meta) = Some(m);
                 ctx.request_repaint();
             });
         }
@@ -168,7 +195,7 @@ impl AudioPlayer {
             error: None,
             meta,
             epoch: Arc::new(AtomicU64::new(0)),
-            sess: Arc::new(Session::default()),
+            sess: Arc::new(Session::new()),
             base: 0.0,
             started: None,
         }
@@ -180,7 +207,9 @@ impl AudioPlayer {
 
     pub fn position(&self) -> f64 {
         let rate = self.sess.rate.load(Ordering::Relaxed);
-        let p = if self.started.is_some() && rate > 0 { self.base + self.sess.played.load(Ordering::Relaxed) as f64 / rate as f64 } else { self.base };
+        // si el salto no llegó donde se pidió, cuenta desde donde de verdad empezó
+        let base = if self.started.is_some() { self.sess.from().unwrap_or(self.base) } else { self.base };
+        let p = if self.started.is_some() && rate > 0 { base + self.sess.played.load(Ordering::Relaxed) as f64 / rate as f64 } else { base };
         if self.duration > 0.0 { p.min(self.duration) } else { p }
     }
 
@@ -191,13 +220,16 @@ impl AudioPlayer {
     fn start(&mut self, pos: f64) {
         self.stop();
         self.error = None;
-        let sess = Arc::new(Session::default());
+        let sess = Arc::new(Session::new());
         self.sess = sess.clone();
         let my = self.epoch.load(Ordering::SeqCst);
         let (epoch, path, ctx) = (self.epoch.clone(), self.path.clone(), self.ctx.clone());
-        crate::vfs::thread::spawn(move || {
-            if let Err(e) = run(&path, pos, &sess, &epoch, my) {
-                *sess.error.lock().unwrap() = Some(e);
+        crate::thumbs::spawn_decoder("audio", move || {
+            // un pánico del decodificador (p. ej. un FLAC roto) se muestra como error, no cierra la app
+            let r = crate::thumbs::guarded(|| run(&path, pos, &sess, &epoch, my))
+                .unwrap_or_else(|| Err(crate::i18n::t("No se pudo reproducir el audio").to_string()));
+            if let Err(e) = r {
+                *lock(&sess.error) = Some(e);
             }
             sess.ended.store(true, Ordering::SeqCst);
             ctx.request_repaint();
@@ -235,7 +267,7 @@ impl AudioPlayer {
 
     /// Recoge las etiquetas y detecta el final de la pista o un error.
     pub fn poll(&mut self) {
-        let m = self.meta.lock().unwrap().take();
+        let m = lock(&self.meta).take();
         if let Some(m) = m {
             self.duration = m.duration;
             self.title = m.title;
@@ -246,7 +278,7 @@ impl AudioPlayer {
             }
         }
         if self.started.is_some() && self.sess.ended.load(Ordering::SeqCst) {
-            if let Some(e) = self.sess.error.lock().unwrap().take() {
+            if let Some(e) = lock(&self.sess.error).take() {
                 self.error = Some(e);
                 self.base = self.position();
             } else {
@@ -269,12 +301,15 @@ fn run(path: &Path, start: f64, sess: &Session, epoch: &AtomicU64, my: u64) -> R
 
     let alive = || epoch.load(Ordering::SeqCst) == my;
     let mut format = open_format(path)?;
-    let track = format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL).ok_or("sin pista de audio")?;
+    let track = format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL).ok_or(crate::i18n::t("sin pista de audio"))?;
     let (id, params) = (track.id, track.codec_params.clone());
     let mut decoder = symphonia::default::get_codecs().make(&params, &DecoderOptions::default()).map_err(|e| e.to_string())?;
     if start > 0.1 {
-        let _ = format.seek(SeekMode::Coarse, SeekTo::Time { time: Time::from(start), track_id: Some(id) });
+        let r = format.seek(SeekMode::Coarse, SeekTo::Time { time: Time::from(start), track_id: Some(id) });
+        sess.from.store(seeked_secs(r, params.time_base, start).to_bits(), Ordering::Relaxed);
         decoder.reset();
+    } else {
+        sess.from.store(0f64.to_bits(), Ordering::Relaxed);
     }
 
     // dispositivo de salida
@@ -399,7 +434,7 @@ fn map_channel(f: &[f32], o: usize, ch_out: usize) -> f32 {
 /// el flujo abierto mientras viva.
 #[cfg(target_arch = "wasm32")]
 fn open_out(_ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, _played: &Arc<AtomicU64>) -> Result<(Box<dyn std::any::Any>, u32, usize), String> {
-    Err("sin audio en la web".into())
+    Err(crate::i18n::t("sin audio en la web").into())
 }
 
 #[cfg(target_os = "android")]
@@ -421,7 +456,7 @@ fn open_out(ring: &Arc<Mutex<std::collections::VecDeque<f32>>>, played: &Arc<Ato
 #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 fn output_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
-    let dev = cpal::default_host().default_output_device().ok_or("no hay dispositivo de audio")?;
+    let dev = cpal::default_host().default_output_device().ok_or(crate::i18n::t("no hay dispositivo de audio"))?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
     Ok((dev, cfg))
 }
@@ -441,7 +476,7 @@ fn build_stream(
         F::I16 => build::<i16>(dev, &conf, ring, played, ch),
         F::U16 => build::<u16>(dev, &conf, ring, played, ch),
         F::I32 => build::<i32>(dev, &conf, ring, played, ch),
-        other => Err(format!("formato de muestra no admitido: {other:?}")),
+        other => Err(crate::i18n::tf("formato de muestra no admitido: {}", &[&format!("{other:?}")])),
     }
 }
 
@@ -476,4 +511,35 @@ where
         None,
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia::core::formats::SeekedTo;
+    use symphonia::core::units::TimeBase;
+
+    #[test]
+    fn failed_seek_reports_real_start() {
+        let tb = Some(TimeBase::new(1, 44_100));
+        assert_eq!(seeked_secs(Err(SymErr::SeekError(symphonia::core::errors::SeekErrorKind::Unseekable)), tb, 42.0), 0.0);
+        let s = SeekedTo { track_id: 0, required_ts: 44_100 * 42, actual_ts: 44_100 * 40 };
+        assert!((seeked_secs(Ok(s), tb, 42.0) - 40.0).abs() < 1e-9);
+        let s = SeekedTo { track_id: 0, required_ts: 1, actual_ts: 1 };
+        assert_eq!(seeked_secs(Ok(s), None, 42.0), 42.0);
+        assert_eq!(Session::new().from(), None);
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn audio_on_fifo_fails_fast() {
+        let dir = std::env::temp_dir().join(format!("fb-audio-fifo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("x.flac");
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_format(&p).is_err());
+        assert!(read_meta(&p).title.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

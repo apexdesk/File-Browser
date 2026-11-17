@@ -61,8 +61,34 @@ pub struct Player {
 fn probe_duration(path: &Path) -> f64 {
     let mut c = Command::new("ffmpeg");
     quiet(&mut c).args(["-hide_banner", "-protocol_whitelist", "file,pipe", "-i"]).arg(path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let Ok(out) = c.output() else { return 0.0 };
-    let s = String::from_utf8_lossy(&out.stderr);
+    let Some(err) = capture_stderr(c, PROBE_TIMEOUT) else { return 0.0 };
+    parse_duration(&String::from_utf8_lossy(&err))
+}
+
+/// plazo para `ffmpeg -i` (un FIFO o un archivo de red raro lo dejarían colgado)
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Lanza la orden y recoge su salida de errores (como mucho 1 MB); si se pasa del plazo se mata.
+fn capture_stderr(mut c: Command, limit: std::time::Duration) -> Option<Vec<u8>> {
+    let mut child = c.spawn().ok()?;
+    let mut err = child.stderr.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::vfs::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = (&mut err).take(1 << 20).read_to_end(&mut b);
+        // el resto se descarta para que el proceso no se quede esperando
+        let _ = std::io::copy(&mut err, &mut std::io::sink());
+        let _ = tx.send(b);
+    });
+    let r = rx.recv_timeout(limit).ok();
+    if r.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    r
+}
+
+fn parse_duration(s: &str) -> f64 {
     let Some(i) = s.find("Duration: ") else { return 0.0 };
     let t: String = s[i + 10..].chars().take_while(|c| c.is_ascii_digit() || *c == ':' || *c == '.').collect();
     let mut secs = 0.0;
@@ -171,7 +197,7 @@ impl Player {
                 if shared.epoch.load(Ordering::SeqCst) != g {
                     return;
                 }
-                *shared.frame.lock().unwrap() = Some(ColorImage::from_rgb([w, h], &buf));
+                *crate::thumbs::lock(&shared.frame) = Some(ColorImage::from_rgb([w, h], &buf));
                 ctx.request_repaint();
             }
             if shared.epoch.load(Ordering::SeqCst) == g {
@@ -225,7 +251,7 @@ impl Player {
 
     /// Sube el último fotograma recibido y detecta el final del vídeo.
     pub fn poll(&mut self) {
-        let f = self.shared.frame.lock().unwrap().take();
+        let f = crate::thumbs::lock(&self.shared.frame).take();
         if let Some(img) = f {
             match &mut self.tex {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
@@ -244,5 +270,26 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.stop_procs();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_is_parsed() {
+        assert!((parse_duration("  Duration: 01:02:03.50, start") - 3723.5).abs() < 1e-9);
+        assert_eq!(parse_duration("nada"), 0.0);
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn stuck_probe_is_killed() {
+        let mut c = Command::new("sleep");
+        c.arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let t = std::time::Instant::now();
+        assert!(capture_stderr(c, std::time::Duration::from_millis(300)).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 }

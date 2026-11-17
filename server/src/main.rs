@@ -12,7 +12,11 @@ mod tls;
 mod timefmt;
 mod walk;
 mod webui;
+#[cfg(windows)]
+mod win;
 mod write;
+#[cfg(test)]
+mod e2e;
 mod zipstream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -36,11 +40,14 @@ Uso: filebrowser-server [opciones] CARPETA [CARPETA…]
                  --password-file ARCHIVO o se pregunta al arrancar; mínimo 8 caracteres)
   --password-file ARCHIVO  lee la contraseña de ese archivo
   --hidden       sirve también archivos y carpetas que empiezan por «.» (por defecto se ocultan)
-  --i-know       permite ejecutarlo como root/administrador
+  --proxy        detrás de un túnel o proxy en este mismo equipo (cloudflared, Caddy…): las conexiones
+                 de 127.0.0.1 no tienen tope por IP y los bloqueos usan X-Forwarded-For
+  --i-know       permite ejecutarlo como root (Unix) o administrador elevado (Windows)
   -h, --help     esta ayuda
 
 El enlace incluye un token aleatorio que solo existe mientras el programa corre.
-No hay HTTPS: úsalo en redes de confianza o a través de un túnel (WireGuard, Tailscale…).";
+Sin --tls el tráfico va sin cifrar: úsalo en redes de confianza o a través de un túnel
+(WireGuard, Tailscale…). No abras el puerto a internet.";
 
 struct Opts {
     dirs: Vec<PathBuf>,
@@ -49,6 +56,7 @@ struct Opts {
     ttl: Option<Duration>,
     max_conn: usize,
     hidden: bool,
+    proxy: bool,
     tls: bool,
     i_know: bool,
     write: bool,
@@ -58,20 +66,21 @@ struct Opts {
 }
 
 fn parse_ttl(s: &str) -> Option<Duration> {
-    let (n, u) = s.split_at(s.len().checked_sub(1)?);
-    let n: u64 = n.parse().ok()?;
+    // la unidad es el último carácter (no el último byte: «5ñ» no debe partir un carácter)
+    let u = s.chars().next_back()?;
+    let n: u64 = s[..s.len() - u.len_utf8()].parse().ok()?;
     let mult = match u {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
         _ => return None,
     };
     n.checked_mul(mult).filter(|v| *v > 0).map(Duration::from_secs)
 }
 
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { dirs: Vec::new(), bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0, ttl: None, max_conn: 32, hidden: false, tls: false, i_know: false, write: false, max_upload_mib: 2048, user: None, password_file: None };
+    let mut o = Opts { dirs: Vec::new(), bind: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 0, ttl: None, max_conn: 32, hidden: false, proxy: false, tls: false, i_know: false, write: false, max_upload_mib: 2048, user: None, password_file: None };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} necesita un valor"));
@@ -84,6 +93,7 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
                 o.max_conn = val("--max-conn")?.parse().ok().filter(|n| (1..=1024).contains(n)).ok_or("--max-conn: entre 1 y 1024")?
             }
             "--hidden" => o.hidden = true,
+            "--proxy" => o.proxy = true,
             "--write" => o.write = true,
             "--max-upload" => o.max_upload_mib = val("--max-upload")?.parse().ok().filter(|n| *n >= 1).ok_or("--max-upload: MiB, al menos 1")?,
             "--user" => {
@@ -112,11 +122,18 @@ fn is_root() -> bool {
         // SAFETY: geteuid no tiene precondiciones.
         unsafe { libc::geteuid() == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        win::is_elevated()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
 }
+
+/// Nombres de raíz que chocarían con las rutas propias del servidor (`/s/<tok>/app/`, `/s/<tok>/api/…`).
+const RESERVED: [&str; 2] = ["app", "api"];
 
 /// IP de la interfaz de salida (no envía ningún paquete).
 fn lan_ip() -> Option<IpAddr> {
@@ -144,7 +161,7 @@ fn make_roots(dirs: &[PathBuf]) -> Result<Vec<jail::Root>, String> {
         let base = canon.file_name().and_then(|n| n.to_str()).filter(|n| jail::valid_component(n)).unwrap_or("carpeta").to_string();
         let mut name = base.clone();
         let mut i = 2;
-        while roots.iter().any(|r| r.name == name) {
+        while roots.iter().any(|r| r.name == name) || RESERVED.contains(&name.as_str()) {
             name = format!("{base}-{i}");
             i += 1;
         }
@@ -181,6 +198,16 @@ fn run() -> Result<(), String> {
         IpAddr::V6(a) => format!("[{a}]"),
         a => a.to_string(),
     };
+    // con --tls el enlace no debe vivir más que el certificado (`tls::MAX_DAYS`)
+    let max_ttl = std::time::Duration::from_secs((tls::MAX_DAYS - 1) * 86_400);
+    let ttl = match o.ttl {
+        Some(t) if o.tls && t > max_ttl => {
+            println!("Aviso: con --tls el enlace dura como mucho {} días (lo que vale el certificado).", tls::MAX_DAYS - 1);
+            Some(max_ttl)
+        }
+        t => t,
+    };
+    let cert_days = tls::days_for(ttl);
     let (tls_cfg, fp) = if o.tls {
         let mut ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
         for ip in std::iter::once(o.bind).chain(lan_ip()) {
@@ -188,7 +215,7 @@ fn run() -> Result<(), String> {
                 ips.push(ip);
             }
         }
-        let (c, fp) = tls::make(&ips)?;
+        let (c, fp) = tls::make_days(&ips, cert_days)?;
         (Some(c), Some(fp))
     } else {
         (None, None)
@@ -196,6 +223,12 @@ fn run() -> Result<(), String> {
     let url = format!("{}://{host}:{port}/s/{token}/", if o.tls { "https" } else { "http" });
 
     println!("Compartiendo ({}):", if o.write { "LECTURA Y ESCRITURA: quien tenga el enlace puede subir, borrar y mover" } else { "solo lectura" });
+    if o.write && !webui::available() {
+        println!(
+            "Aviso: este binario no incluye la interfaz web (server/build-web.sh): las páginas del enlace son de solo \
+             lectura y para escribir hace falta un cliente propio que hable la API."
+        );
+    }
     for r in &roots {
         println!("  {} → {}", r.name, r.path.display());
     }
@@ -207,7 +240,17 @@ fn run() -> Result<(), String> {
         println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
     }
     if let Some(fp) = &fp {
-        println!("HTTPS con certificado autofirmado (válido 30 días). Huella SHA-256:\n  {fp}");
+        let end = timefmt::civil(timefmt::unix(std::time::SystemTime::now()) + cert_days as i64 * 86_400);
+        println!("HTTPS con certificado autofirmado (válido hasta el {:04}-{:02}-{:02}). Huella SHA-256:\n  {fp}", end.year, end.month, end.day);
+        if ttl.is_none() {
+            println!("Sin --ttl: reinicia el servidor antes de esa fecha (los navegadores rechazarán el certificado caducado).");
+            // aviso en la consola una semana antes
+            let warn_in = std::time::Duration::from_secs(cert_days.saturating_sub(7) * 86_400);
+            std::thread::spawn(move || {
+                std::thread::sleep(warn_in);
+                eprintln!("Aviso: el certificado HTTPS caduca en 7 días; reinicia el servidor para generar otro.");
+            });
+        }
     }
     if let Some(u) = &o.user {
         println!("Acceso con usuario «{u}» y contraseña, además del enlace.");
@@ -218,11 +261,16 @@ fn run() -> Result<(), String> {
     if !o.bind.is_loopback() && !o.tls {
         println!("Aviso: sin HTTPS. Cualquiera en esa red con el enlace puede leer lo compartido; para salir a internet usa un túnel.");
     }
-    if let Some(t) = o.ttl {
+    if o.proxy {
+        println!("Modo --proxy: se confía en X-Forwarded-For solo de conexiones de este mismo equipo.");
+    }
+    if let Some(t) = ttl {
         println!("El enlace caduca en {} s.", t.as_secs());
         std::thread::spawn(move || {
             std::thread::sleep(t);
             eprintln!("Tiempo cumplido: se cierra el servidor.");
+            // las subidas a medias no dejan `.fbtmp-*` por ahí
+            write::remove_live_temps();
             std::process::exit(0);
         });
     }
@@ -232,11 +280,19 @@ fn run() -> Result<(), String> {
     }
     let mut ctx = server::Ctx::new(roots, token, o.hidden, o.write, o.max_upload_mib.saturating_mul(1 << 20), tls_cfg);
     ctx.auth = auth;
+    ctx.proxy = o.proxy;
     server::serve(listener, Arc::new(ctx), o.max_conn);
     Ok(())
 }
 
 fn main() {
+    // el perfil de publicación desenrolla (lo necesita el gestor para aislar decodificadores); aquí un
+    // pánico en cualquier hilo sigue tumbando el proceso entero, como con `panic = "abort"`
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |i| {
+        prev(i);
+        std::process::abort();
+    }));
     if let Err(e) = run() {
         eprintln!("filebrowser-server: {e}");
         std::process::exit(2);
@@ -255,6 +311,10 @@ mod tests {
         assert!(parse_ttl("5").is_none());
         assert!(parse_ttl("").is_none());
         assert!(parse_ttl("99999999999999999999d").is_none());
+        // sufijo de varios bytes: ni pánico ni valor
+        assert!(parse_ttl("5ñ").is_none());
+        assert!(parse_ttl("ñ").is_none());
+        assert!(parse_ttl("1€").is_none());
     }
 
     #[test]
@@ -266,5 +326,18 @@ mod tests {
         assert!(a(&["--raro", "d"]).is_err());
         let o = a(&["--port", "80", "--hidden", "x", "y"]).ok().unwrap();
         assert_eq!((o.port, o.hidden, o.dirs.len()), (80, true, 2));
+        assert!(a(&["--proxy", "x"]).ok().unwrap().proxy);
+    }
+
+    #[test]
+    fn raiz_llamada_como_una_ruta_propia_se_renombra() {
+        let d = std::env::temp_dir().join(format!("fbs_res_{}", std::process::id()));
+        for n in ["app", "api", "x"] {
+            std::fs::create_dir_all(d.join(n)).unwrap();
+        }
+        let r = make_roots(&[d.join("app"), d.join("api"), d.join("x")]).unwrap();
+        let names: Vec<&str> = r.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["app-2", "api-2", "x"]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

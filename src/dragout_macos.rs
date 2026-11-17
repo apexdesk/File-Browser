@@ -48,6 +48,7 @@ impl Source {
 
     fn new(mtm: MainThreadMarker, active: Arc<AtomicBool>) -> Retained<Source> {
         let this = mtm.alloc::<Source>().set_ivars(active);
+        // SAFETY: `init` de NSObject sobre un objeto recién reservado de una subclase suya, sin argumentos.
         unsafe { msg_send_id![super(this), init] }
     }
 }
@@ -98,10 +99,14 @@ impl Imp {
             return false;
         }
         let Some(mtm) = MainThreadMarker::new() else { return false };
+        // SAFETY: es la NSView de la ventana de eframe (de su RawWindowHandle), que vive tanto como la
+        // aplicación; sólo se usa aquí, en el hilo principal (`mtm`).
         let view: &NSView = unsafe { &*(self.view as *const NSView) };
         let app = NSApplication::sharedApplication(mtm);
         let Some(window) = view.window() else { return false };
         // Evento de ratón para iniciar la sesión: el actual si lo es, o uno sintético en la posición del puntero.
+        // SAFETY (bloques de abajo): métodos de AppKit sin requisitos más allá del hilo principal, que
+        // garantiza `mtm`; el evento sintético usa la ventana real y valores por defecto.
         let event: Retained<NSEvent> = match unsafe { app.currentEvent() } {
             Some(e) if matches!(unsafe { e.r#type() }, NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged) => e,
             _ => {
@@ -124,17 +129,34 @@ impl Imp {
                 e
             }
         };
+        // SAFETY: hilo principal (`mtm`); `None` = coordenadas de la ventana.
         let at = unsafe { view.convertPoint_fromView(event.locationInWindow(), None) };
+        // SAFETY: singleton de AppKit, sin requisitos.
         let ws = unsafe { NSWorkspace::sharedWorkspace() };
         let mut items = Vec::new();
-        for (i, p) in paths.iter().take(32).enumerate() {
+        // se arrastran todos; sólo los primeros 32 piden su propio icono (los demás repiten el primero)
+        let mut first_icon = None;
+        for (i, p) in paths.iter().enumerate() {
             let s = NSString::from_str(&p.to_string_lossy());
+            // SAFETY: `s` es un NSString válido; fileURLWithPath no tiene otros requisitos.
             let url = unsafe { NSURL::fileURLWithPath(&s) };
             let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*url);
+            // SAFETY: `mtm` prueba que estamos en el hilo principal; el escritor vive mientras el ítem.
             let item = unsafe { NSDraggingItem::initWithPasteboardWriter(mtm.alloc(), writer) };
-            let icon = unsafe { ws.iconForFile(&s) };
-            let off = i as f64 * 4.0;
+            let icon = match (&first_icon, i < 32) {
+                (Some(ic), false) => Retained::clone(ic),
+                _ => {
+                    // SAFETY: NSWorkspace es seguro de usar desde el hilo principal con un NSString válido.
+                    let ic = unsafe { ws.iconForFile(&s) };
+                    if first_icon.is_none() {
+                        first_icon = Some(ic.clone());
+                    }
+                    ic
+                }
+            };
+            let off = i.min(8) as f64 * 4.0;
             let frame = NSRect::new(NSPoint::new(at.x - 24.0 + off, at.y - 24.0 - off), NSSize::new(48.0, 48.0));
+            // SAFETY: `icon` es una NSImage, el contenido que admite un NSDraggingItem.
             unsafe { item.setDraggingFrame_contents(frame, Some(&icon)) };
             items.push(item);
         }
@@ -144,6 +166,8 @@ impl Imp {
         let arr = NSArray::from_vec(items);
         let source = Source::new(mtm, self.active.clone());
         DONE.store(false, Ordering::Release);
+        // SAFETY: hilo principal; `source` y la sesión se guardan en `self` mientras dure el arrastre
+        // (AppKit no retiene la fuente).
         let session = unsafe { view.beginDraggingSessionWithItems_event_source(&arr, &event, ProtocolObject::from_ref(&*source)) };
         self.active.store(true, Ordering::Release);
         self.source = Some(source);

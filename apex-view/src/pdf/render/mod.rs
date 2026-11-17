@@ -78,8 +78,12 @@ pub struct Document {
 
 impl Document {
     pub fn open(data: Arc<[u8]>, password: Option<&str>) -> Result<Document, super::Fail> {
-        // SAFETY: the bytes live in `data`'s allocation, which never moves
-        // and is kept in the document, dropped after the file borrowing it.
+        // SAFETY: the bytes live in `data`'s heap allocation, which never
+        // moves while the `Arc` is alive. The document keeps that `Arc` in
+        // `_data`, declared after `file` and `pages` so it drops after
+        // them; the `'static` slice never leaves the document (`file` and
+        // `pages` are private, and nothing borrowed from them is handed
+        // out with a lifetime longer than `&self`).
         let bytes: &'static [u8] = unsafe { &*(&*data as *const [u8]) };
         let file = PdfFile::open(bytes, password)?;
         let pages = file.pages();
@@ -1194,7 +1198,11 @@ impl<'a, 'f> R<'a, 'f> {
         // around it, as pdfium's does.
         if let Some(r) = upright_rect(path, gs.ctm) {
             self.ctx.set_transform(Affine::IDENTITY);
-            self.ctx.push_clip_path(&Rect::new(r.x0.floor(), r.y0.floor(), r.x1.ceil(), r.y1.ceil()).to_path(0.1));
+            // Kept on the page: vello panics intersecting a clip past its
+            // right edge with a path along it. None of it there: none.
+            let r = Rect::new(r.x0.floor(), r.y0.floor(), r.x1.ceil(), r.y1.ceil()).intersect(Rect::new(0.0, 0.0, self.width as f64, self.height as f64));
+            let r = if r.width() > 0.0 && r.height() > 0.0 { r } else { Rect::ZERO };
+            self.ctx.push_clip_path(&r.to_path(0.1));
         } else {
             self.ctx.set_transform(gs.ctm);
             self.ctx.push_clip_path(path);
@@ -1434,7 +1442,8 @@ impl<'a, 'f> R<'a, 'f> {
                 };
                 let mask = matches!(f.key(&d, "ImageMask"), Obj::Bool(true));
                 // Pixels the image takes on the page, to shrink big pictures.
-                let key_fill = if mask { (fill[0] * 255.0) as u32 * 65536 + (fill[1] * 255.0) as u32 * 256 + (fill[2] * 255.0) as u32 } else { 0 };
+                let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+                let key_fill = if mask { byte(fill[0]) << 16 | byte(fill[1]) << 8 | byte(fill[2]) } else { 0 };
                 let pix = match id.and_then(|n| self.images.get(&(n, key_fill))) {
                     Some(p) => p.clone(),
                     None => {
@@ -1524,15 +1533,16 @@ impl<'a, 'f> R<'a, 'f> {
             let mut out = vec![0u8; nw * nh * 4];
             for y in 0..nh {
                 for x in 0..nw {
-                    let mut acc = [0u32; 4];
-                    let mut n = 0u32;
+                    // 64 bits: a box of millions of pixels overflows 32.
+                    let mut acc = [0u64; 4];
+                    let mut n = 0u64;
                     for yy in y * fy..((y + 1) * fy).min(h) {
                         for xx in x * fx..((x + 1) * fx).min(w) {
                             let i = (yy * w + xx) * 4;
-                            let a = data[i + 3] as u32;
-                            acc[0] += data[i] as u32 * a;
-                            acc[1] += data[i + 1] as u32 * a;
-                            acc[2] += data[i + 2] as u32 * a;
+                            let a = data[i + 3] as u64;
+                            acc[0] += data[i] as u64 * a;
+                            acc[1] += data[i + 1] as u64 * a;
+                            acc[2] += data[i + 2] as u64 * a;
                             acc[3] += a;
                             n += 1;
                         }
@@ -1592,6 +1602,13 @@ impl<'a, 'f> R<'a, 'f> {
             return;
         }
         let (w, h) = (self.width, self.height);
+        // Each is a page of pixels: a cached mask drawn over and over
+        // mustn't take hours.
+        let page = w as usize * h as usize;
+        if page > self.pixels {
+            return;
+        }
+        self.pixels -= page;
         let mut g = gs.clone();
         g.fill_alpha = 1.0;
         let pm = self.offscreen(w, h, |r| r.draw_image(p, &g));
@@ -1703,7 +1720,8 @@ impl<'a, 'f> R<'a, 'f> {
             bounds = bounds.intersect(to_dev.transform_rect_bbox(Rect::new(b[0], b[1], b[2], b[3])));
         }
         let b = bounds.expand();
-        if b.width() < 1.0 || b.height() < 1.0 {
+        // Also NaN bounds.
+        if !(b.width() >= 1.0 && b.height() >= 1.0) {
             return;
         }
         let (x0, y0, w, h) = (b.x0 as i32, b.y0 as i32, b.width() as usize, b.height() as usize);
@@ -1802,6 +1820,14 @@ impl<'a, 'f> R<'a, 'f> {
                 self.nesting.pop();
                 // Tile pixels to device.
                 let t = to_dev * tile.inverse();
+                // Shifted by whole tiles to near the page: vello indexes
+                // out of its pixmap for samples far from the tile.
+                let p = t.inverse() * Point::ORIGIN;
+                let t = t * Affine::translate((p.x - p.x.rem_euclid(tw), p.y - p.y.rem_euclid(th)));
+                let page = t.inverse().transform_rect_bbox(Rect::new(0.0, 0.0, self.width as f64, self.height as f64));
+                if !(page.x0.abs().max(page.x1.abs()).max(page.y0.abs()).max(page.y1.abs()) < 1e6) {
+                    return;
+                }
                 self.prepare(gs);
                 self.ctx.set_transform(Affine::IDENTITY);
                 self.ctx.set_fill_rule(rule);
@@ -1847,6 +1873,10 @@ impl<'a, 'f> R<'a, 'f> {
         let pr = inv.transform_rect_bbox(Rect::new(ax0, ay0, ax1, ay1));
         let (c0, c1) = (((pr.x0 - bb.2) / xs).floor() - 1.0, ((pr.x1 - bb.0) / xs).ceil() + 1.0);
         let (r0, r1) = (((pr.y0 - bb.3) / ys).floor() - 1.0, ((pr.y1 - bb.1) / ys).ceil() + 1.0);
+        // Huge or odd steps: `col + 1.0` would stay `col` and never end.
+        if ![c0, c1, r0, r1].iter().all(|v| v.abs() < 1e12) {
+            return false;
+        }
         if (c1 - c0 + 1.0) * (r1 - r0 + 1.0) > 40_000.0 {
             return false;
         }
@@ -1881,13 +1911,13 @@ impl<'a, 'f> R<'a, 'f> {
         let src = pm.data();
         let e = to_dev.as_coeffs();
         let (lo, to) = (cell.x0 - e[4], cell.y0 - e[5]);
-        let mut row = r0;
-        while row <= r1 {
-            let mut col = c0;
-            while col <= c1 {
+        for j in 0..(r1 - r0 + 1.0).max(0.0) as u32 {
+            let row = r0 + j as f64;
+            for i in 0..(c1 - c0 + 1.0).max(0.0) as u32 {
+                let col = c0 + i as f64;
                 let o = to_dev * Point::new(col * xs, row * ys);
-                let (sx, sy) = ((o.x + lo).round() as i64 - ax0 as i64, (o.y + to).round() as i64 - ay0 as i64);
-                if sx < aw && sy < ah && sx + tw > 0 && sy + th > 0 {
+                let (sx, sy) = (((o.x + lo).round() as i64).saturating_sub(ax0 as i64), ((o.y + to).round() as i64).saturating_sub(ay0 as i64));
+                if sx < aw && sy < ah && sx.saturating_add(tw) > 0 && sy.saturating_add(th) > 0 {
                     for y in sy.max(0)..(sy + th).min(ah) {
                         for x in sx.max(0)..(sx + tw).min(aw) {
                             let s = src[((y - sy) * tw + (x - sx)) as usize];
@@ -1901,9 +1931,7 @@ impl<'a, 'f> R<'a, 'f> {
                         }
                     }
                 }
-                col += 1.0;
             }
-            row += 1.0;
         }
         let mut big = Pixmap::from_parts(out, aw as u16, ah as u16);
         big.set_may_have_transparency(true);
@@ -2227,8 +2255,14 @@ impl R<'_, '_> {
             let d: Vec<String> = d.iter().map(|v| format!("{v}")).collect();
             s.push_str(&format!("[{}] 0 d\n", d.join(" ")));
         }
+        // Paths may all be one big array named over and over.
+        let mut left = 1usize << 20;
         for p in paths.iter() {
             let p = f.nums(p);
+            if left < p.len() {
+                break;
+            }
+            left -= p.len();
             for (i, xy) in p.chunks_exact(2).enumerate() {
                 s.push_str(&format!("{} {} {}\n", xy[0], xy[1], if i == 0 { "m" } else { "l" }));
             }
@@ -2267,6 +2301,9 @@ impl R<'_, '_> {
         if !highlight {
             s.push_str("1 w\n");
         }
+        // Zigzag steps all quadrilaterals may take (a huge one would
+        // never end, or fill the memory).
+        let mut steps = 100_000u32;
         for p in q.chunks_exact(8) {
             let (l, r) = (p.iter().step_by(2).fold(f64::MAX, |a, &b| a.min(b)), p.iter().step_by(2).fold(f64::MIN, |a, &b| a.max(b)));
             let (b, t) = (p.iter().skip(1).step_by(2).fold(f64::MAX, |a, &b| a.min(b)), p.iter().skip(1).step_by(2).fold(f64::MIN, |a, &b| a.max(b)));
@@ -2280,7 +2317,8 @@ impl R<'_, '_> {
                     s.push_str(&format!("{l} {top} m"));
                     let mut x = l + 2.0;
                     let mut up = false;
-                    while x < r {
+                    while x < r && steps > 0 {
+                        steps -= 1;
                         s.push_str(&format!(" {x} {} l", if up { top } else { b }));
                         up = !up;
                         x += 2.0;

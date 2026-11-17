@@ -606,7 +606,7 @@ fn find_blip(d: &[u8], depth: u32) -> Option<Vec<u8>> {
         if found.is_some() {
             return found;
         }
-        p = p.saturating_add(8 + len);
+        p = p.saturating_add(len).saturating_add(8);
     }
     None
 }
@@ -792,11 +792,13 @@ impl Reader<'_> {
     /// The instruction of a field, without its nested fields' results.
     fn field_code(&self, start: usize, sep: usize) -> String {
         let mut s = String::new();
-        let mut depth = 0;
-        for cp in start + 1..sep.min(self.text.len()) {
+        let mut depth = 0i32;
+        // An instruction is short: one running to a far mark is read only
+        // so far (fields may name marks anywhere).
+        for cp in start + 1..sep.min(self.text.len()).min(start.saturating_add(1 << 16)) {
             match self.text[cp] {
-                0x13 => depth += 1,
-                0x15 => depth -= 1,
+                0x13 => depth = depth.saturating_add(1),
+                0x15 => depth = depth.saturating_sub(1),
                 0x14 => {}
                 u if depth == 0 && u >= 0x20 && s.len() < 256 => s.push(char::from_u32(u32::from(u)).unwrap_or(' ')),
                 _ => {}
@@ -963,13 +965,13 @@ impl Reader<'_> {
                         match word.as_str() {
                             "PAGE" => {
                                 push(&mut spans, &PAGE.to_string());
-                                skip_to = fend + 1;
+                                skip_to = fend.saturating_add(1);
                             }
                             "NUMPAGES" | "SECTIONPAGES" => {
                                 push(&mut spans, &PAGES.to_string());
-                                skip_to = fend + 1;
+                                skip_to = fend.saturating_add(1);
                             }
-                            _ => skip_to = sep.map_or(fend + 1, |s| s + 1),
+                            _ => skip_to = sep.map_or(fend, |s| s).saturating_add(1),
                         }
                     }
                     0x14 | 0x15 => {}
@@ -1090,8 +1092,11 @@ fn flush_table(out: &mut Vec<Block>, rows: &mut Vec<(Vec<Vec<Block>>, RowDef)>) 
             let n = (t.first().copied().unwrap_or(0) as usize).min(MAX_CELLS);
             let edges: Vec<i16> = (0..=n).filter_map(|i| i16_at(t, 1 + i * 2)).collect();
             let tcs: Vec<Vec<u8>> = (0..n).map(|i| t.get(1 + (n + 1) * 2 + i * 20..).map_or(Vec::new(), |c| c[..c.len().min(20)].to_vec())).collect();
-            // Without a definition, an inch per cell.
-            if edges.len() == n + 1 && n > 0 { (edges, tcs) } else { ((0..=cells.len().min(MAX_CELLS) as i16).map(|i| i * 1440).collect(), vec![Vec::new(); cells.len().min(MAX_CELLS)]) }
+            // Without a definition, an inch per cell (narrower when that
+            // would pass an i16's twips).
+            let m = cells.len().min(MAX_CELLS);
+            let w = (30_000 / m.max(1) as i32).min(1440);
+            if edges.len() == n + 1 && n > 0 { (edges, tcs) } else { ((0..=m as i32).map(|i| (i * w) as i16).collect(), vec![Vec::new(); m]) }
         })
         .collect();
     let mut edges: Vec<i16> = defs.iter().flat_map(|d| d.0.iter().copied()).collect();
@@ -1338,7 +1343,7 @@ fn read(data: &[u8], limits: &Limits) -> Result<(DocModel, HashMap<Arc<str>, Vec
     for (i, sed) in seds.iter().enumerate().take(10_000) {
         let fc = u32::from_le_bytes([sed[2], sed[3], sed[4], sed[5]]) as usize;
         let g = match u16_at(&wd, fc) {
-            Some(cb) if fc != 0xFFFF_FFFF => wd.get(fc + 2..(fc + 2 + cb as usize).min(wd.len())).unwrap_or(&[]),
+            Some(cb) if fc != 0xFFFF_FFFF => wd.get(fc.saturating_add(2)..fc.saturating_add(2 + cb as usize).min(wd.len())).unwrap_or(&[]),
             _ => &[],
         };
         let g = if fib.word6 { ww6::translate(g) } else { g.to_vec() };
@@ -1358,7 +1363,7 @@ fn read(data: &[u8], limits: &Limits) -> Result<(DocModel, HashMap<Arc<str>, Vec
     // footer. An empty one is the previous section's. Word 6 lists only
     // the separators and stories there are.
     let (hcps, _) = plc(fib.part(&table, PLCF_HDD), 0);
-    let hdd = ccp_text + ccp_ftn;
+    let hdd = ccp_text.saturating_add(ccp_ftn);
     let mut prev: [Option<Arc<Vec<Block>>>; 6] = Default::default();
     let mut word6_at = fib.part(&table, DOP).get(1).copied().unwrap_or(0).count_ones() as usize;
     for (s, (sec, bits)) in sections.iter_mut().enumerate() {
@@ -1373,11 +1378,11 @@ fn read(data: &[u8], limits: &Limits) -> Result<(DocModel, HashMap<Arc<str>, Vec
                 *g = prev[k].clone();
                 continue;
             };
-            if b <= a + 1 {
+            if b <= a.saturating_add(1) {
                 *g = prev[k].clone();
                 continue;
             }
-            let mut blocks = r.story(hdd + a as usize, hdd + b as usize);
+            let mut blocks = r.story(hdd.saturating_add(a as usize), hdd.saturating_add(b as usize));
             // The story's last paragraph mark is a guard.
             if blocks.len() > 1 && matches!(blocks.last(), Some(Block::Para(p)) if p.spans.iter().all(|s| s.text.is_empty() && s.object.is_none())) {
                 blocks.pop();
@@ -1496,9 +1501,73 @@ fn cp1252(b: u8) -> u16 {
     if (0x80..0xA0).contains(&b) { HIGH[(b - 0x80) as usize] } else { b as u16 }
 }
 
+/// A Word 97 file of one paragraph, `text` (8-bit), whose header stories
+/// are at `hdd` (test documents).
+#[cfg(test)]
+pub(crate) fn test_file(text: &[u8], hdd: &[u32]) -> Vec<u8> {
+    let mut wd = vec![0u8; 1024];
+    wd[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes());
+    wd[2..4].copy_from_slice(&0x00C1u16.to_le_bytes());
+    wd[0x0A..0x0C].copy_from_slice(&0x0200u16.to_le_bytes());
+    wd[32..34].copy_from_slice(&14u16.to_le_bytes());
+    wd[62..64].copy_from_slice(&22u16.to_le_bytes());
+    wd[64 + 12..64 + 16].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    wd[152..154].copy_from_slice(&93u16.to_le_bytes());
+    let mut fclcb = |i: usize, fc: u32, lcb: u32| {
+        wd[154 + i * 8..158 + i * 8].copy_from_slice(&fc.to_le_bytes());
+        wd[158 + i * 8..162 + i * 8].copy_from_slice(&lcb.to_le_bytes());
+    };
+    // The piece table at 0 of the table stream, the headers' PLC at 64.
+    fclcb(CLX, 0, 21);
+    fclcb(PLCF_HDD, 64, (hdd.len() * 4) as u32);
+    wd.extend_from_slice(text);
+    let mut table = vec![2u8];
+    table.extend(16u32.to_le_bytes());
+    table.extend(0u32.to_le_bytes());
+    table.extend((text.len() as u32).to_le_bytes());
+    table.extend([0, 0]);
+    table.extend((2048u32 | 0x4000_0000).to_le_bytes());
+    table.extend([0, 0]);
+    table.resize(64, 0);
+    table.extend(hdd.iter().flat_map(|v| v.to_le_bytes()));
+    crate::ole::test_file(&[("WordDocument", &wd), ("1Table", &table)], false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_and_draw(data: Vec<u8>) {
+        let mut d = crate::Document::open_bytes(data).unwrap();
+        assert_eq!(d.format(), crate::Format::Doc);
+        d.page_size(0).unwrap();
+        d.render_page(0, 64, &|| false).unwrap();
+    }
+
+    #[test]
+    fn hostile_header_positions() {
+        open_and_draw(test_file(b"Hello\r", &[]));
+        // A header story ending at the last character position.
+        let mut hdd = vec![0u32; 6];
+        hdd.extend([u32::MAX, u32::MAX, u32::MAX - 1, u32::MAX, 0, u32::MAX]);
+        open_and_draw(test_file(b"Hello\r", &hdd));
+        // Fields whose marks are out of order.
+        open_and_draw(test_file(b"\x13PAGE\x15\x14x\x15\x13\x13\x14\r", &hdd));
+    }
+
+    #[test]
+    fn many_cells_without_a_definition() {
+        // Rows of more than 22 cells with no TDefTable: their default
+        // edges would pass an i16.
+        for n in [1, 22, 23, 64, 100] {
+            let cells: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
+            let mut rows = vec![(cells, RowDef::default())];
+            let mut out = Vec::new();
+            flush_table(&mut out, &mut rows);
+            let Some(Block::Table(t)) = out.first() else { panic!("no table") };
+            assert_eq!(t.rows[0].cells.len(), n.min(MAX_CELLS));
+        }
+    }
 
     #[test]
     fn property_lists() {

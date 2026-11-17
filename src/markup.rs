@@ -10,49 +10,67 @@ pub enum Tok<'a> {
 /// Separa el texto en etiquetas y texto. Comentarios, instrucciones y DOCTYPE se descartan;
 /// CDATA se devuelve como texto sin interpretar.
 pub fn tokens(s: &str, lower: bool) -> Vec<Tok<'_>> {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'<' {
-            let j = s[i..].find('<').map(|k| i + k).unwrap_or(b.len());
-            out.push(Tok::Text(&s[i..j]));
-            i = j;
-            continue;
-        }
-        let rest = &s[i..];
-        if rest.starts_with("<!--") {
-            i += rest.find("-->").map(|k| k + 3).unwrap_or(rest.len());
-        } else if rest.starts_with("<![CDATA[") {
-            let end = rest.find("]]>").unwrap_or(rest.len());
-            out.push(Tok::Text(&rest[9..end.max(9)]));
-            i += (end + 3).min(rest.len());
-        } else if rest.starts_with("<?") || rest.starts_with("<!") {
-            i += rest.find('>').map(|k| k + 1).unwrap_or(rest.len());
-        } else {
-            // etiqueta: hasta el '>' que no esté entre comillas
-            let mut j = i + 1;
-            let mut q = 0u8;
-            while j < b.len() {
-                match (q, b[j]) {
-                    (0, b'"' | b'\'') => q = b[j],
-                    (x, c) if x != 0 && c == x => q = 0,
-                    (0, b'>') => break,
-                    _ => {}
+    iter_tokens(s, lower).collect()
+}
+
+/// Como `tokens`, pero de uno en uno: un documento enorme no se convierte entero en memoria.
+pub fn iter_tokens(s: &str, lower: bool) -> Tokens<'_> {
+    Tokens { s, i: 0, lower }
+}
+
+pub struct Tokens<'a> {
+    s: &'a str,
+    i: usize,
+    lower: bool,
+}
+
+impl<'a> Iterator for Tokens<'a> {
+    type Item = Tok<'a>;
+
+    fn next(&mut self) -> Option<Tok<'a>> {
+        let (s, lower) = (self.s, self.lower);
+        let b = s.as_bytes();
+        while self.i < b.len() {
+            let i = self.i;
+            if b[i] != b'<' {
+                let j = s[i..].find('<').map(|k| i + k).unwrap_or(b.len());
+                self.i = j;
+                return Some(Tok::Text(&s[i..j]));
+            }
+            let rest = &s[i..];
+            if rest.starts_with("<!--") {
+                self.i += rest.find("-->").map(|k| k + 3).unwrap_or(rest.len());
+            } else if rest.starts_with("<![CDATA[") {
+                let end = rest.find("]]>").unwrap_or(rest.len());
+                self.i += (end + 3).min(rest.len());
+                return Some(Tok::Text(&rest[9..end.max(9)]));
+            } else if rest.starts_with("<?") || rest.starts_with("<!") {
+                self.i += rest.find('>').map(|k| k + 1).unwrap_or(rest.len());
+            } else {
+                // etiqueta: hasta el '>' que no esté entre comillas
+                let mut j = i + 1;
+                let mut q = 0u8;
+                while j < b.len() {
+                    match (q, b[j]) {
+                        (0, b'"' | b'\'') => q = b[j],
+                        (x, c) if x != 0 && c == x => q = 0,
+                        (0, b'>') => break,
+                        _ => {}
+                    }
+                    j += 1;
                 }
-                j += 1;
-            }
-            let inner = &s[i + 1..j.min(b.len())];
-            i = (j + 1).min(b.len());
-            if let Some(name) = inner.strip_prefix('/') {
-                let n = name.trim();
-                out.push(Tok::Close(if lower { n.to_ascii_lowercase() } else { n.to_string() }));
-            } else if !inner.is_empty() {
-                out.push(parse_open(inner, lower));
+                let inner = &s[i + 1..j.min(b.len())];
+                self.i = (j + 1).min(b.len());
+                if let Some(name) = inner.strip_prefix('/') {
+                    let n = name.trim();
+                    return Some(Tok::Close(if lower { n.to_ascii_lowercase() } else { n.to_string() }));
+                } else if !inner.is_empty() {
+                    return Some(parse_open(inner, lower));
+                }
             }
         }
+        None
     }
-    out
 }
 
 fn parse_open(inner: &str, lower: bool) -> Tok<'static> {
@@ -200,8 +218,11 @@ impl Json {
     }
 }
 
+/// Valores como mucho en un JSON: cada uno ocupa en memoria decenas de veces lo que en el archivo.
+const MAX_JSON_VALUES: usize = 2_000_000;
+
 pub fn parse_json(s: &str) -> Option<Json> {
-    let mut p = JP { b: s.as_bytes(), i: 0, depth: 0 };
+    let mut p = JP { b: s.as_bytes(), i: 0, depth: 0, left: MAX_JSON_VALUES };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -212,6 +233,8 @@ struct JP<'a> {
     b: &'a [u8],
     i: usize,
     depth: usize,
+    /// valores que aún se pueden crear
+    left: usize,
 }
 
 impl JP<'_> {
@@ -236,9 +259,10 @@ impl JP<'_> {
 
     fn value(&mut self) -> Option<Json> {
         self.depth += 1;
-        if self.depth > 200 {
+        if self.depth > 200 || self.left == 0 {
             return None;
         }
+        self.left -= 1;
         let v = match *self.b.get(self.i)? {
             b'{' => {
                 self.i += 1;
@@ -361,6 +385,24 @@ mod tests {
         assert_eq!(j.get("a").unwrap().at(1).unwrap().num(), Some(2.5));
         assert_eq!(j.get("a").unwrap().at(2).unwrap().get("b").unwrap().str(), Some("xé\n"));
         assert!(parse_json("{").is_none());
+    }
+
+    #[test]
+    fn json_value_budget() {
+        let mut s = String::from("[");
+        s.push_str(&"0,".repeat(MAX_JSON_VALUES));
+        s.push_str("0]");
+        assert!(parse_json(&s).is_none());
+        let ok = format!("[{}0]", "0,".repeat(1000));
+        assert_eq!(parse_json(&ok).unwrap().arr().len(), 1001);
+    }
+
+    #[test]
+    fn lazy_tokens_match_eager() {
+        let s = "<a x='1'>t<!-- c --><![CDATA[<z>]]><?pi?></a><b/>";
+        let a: Vec<String> = tokens(s, false).iter().map(|t| match t { Tok::Open { name, .. } => format!("<{name}"), Tok::Close(n) => format!("</{n}"), Tok::Text(t) => t.to_string() }).collect();
+        assert_eq!(a, ["<a", "t", "<z>", "</a", "<b"]);
+        assert_eq!(iter_tokens(s, false).count(), 5);
     }
 
     #[test]

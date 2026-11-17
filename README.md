@@ -30,10 +30,14 @@ Requires the Android SDK (build-tools 34, platform 34), the NDK and the `aarch64
 target. Then:
 
 ```sh
-./android/build-apk.sh        # produces target-android/FileBrowser.apk (signed with the debug key)
+./android/build-apk.sh        # produces target-android/FileBrowser.apk
 ```
 
-`ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK.
+`ANDROID_HOME` and `NDK` can be set to point at your SDK/NDK. Without `ANDROID_KEYSTORE` the APK is signed
+with the local **debug key** and the script prints a warning: such an APK is only for testing (anyone can make
+the same key, and it cannot be updated by an APK signed with a real key). To sign a release, set
+`ANDROID_KEYSTORE`, `ANDROID_KS_ALIAS` and either `ANDROID_KS_PASS` or `ANDROID_KS_PASS_FILE` (a file with the
+password); the password is passed to `apksigner` through the environment or that file, never on the command line.
 
 ### Web version (the same app in the browser)
 
@@ -98,7 +102,40 @@ request: Linux x86-64 and aarch64, Windows x86-64 and ARM64, macOS (universal `.
 Pushing a tag such as `v0.2.0` publishes a GitHub release with all binaries and `SHA256SUMS`.
 
 To sign the Android APK with your own key instead of a throw-away debug key, add the repository secrets
-`ANDROID_KEYSTORE_B64` (base64 of the keystore), `ANDROID_KS_PASS` and `ANDROID_KS_ALIAS`.
+`ANDROID_KEYSTORE_B64` (base64 of the keystore), `ANDROID_KS_PASS` and `ANDROID_KS_ALIAS`. Without them the
+CI APKs are signed with a debug key and are for testing only. CI also runs Clippy and `cargo audit`.
+
+### Automated screenshots (developers)
+
+A small harness drives the app from environment variables and saves a screenshot, for visual checks of
+dialogs and layouts. It is behind the non-default `selftest` feature: normal and release builds contain none
+of it and ignore these variables.
+
+```sh
+FB_SHOT=/tmp/shot.png FB_DLG=opts cargo run --features selftest -- ~/Documents
+```
+
+| Variable | Effect |
+|----------|--------|
+| `FB_SHOT=file.png` | enables the harness: saves a PNG screenshot after `FB_WAIT` ms and exits; prints `[trace]` timings to stderr |
+| `FB_WAIT=ms` | delay before the screenshot (default 2500) |
+| `FB_DLG=name` | opens a dialog or state with sample content: `opts`, `cols`, `temas`, `temas_new`, `welcome`, `keys`, `keys_ask`, `keys_reset`, `keys_find`, `trash_ask`, `compress`, `run`, `toast`, `conflict`, `conflict_info`, `delete_many`, `del`, `share`, `filter_empty`, `hostkey`, `batch`, `pass`, `props`, `net`, `rename`, `rename_touch`, `selmode`, `palette`, `hash`, `openwith`, `openwith-search`, `openwith-browse`, `dups`, `trash`, `themeanim`, `newfile`, `netlogin`, `netshares`, `errors`, `about`, `quit`, `tasks`, `phonetabs`, `copyui`, `undotest`, `gear`, `foldericon`, `favlabel`, `btnall`, `deep`, `searchall`, `searchdir`, `addr`, `tabsplit`, `tab`; any other name opens the search |
+| `FB_OW_QUERY=text` | search typed in the `openwith-search` dialog (default `text`) |
+| `FB_COPY_SRC`, `FB_COPY_DST` | source and destination of the `copyui` copy |
+| `FB_PREVIEW=n` | opens the preview of the n-th entry |
+| `FB_PLAY` | starts playback in the preview |
+| `FB_USAGE` | folder previews open on the «Disk usage» tab |
+| `FB_TASKS=dir` | starts three copies of the current folder into `dir` (task centre) |
+| `FB_DBL` | simulates a double click on the first entry |
+| `FB_TERM` | opens the integrated terminal and runs a command |
+| `FB_COLS` / `FB_LIST` | column view / list view at start-up |
+| `FB_SPLIT[=dir]` | split view (in `dir` or the current folder) |
+| `FB_FILTER=text` | initial filter text |
+| `FB_PHONE` | phone layout on the desktop |
+| `FB_INSETS=l,t,r,b` | simulated safe-area insets, in points |
+
+Some cases (`conflict`, `undotest`, `FB_TASKS`, `copyui`) create or copy files: run them in a scratch folder.
+`FB_POS` (window position of a new window) is not part of the harness.
 
 ## Performance design
 
@@ -109,7 +146,9 @@ To sign the Android APK with your own key instead of a throw-away debug key, add
 - **Thumbnails**: a "visible first" queue that is replaced every frame (scrolling fast drops stale
   work), a thread pool, JPEG decoding with DCT downscaling (1/2–1/8) and an LRU texture cache.
 - **Vector icons** drawn with the painter: no image or icon fonts needed.
-- **No continuous repainting**: 0 % CPU at idle.
+- **No continuous repainting**: the window only redraws on input or when something changes. At idle
+  the only wake-up is a cheap check for changes in the open folders, every 2 s while focused and every
+  6 s otherwise (none while minimised), so CPU use stays near zero.
 
 ## Features
 
@@ -143,7 +182,7 @@ To sign the Android APK with your own key instead of a throw-away debug key, add
 
 | Key | Action |
 |---|---|
-| `Space` | Quick preview (←/→ navigate, `Esc`/`Space` close, `Enter` opens) |
+| `Space` | Quick preview (←/→ navigate, `Esc`/`Space` close, `Enter`/`O` open; in videos `Space`/`Enter` play/pause, ←/→ seek, `O` opens) |
 | `Enter` / double click | Open |
 | `Backspace`, `Alt+↑` | Parent folder · `Alt+←/→` back/forward |
 | `F2` | Rename · `Del` trash · `Shift+Del` delete permanently |
@@ -155,10 +194,11 @@ To sign the Android APK with your own key instead of a throw-away debug key, add
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `F9` | Split view · `Tab` switch pane · `F6`/`F7` copy/move to the other pane |
 | `F12` | Terminal |
-| Type a name | Jump to the first entry starting with it |
+| Type a name | Filter the list to the matching entries |
 
-Drag items onto a folder or onto the sidebar to move them; drag on empty space for a rubber-band
-selection. Dropping files from another application onto the window copies them to the current folder.
+Drag items onto a folder or onto the sidebar to move them; dropping them on another disk copies them
+instead, and holding Ctrl (Option on macOS) always copies while holding Shift always moves. Drag on empty
+space for a rubber-band selection. Dropping files from another application onto the window copies them to the current folder.
 
 ### Flatpak
 
@@ -181,8 +221,8 @@ It runs sandboxed with access to your files (`--filesystem=host`); launching ext
 
 ## Known limitations
 
-- Dragging files **out** of the application into other apps is not supported on Linux (winit does not
-  provide a drag source). Use copy and paste instead.
+- Dragging files **out** to other applications on Linux uses the app's own Wayland/X11 drag source (winit
+  does not provide one); some applications may not accept it. Copy and paste works everywhere.
 - On Windows and macOS, the file clipboard shared with other apps is not implemented (only paths as
   text). On Linux it needs `wl-copy`/`xclip`.
 - Network locations rely on gvfs and are Linux-only.

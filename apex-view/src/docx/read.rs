@@ -592,6 +592,10 @@ pub(crate) fn number(n: i32, fmt: &str) -> String {
                 return n.to_string();
             }
             let n = n as u32 - 1;
+            // Huge numbers (from the file) as digits, not megabytes of letters.
+            if n / 26 >= 64 {
+                return (n + 1).to_string();
+            }
             let c = (b'a' + (n % 26) as u8) as char;
             let s = c.to_string().repeat((n / 26) as usize + 1);
             if fmt == "upperLetter" { s.to_uppercase() } else { s }
@@ -1146,4 +1150,17 @@ pub(crate) fn read(pkg: &Package) -> Result<DocModel, Error> {
     }
     let background = root.child("background").and_then(|b| b.attr("color")).and_then(color_of);
     Ok(DocModel { body: blocks, sections, background })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_letter_numbers_are_written_in_digits() {
+        assert_eq!(number(28, "lowerLetter"), "bb");
+        assert_eq!(number(i32::MAX, "upperLetter"), i32::MAX.to_string());
+        assert_eq!(number(26 * 64, "lowerLetter").len(), 64);
+        assert_eq!(number(26 * 64 + 1, "lowerLetter"), (26 * 64 + 1).to_string());
+    }
 }

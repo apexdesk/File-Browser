@@ -13,7 +13,7 @@ fn err(kind: io::ErrorKind, msg: &str) -> io::Error {
 }
 
 fn not_found() -> io::Error {
-    err(io::ErrorKind::NotFound, "no existe")
+    err(io::ErrorKind::NotFound, crate::i18n::t("no existe"))
 }
 
 // ---------- tipos ----------
@@ -77,7 +77,7 @@ impl Metadata {
     }
     pub fn modified(&self) -> io::Result<SystemTime> {
         if self.mtime <= 0 {
-            return Err(err(io::ErrorKind::Unsupported, "sin fecha"));
+            return Err(err(io::ErrorKind::Unsupported, crate::i18n::t("sin fecha")));
         }
         Ok(UNIX_EPOCH + Duration::from_secs(self.mtime as u64))
     }
@@ -85,7 +85,7 @@ impl Metadata {
         self.modified()
     }
     pub fn created(&self) -> io::Result<SystemTime> {
-        Err(err(io::ErrorKind::Unsupported, "sin fecha de creación"))
+        Err(err(io::ErrorKind::Unsupported, crate::i18n::t("sin fecha de creación")))
     }
 }
 
@@ -172,7 +172,7 @@ fn mem_op(op: &str, a: &str, b: Option<&str>) -> io::Result<()> {
     MEM.with_borrow_mut(|m| match op {
         "mkdir" => {
             if m.dirs.contains(a) || m.files.contains_key(a) {
-                return Err(err(io::ErrorKind::AlreadyExists, "ya existe"));
+                return Err(err(io::ErrorKind::AlreadyExists, crate::i18n::t("ya existe")));
             }
             m.dirs.insert(a.to_string());
             Ok(())
@@ -206,7 +206,7 @@ fn mem_op(op: &str, a: &str, b: Option<&str>) -> io::Result<()> {
             }
             Ok(())
         }
-        _ => Err(err(io::ErrorKind::Unsupported, "operación desconocida")),
+        _ => Err(err(io::ErrorKind::Unsupported, crate::i18n::t("operación desconocida"))),
     })
 }
 
@@ -231,7 +231,7 @@ thread_local! {
 const TTL: f64 = 3.0;
 
 /// La ruta tal y como la entiende el servidor: sin la barra inicial ni barras dobles.
-fn virt(p: &Path) -> String {
+pub(crate) fn virt(p: &Path) -> String {
     let s = p.to_string_lossy();
     s.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/")
 }
@@ -242,6 +242,12 @@ fn forget(path: &str) {
         m.remove(path);
         m.remove(parent_of(path));
     });
+}
+
+/// Olvida el listado guardado de la carpeta `dir` (el siguiente se pide al servidor).
+pub(crate) fn invalidate(dir: &Path) {
+    let v = virt(dir);
+    LISTINGS.with_borrow_mut(|m| m.remove(&v));
 }
 
 fn parent_of(path: &str) -> &str {
@@ -284,7 +290,7 @@ pub fn read_dir<P: AsRef<Path>>(p: P) -> io::Result<ReadDir> {
     let path = p.as_ref();
     let v = virt(path);
     if !metadata(path)?.is_dir() {
-        return Err(err(io::ErrorKind::NotADirectory, "no es una carpeta"));
+        return Err(err(io::ErrorKind::NotADirectory, crate::i18n::t("no es una carpeta")));
     }
     let rows = listing(&v)?;
     let base = Path::new("/").join(&v);
@@ -305,29 +311,33 @@ pub fn read<P: AsRef<Path>>(p: P) -> io::Result<Vec<u8>> {
 }
 
 pub fn read_to_string<P: AsRef<Path>>(p: P) -> io::Result<String> {
-    String::from_utf8(read(p)?).map_err(|_| err(io::ErrorKind::InvalidData, "no es UTF-8"))
+    String::from_utf8(read(p)?).map_err(|_| err(io::ErrorKind::InvalidData, crate::i18n::t("no es UTF-8")))
 }
 
 pub fn read_link<P: AsRef<Path>>(_p: P) -> io::Result<PathBuf> {
-    Err(err(io::ErrorKind::InvalidInput, "no es un enlace"))
+    Err(err(io::ErrorKind::InvalidInput, crate::i18n::t("no es un enlace")))
 }
 
 pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(p: P, contents: C) -> io::Result<()> {
     let v = virt(p.as_ref());
-    store(&v, contents.as_ref())?;
+    store(&v, contents.as_ref(), false)?;
     Ok(())
 }
 
 /// Guarda un archivo entero: en memoria si es de la carpeta local, y si no, en el servidor.
-fn store(v: &str, data: &[u8]) -> io::Result<()> {
+/// `only_new`: solo si no existe (si existe, `AlreadyExists`; el servidor no lo pisa).
+fn store(v: &str, data: &[u8], only_new: bool) -> io::Result<()> {
     if is_local(v) {
         if !MEM.with_borrow(|m| m.dirs.contains(parent_of(v)) || parent_of(v) == LOCAL) {
             return Err(not_found());
         }
+        if only_new && MEM.with_borrow(|m| m.files.contains_key(v) || m.dirs.contains(v)) {
+            return Err(err(io::ErrorKind::AlreadyExists, crate::i18n::t("ya existe")));
+        }
         MEM.with_borrow_mut(|m| m.files.insert(v.to_string(), (data.to_vec(), now_secs())));
         return Ok(());
     }
-    crate::vfs::net::put(v, data)?;
+    crate::vfs::net::put(v, data, only_new)?;
     forget(v);
     Ok(())
 }
@@ -395,6 +405,10 @@ pub struct File {
     out: Option<Vec<u8>>,
     /// contenido ya en memoria (archivos de la carpeta local)
     mem: Option<Vec<u8>>,
+    /// Hay datos escritos que aún no se han enviado.
+    dirty: bool,
+    /// Abierto con `create_new`: el primer envío no pisa un archivo que ya exista.
+    only_new: bool,
 }
 
 const CHUNK: u64 = 512 * 1024;
@@ -403,19 +417,28 @@ impl File {
     pub fn open<P: AsRef<Path>>(p: P) -> io::Result<File> {
         let md = metadata(p.as_ref())?;
         if md.is_dir() {
-            return Err(err(io::ErrorKind::IsADirectory, "es una carpeta"));
+            return Err(err(io::ErrorKind::IsADirectory, crate::i18n::t("es una carpeta")));
         }
         let path = virt(p.as_ref());
         let mem = is_local(&path).then(|| MEM.with_borrow(|m| m.files.get(&path).map(|f| f.0.clone()))).flatten();
-        Ok(File { path, size: md.len(), pos: 0, cache: (0, Vec::new()), out: None, mem })
+        Ok(File { path, size: md.len(), pos: 0, cache: (0, Vec::new()), out: None, mem, dirty: false, only_new: false })
     }
 
     pub fn create<P: AsRef<Path>>(p: P) -> io::Result<File> {
+        Self::create_with(p, false)
+    }
+
+    /// `create_new`: como `std`, falla si ya existe (lo comprueba el servidor al enviar; aquí se mira el
+    /// listado para avisar antes de escribir nada).
+    fn create_with<P: AsRef<Path>>(p: P, create_new: bool) -> io::Result<File> {
         let path = virt(p.as_ref());
         if !is_local(&path) && !crate::vfs::net::writable() {
-            return Err(err(io::ErrorKind::PermissionDenied, "el servidor es de solo lectura"));
+            return Err(err(io::ErrorKind::PermissionDenied, crate::i18n::t("el servidor es de solo lectura")));
         }
-        Ok(File { path, size: 0, pos: 0, cache: (0, Vec::new()), out: Some(Vec::new()), mem: None })
+        if create_new && metadata(p.as_ref()).is_ok() {
+            return Err(err(io::ErrorKind::AlreadyExists, crate::i18n::t("ya existe")));
+        }
+        Ok(File { path, size: 0, pos: 0, cache: (0, Vec::new()), out: Some(Vec::new()), mem: None, dirty: true, only_new: create_new })
     }
 
     pub fn options() -> OpenOptions {
@@ -427,7 +450,7 @@ impl File {
     }
 
     pub fn set_len(&self, _n: u64) -> io::Result<()> {
-        Err(err(io::ErrorKind::Unsupported, "no disponible"))
+        Err(err(io::ErrorKind::Unsupported, crate::i18n::t("no disponible")))
     }
 
     pub fn set_modified(&self, _t: SystemTime) -> io::Result<()> {
@@ -443,15 +466,23 @@ impl File {
     }
 
     pub fn try_clone(&self) -> io::Result<File> {
-        Err(err(io::ErrorKind::Unsupported, "no disponible"))
+        Err(err(io::ErrorKind::Unsupported, crate::i18n::t("no disponible")))
     }
 
+    /// Envía lo escrito. Quien necesite saber si llegó (copiar, mover) llama a `flush`, que
+    /// devuelve el error; al soltar el archivo sin más ya no hay a quién avisar.
     fn send(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         if let Some(buf) = self.out.take() {
-            let r = store(&self.path, &buf);
+            let r = store(&self.path, &buf, self.only_new);
             self.out = Some(buf);
             r?;
         }
+        // ya es nuestro: los envíos siguientes lo reemplazan
+        self.only_new = false;
+        self.dirty = false;
         Ok(())
     }
 }
@@ -490,7 +521,7 @@ impl Read for File {
 
 impl Read for &File {
     fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        Err(err(io::ErrorKind::Unsupported, "no disponible"))
+        Err(err(io::ErrorKind::Unsupported, crate::i18n::t("no disponible")))
     }
 }
 
@@ -503,7 +534,7 @@ impl Seek for File {
             SeekFrom::Current(d) => self.pos as i128 + d as i128,
         };
         if p < 0 {
-            return Err(err(io::ErrorKind::InvalidInput, "posición negativa"));
+            return Err(err(io::ErrorKind::InvalidInput, crate::i18n::t("posición negativa")));
         }
         self.pos = p as u64;
         Ok(self.pos)
@@ -513,20 +544,22 @@ impl Seek for File {
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let Some(out) = self.out.as_mut() else {
-            return Err(err(io::ErrorKind::PermissionDenied, "abierto solo para leer"));
+            return Err(err(io::ErrorKind::PermissionDenied, crate::i18n::t("abierto solo para leer")));
         };
         out.extend_from_slice(buf);
+        self.dirty = true;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.send()
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
     write: bool,
+    create_new: bool,
 }
 
 impl OpenOptions {
@@ -547,14 +580,15 @@ impl OpenOptions {
     pub fn create(&mut self, _c: bool) -> &mut OpenOptions {
         self
     }
-    pub fn create_new(&mut self, _c: bool) -> &mut OpenOptions {
+    pub fn create_new(&mut self, c: bool) -> &mut OpenOptions {
+        self.create_new = c;
         self
     }
     pub fn truncate(&mut self, _t: bool) -> &mut OpenOptions {
         self
     }
     pub fn open<P: AsRef<Path>>(&self, p: P) -> io::Result<File> {
-        if self.write { File::create(p) } else { File::open(p) }
+        if self.write { File::create_with(p, self.create_new) } else { File::open(p) }
     }
 }
 

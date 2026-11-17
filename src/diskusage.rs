@@ -107,7 +107,7 @@ fn file_size(md: &crate::vfs::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        md.blocks() * 512
+        md.blocks().saturating_mul(512)
     }
     #[cfg(not(unix))]
     {
@@ -168,7 +168,7 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
                         // baja prioridad: deja respirar al disco y a la CPU
                         crate::vfs::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    arena[idx].own += sz;
+                    arena[idx].own = arena[idx].own.saturating_add(sz);
                     // sólo se conservan individualmente los archivos de los anillos visibles
                     // y de cada carpeta sólo los mayores: una carpeta con millones de archivos no
                     // debe llenar la memoria
@@ -218,7 +218,7 @@ fn scan_bfs(root: &Path, name: String, c: &Ctx) -> Node {
     for i in (1..arena.len()).rev() {
         if parent[i] != usize::MAX && arena[i].dir {
             let t = total[i];
-            total[parent[i]] += t;
+            total[parent[i]] = total[parent[i]].saturating_add(t);
         }
     }
     build(&arena, &total, 0, 0)
@@ -234,10 +234,10 @@ fn build(arena: &[Ent], total: &[u64], i: usize, depth: usize) -> Node {
     kids.sort_by(|a, b| b.size.cmp(&a.size));
     let mut extra = e.dropped;
     if kids.len() > KIDS {
-        extra += (kids.len() - KIDS) as u64;
+        extra = extra.saturating_add((kids.len() - KIDS) as u64);
         kids.truncate(KIDS);
     }
-    let kept: u64 = kids.iter().map(|k| k.size).sum();
+    let kept: u64 = kids.iter().fold(0u64, |a, k| a.saturating_add(k.size));
     let rest = node.size.saturating_sub(kept);
     if extra > 0 && rest > 0 {
         kids.push(Node { name: format!("… ({extra})"), size: rest, dir: false, other: true, kids: Vec::new() });

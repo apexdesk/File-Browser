@@ -503,6 +503,13 @@ impl Func {
                 if total > 4_000_000 {
                     return None;
                 }
+                // Reading the samples costs a step a bit: functions named
+                // over and over must not each read millions again.
+                let cost = total * bps;
+                if FUNC_STEPS.with(|c| c.get()) < cost {
+                    return None;
+                }
+                charge(cost);
                 let mut encode = floats(f, &d, "Encode");
                 if encode.len() != 2 * m {
                     encode = size.iter().flat_map(|&s| [0.0, (s - 1) as f32]).collect();

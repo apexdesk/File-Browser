@@ -161,7 +161,12 @@ impl<'a> PdfFile<'a> {
                 continue;
             }
             // Files with junk before the header have offsets from it.
-            let p = if self.xref_at(p) { p } else if self.xref_at(p + header) { p + header } else if trailer.is_some() { continue } else { return false };
+            let p = match p.checked_add(header) {
+                _ if self.xref_at(p) => p,
+                Some(q) if self.xref_at(q) => q,
+                _ if trailer.is_some() => continue,
+                _ => return false,
+            };
             let t = if data[p..].starts_with(b"xref") { self.xref_table(p) } else { self.xref_stream(p) };
             let Some(t) = t else { break };
             // A hybrid file's stream right after its table, then the
@@ -207,7 +212,7 @@ impl<'a> PdfFile<'a> {
                     let Item::Obj(Obj::Int(count)) = lx.next(false)? else { return None };
                     for i in 0..count.max(0) {
                         let (Some(Item::Obj(off)), Some(Item::Obj(_gen)), Some(Item::Kw(kind))) = (lx.next(false), lx.next(false), lx.next(false)) else { return None };
-                        let n = (start + i) as u32;
+                        let n = start.wrapping_add(i) as u32;
                         if kind == b"n" && !self.xref.contains_key(&n) {
                             let off = off.int().unwrap_or(0).max(0) as usize;
                             if off > 0 {
@@ -236,7 +241,8 @@ impl<'a> PdfFile<'a> {
         let w: Vec<usize> = d.get("W")?.array()?.iter().map(|o| o.int().unwrap_or(0).max(0) as usize).collect();
         // A field wider than 8 bytes holds nothing a u64 can (and the sum
         // of huge ones would wrap).
-        if w.len() < 3 || w.iter().any(|&n| n > 8) || w.iter().sum::<usize>() == 0 {
+        // Rows of no bytes are no rows (`chunks_exact(0)` panics).
+        if w.len() < 3 || w.iter().any(|&n| n > 8) || w[..3].iter().sum::<usize>() == 0 {
             return None;
         }
         let size = d.get("Size").and_then(Obj::int).unwrap_or(0);
@@ -255,7 +261,7 @@ impl<'a> PdfFile<'a> {
                 let t = if w[0] == 0 { 1 } else { field(&r[..w[0]]) };
                 let a = field(&r[w[0]..w[0] + w[1]]);
                 let b = field(&r[w[0] + w[1]..]);
-                let n = (start + i) as u32;
+                let n = start.wrapping_add(i) as u32;
                 if self.xref.contains_key(&n) {
                     continue;
                 }
@@ -347,6 +353,12 @@ impl<'a> PdfFile<'a> {
         if let Some(o) = self.cache.borrow().get(&n) {
             return o.clone();
         }
+        // Loading one object may load others (an indirect /Length, the
+        // object stream it is in): a chain of them is cut short, not
+        // followed down the stack (and not cached, read again from the top).
+        if self.loading.borrow().len() >= MAX_LOAD_DEPTH {
+            return Obj::Null;
+        }
         if !self.loading.borrow_mut().insert(n) {
             return Obj::Null;
         }
@@ -419,7 +431,7 @@ impl<'a> PdfFile<'a> {
         let mut offs = Vec::new();
         for _ in 0..count {
             let (Some(Item::Obj(Obj::Int(m))), Some(Item::Obj(Obj::Int(o)))) = (lx.next(false), lx.next(false)) else { break };
-            offs.push((m as u32, first + o.max(0) as usize));
+            offs.push((m as u32, first.saturating_add(o.max(0) as usize)));
         }
         let s2 = Arc::new((data, offs));
         self.streams.borrow_mut().insert(s, s2.clone());
@@ -700,6 +712,9 @@ fn scan(data: &[u8]) -> (HashMap<u32, usize>, Dict) {
 /// The most one filter of a stream may make: a few kilobytes inflating
 /// to gigabytes (a "bomb") stop here, with what came before.
 pub(super) const MAX_DECODED: usize = 256 << 20;
+
+/// How many objects may be loading at once, each for the one before.
+const MAX_LOAD_DEPTH: usize = 32;
 
 /// The most objects a cross-reference stream may list.
 const MAX_ENTRIES: usize = 1 << 23;

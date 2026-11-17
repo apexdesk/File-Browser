@@ -5,6 +5,10 @@ use egui::{pos2, vec2, Align2, CornerRadius, FontId, Rect, Stroke};
 
 const MAX_ROWS: usize = 50_000;
 const MAX_COLS: usize = 200;
+/// bytes como mucho en una celda de CSV
+const MAX_FIELD: usize = 2000;
+/// celdas como mucho en una tabla CSV (filas × columnas)
+const MAX_CELLS: usize = 2_000_000;
 const ROW_H: f32 = 24.0;
 const HEAD_H: f32 = 28.0;
 
@@ -37,37 +41,56 @@ pub fn csv(text: &str) -> Table {
     let mut quoted = false;
     let mut chars = text.chars().peekable();
     let mut truncated = false;
+    // topes: letras por celda, celdas por fila y celdas en total (una fila de sólo comas no debe
+    // convertirse en millones de cadenas vacías)
+    let mut wide = 0usize;
+    let push_field = |row: &mut Vec<String>, field: &mut String, truncated: &mut bool| {
+        if row.len() < MAX_COLS {
+            row.push(std::mem::take(field));
+        } else {
+            *truncated = true;
+            field.clear();
+        }
+    };
+    let push_char = |field: &mut String, c: char, truncated: &mut bool| {
+        if field.len() < MAX_FIELD {
+            field.push(c);
+        } else {
+            *truncated = true;
+        }
+    };
     while let Some(c) = chars.next() {
         if quoted {
             if c == '"' {
                 if chars.peek() == Some(&'"') {
                     chars.next();
-                    field.push('"');
+                    push_char(&mut field, '"', &mut truncated);
                 } else {
                     quoted = false;
                 }
             } else {
-                field.push(if c == '\n' || c == '\r' { ' ' } else { c });
+                push_char(&mut field, if c == '\n' || c == '\r' { ' ' } else { c }, &mut truncated);
             }
             continue;
         }
         match c {
             '"' if field.is_empty() => quoted = true,
-            c if c == d => row.push(std::mem::take(&mut field)),
+            c if c == d => push_field(&mut row, &mut field, &mut truncated),
             '\r' => {}
             '\n' => {
-                row.push(std::mem::take(&mut field));
+                push_field(&mut row, &mut field, &mut truncated);
+                wide = wide.max(row.len());
                 rows.push(std::mem::take(&mut row));
-                if rows.len() >= MAX_ROWS {
+                if rows.len() >= MAX_ROWS || rows.len().saturating_mul(wide) >= MAX_CELLS {
                     truncated = true;
                     break;
                 }
             }
-            c => field.push(c),
+            c => push_char(&mut field, c, &mut truncated),
         }
     }
-    if !truncated && (!field.is_empty() || !row.is_empty()) {
-        row.push(field);
+    if rows.len() < MAX_ROWS && rows.len().saturating_mul(wide) < MAX_CELLS && (!field.is_empty() || !row.is_empty()) {
+        push_field(&mut row, &mut field, &mut truncated);
         rows.push(row);
     }
     let width = rows.iter().map(|r| r.len()).max().unwrap_or(0).min(MAX_COLS);
@@ -82,8 +105,8 @@ pub fn csv(text: &str) -> Table {
 pub struct TableView {
     pub tables: Vec<(String, Table)>,
     cur: usize,
-    scroll: f32,
-    scroll_x: f32,
+    pub scroll: f32,
+    pub scroll_x: f32,
     list_scroll: f32,
     widths: Vec<Vec<f32>>,
 }
@@ -107,7 +130,9 @@ impl TableView {
         TableView { tables, cur: 0, scroll: 0.0, scroll_x: 0.0, list_scroll: 0.0, widths }
     }
 
-    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, pointer: Option<egui::Pos2>, clicked: bool) {
+    /// `hot`: puntero encima; `active`: acepta el ratón; `keys`: el teclado es suyo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, pointer: Option<egui::Pos2>, clicked: bool, active: bool, keys: bool) {
         p.rect_filled(area, CornerRadius::same(10), pal.bg);
         let mut main = area;
         // lista de tablas (bases de datos)
@@ -155,10 +180,17 @@ impl TableView {
         let (dx, dy, shift) = ctx.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y, i.modifiers.shift));
         if hot && in_main {
             let (ax, ay) = if shift { (dx + dy, 0.0) } else { (dx, dy) };
-            self.scroll_x = (self.scroll_x - ax).clamp(0.0, (total_w - main.width()).max(0.0));
-            self.scroll = (self.scroll - ay).clamp(0.0, (total_h - body.height()).max(0.0));
+            // con el dedo, arrastrar desplaza en los dos ejes
+            let drag = ctx.input(|i| {
+                let touch = cfg!(target_os = "android") || i.any_touches();
+                let ok = touch && i.pointer.primary_down() && !crate::preview::edge_start(i) && i.pointer.press_origin().is_some_and(|o| main.contains(o) && o.x < main.right() - 16.0);
+                if ok { i.pointer.delta() } else { egui::Vec2::ZERO }
+            });
+            self.scroll_x = (self.scroll_x - ax - drag.x).clamp(0.0, (total_w - main.width()).max(0.0));
+            self.scroll = (self.scroll - ay - drag.y).clamp(0.0, (total_h - body.height()).max(0.0));
         }
-        crate::rich::scroll_input(ctx, body, total_h, &mut self.scroll, false);
+        self.scroll_x = self.scroll_x.clamp(0.0, (total_w - main.width()).max(0.0));
+        crate::rich::scroll_input(ctx, body, total_h, &mut self.scroll, false, keys);
         let cp = p.with_clip_rect(main);
         let font = FontId::proportional(13.0);
         // columnas visibles
@@ -170,6 +202,9 @@ impl TableView {
         }
         let first = (self.scroll / ROW_H) as usize;
         let n = (body.height() / ROW_H) as usize + 2;
+        // celda recortada bajo el puntero: su valor completo va en un globo
+        let mut tip: Option<(usize, usize, &str)> = None;
+        let over = pointer.filter(|q| active && body.contains(*q) && q.x > main.left() + gutter && q.x < main.right() - 14.0);
         for (k, row) in t.rows.iter().enumerate().skip(first).take(n) {
             let y = body.top() + k as f32 * ROW_H - self.scroll;
             if k % 2 == 1 {
@@ -182,7 +217,11 @@ impl TableView {
                     continue;
                 }
                 let maxc = ((w - 14.0) / 7.2).max(1.0) as usize;
-                let txt: String = if cell.chars().count() > maxc { cell.chars().take(maxc.saturating_sub(1)).collect::<String>() + "…" } else { cell.clone() };
+                let cut = cell.chars().count() > maxc;
+                let txt: String = if cut { cell.chars().take(maxc.saturating_sub(1)).collect::<String>() + "…" } else { cell.clone() };
+                if cut && over.is_some_and(|q| q.x >= cx && q.x < cx + w && q.y >= y && q.y < y + ROW_H) {
+                    tip = Some((k, c, cell.as_str()));
+                }
                 let num = cell.parse::<f64>().is_ok();
                 let (pos, al) = if num { (pos2(cx + w - 8.0, y + ROW_H / 2.0), Align2::RIGHT_CENTER) } else { (pos2(cx + 8.0, y + ROW_H / 2.0), Align2::LEFT_CENTER) };
                 cp.with_clip_rect(Rect::from_min_max(pos2((main.left() + gutter).max(cx), y), pos2((cx + w).min(main.right()), y + ROW_H))).text(pos, al, txt, font.clone(), pal.text);
@@ -207,7 +246,19 @@ impl TableView {
         if t.truncated {
             cp.text(pos2(main.right() - 12.0, main.bottom() - 8.0), Align2::RIGHT_BOTTOM, crate::i18n::t("(vista parcial)"), FontId::proportional(11.5), pal.subtle);
         }
-        crate::rich::scrollbar(&cp, body, total_h + 0.0, self.scroll, pal);
+        crate::rich::scrollbar(ctx, &cp, body, total_h + 0.0, &mut self.scroll, pal, active);
+        if total_w > main.width() {
+            let track = Rect::from_min_max(pos2(main.left() + gutter, main.bottom() - 11.0), pos2(main.right() - 16.0, main.bottom() - 1.0));
+            crate::rich::scrollbar_track(ctx, &cp, track, main.width(), total_w, &mut self.scroll_x, pal, active, false);
+        }
+        if let Some((r, c, val)) = tip {
+            if !ctx.input(|i| i.pointer.any_down()) {
+                egui::Tooltip::always_open(ctx.clone(), p.layer_id(), egui::Id::new(("fb_cell_tip", r, c)), egui::PopupAnchor::Pointer).show(|ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(val);
+                });
+            }
+        }
     }
 }
 
@@ -223,5 +274,20 @@ mod tests {
         assert_eq!(t.rows[1][1], "he said \"hi\"");
         let t = csv("x\ty\n1\t2");
         assert_eq!(t.rows[0], ["1", "2"]);
+    }
+
+    #[test]
+    fn csv_amplification_is_bounded() {
+        // una sola fila de millones de comas
+        let t = csv(&",".repeat(3_000_000));
+        assert!(t.truncated && t.head.len() <= MAX_COLS);
+        // una celda enorme
+        let t = csv(&format!("a,b\n{},1\n", "x".repeat(1_000_000)));
+        assert!(t.truncated && t.rows[0][0].len() <= MAX_FIELD + 4);
+        // muchas filas anchas: el total de celdas queda acotado
+        let line = format!("{}\n", ",".repeat(MAX_COLS - 1));
+        let t = csv(&line.repeat(40_000));
+        assert!(t.truncated);
+        assert!((t.rows.len() + 1) * t.head.len() <= MAX_CELLS + MAX_COLS);
     }
 }

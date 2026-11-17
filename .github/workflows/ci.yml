@@ -20,12 +20,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: System libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev libasound2-dev
-      - run: cargo test --release --lib
+      # todo el espacio de trabajo (también apex-view y los crates de vendor/)
+      - run: cargo test --release --workspace
+      # el arnés de capturas (característica `selftest`) también tiene que compilar
+      - run: cargo check --features selftest
+      # los avisos no hacen fallar; los errores de clippy (lints «deny») sí
+      - name: Clippy
+        run: cargo clippy --release --workspace --all-targets
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # vulnerabilidades conocidas (RustSec) y versiones retiradas en Cargo.lock
+      - run: cargo audit --deny yanked
 
   build:
     name: Build ${{ matrix.name }}
@@ -142,17 +161,22 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" "platforms;android-34" "ndk;27.3.13750724"
           echo "NDK=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
+      # Los secretos van por `env:` (nunca expandidos dentro del script) y la contraseña llega a
+      # apksigner como `env:ANDROID_KS_PASS`, no en la línea de órdenes
       - name: Signing key (optional)
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
         run: |
           if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            umask 077
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
             echo "ANDROID_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
-            echo "ANDROID_KS_PASS=${{ secrets.ANDROID_KS_PASS }}" >> "$GITHUB_ENV"
-            echo "ANDROID_KS_ALIAS=${{ secrets.ANDROID_KS_ALIAS }}" >> "$GITHUB_ENV"
           fi
-      - run: ./android/build-apk.sh ${{ matrix.abi }}
+      - name: Build APK
+        env:
+          ANDROID_KS_PASS: ${{ secrets.ANDROID_KS_PASS }}
+          ANDROID_KS_ALIAS: ${{ secrets.ANDROID_KS_ALIAS }}
+        run: ./android/build-apk.sh ${{ matrix.abi }}
       - run: mkdir -p out && cp target-android/${{ matrix.apk }} out/filebrowser-android-${{ matrix.name }}.apk
       - uses: actions/upload-artifact@v4
         with:
@@ -290,7 +314,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build, android, flatpak, linux-packages, windows-packages]
+    needs: [test, audit, build, android, flatpak, linux-packages, windows-packages]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

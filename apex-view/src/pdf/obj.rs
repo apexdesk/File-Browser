@@ -371,7 +371,8 @@ impl<'a> Lexer<'a> {
             }
             self.p += 1;
         }
-        self.p += 1;
+        // Past the '>', never past the end.
+        self.p = (self.p + 1).min(d.len());
         if let Some(h) = hi {
             out.push(h << 4);
         }

@@ -10,6 +10,13 @@ use std::path::Path;
 const MAX_ROWS: usize = 300;
 const MAX_TABLES: usize = 400;
 const MAX_COLS: usize = 120;
+/// Lectura total de una base (todas las tablas): celdas que se repiten o cadenas de
+/// desbordamiento circulares no pueden hacer leer gigas.
+const MAX_READ_BYTES: u64 = 128 << 20;
+/// Páginas visitadas en total (todas las tablas).
+const MAX_VISITS: u32 = 100_000;
+/// Bytes de registros que se guardan en un recorrido.
+const MAX_KEEP_BYTES: usize = 32 << 20;
 
 struct Db {
     f: File,
@@ -18,6 +25,12 @@ struct Db {
     usable: usize,
     pages: u64,
     enc: u32,
+    /// bytes leídos hasta ahora
+    read: u64,
+    /// páginas visitadas en todos los recorridos
+    visits_all: u32,
+    /// bytes de registros guardados en el recorrido actual
+    kept: usize,
 }
 
 #[derive(Clone)]
@@ -68,7 +81,7 @@ fn be(b: &[u8]) -> u64 {
 
 impl Db {
     fn open(path: &Path) -> Option<Db> {
-        let mut f = File::open(path).ok()?;
+        let mut f = crate::thumbs::open_regular(path)?;
         let mut h = [0u8; 100];
         f.read_exact(&mut h).ok()?;
         if &h[..16] != b"SQLite format 3\0" {
@@ -85,14 +98,21 @@ impl Db {
             return None;
         }
         let len = f.metadata().ok()?.len();
-        Some(Db { f, visits: 0, page, usable, pages: len / page as u64, enc: u32::from_be_bytes([h[56], h[57], h[58], h[59]]) })
+        Some(Db { f, visits: 0, page, usable, pages: len / page as u64, enc: u32::from_be_bytes([h[56], h[57], h[58], h[59]]), read: 0, visits_all: 0, kept: 0 })
+    }
+
+    /// ¿Se ha agotado el presupuesto de lectura?
+    fn spent(&self) -> bool {
+        self.read.saturating_add(self.page as u64) > MAX_READ_BYTES
     }
 
     fn page(&mut self, n: u64) -> Option<Vec<u8>> {
         if n == 0 || n > self.pages {
             return None;
         }
-        self.f.seek(SeekFrom::Start((n - 1) * self.page as u64)).ok()?;
+        // presupuesto de lectura agotado: se deja de leer (lo ya leído se muestra)
+        self.read = self.read.checked_add(self.page as u64).filter(|r| *r <= MAX_READ_BYTES)?;
+        self.f.seek(SeekFrom::Start((n - 1).checked_mul(self.page as u64)?)).ok()?;
         let mut v = vec![0u8; self.page];
         self.f.read_exact(&mut v).ok()?;
         Some(v)
@@ -124,17 +144,15 @@ impl Db {
 
     fn record(&self, b: &[u8]) -> Option<Vec<Val>> {
         let (hl, n) = varint(b)?;
+        let hl = usize::try_from(hl).ok().filter(|h| *h <= b.len())?;
         let mut types = Vec::new();
         let mut p = n;
-        while p < hl as usize && types.len() < 2000 {
+        while p < hl && types.len() < 2000 {
             let (t, k) = varint(b.get(p..)?)?;
             types.push(t);
             p += k;
         }
-        if hl as usize > b.len() {
-            return None;
-        }
-        let mut q = hl as usize;
+        let mut q = hl;
         let mut vals = Vec::with_capacity(types.len());
         for t in types {
             let size = match t {
@@ -145,7 +163,7 @@ impl Db {
                 4 => 4,
                 5 => 6,
                 6 | 7 => 8,
-                n if n >= 12 => ((n - 12) / 2) as usize,
+                n if n >= 12 => usize::try_from((n - 12) / 2).ok()?,
                 _ => return None,
             };
             let end = q.checked_add(size)?;
@@ -176,30 +194,43 @@ impl Db {
     fn walk(&mut self, root: u64, limit: usize, out: &mut Vec<(i64, Vec<Val>)>, depth: u32) -> Option<()> {
         if depth == 0 {
             self.visits = 0;
+            self.kept = 0;
         }
         // un archivo con páginas que se apuntan entre sí no puede hacernos dar vueltas sin fin
         self.visits += 1;
-        if depth > 12 || out.len() >= limit || self.visits > 20_000 {
+        self.visits_all = self.visits_all.saturating_add(1);
+        if depth > 12 || out.len() >= limit || self.visits > 20_000 || self.visits_all > MAX_VISITS || self.kept >= MAX_KEEP_BYTES {
             return Some(());
         }
-        let page = self.page(root)?;
+        let page = match self.page(root) {
+            Some(p) => p,
+            None if self.spent() => return Some(()),
+            None => return None,
+        };
         let hdr = if root == 1 { 100 } else { 0 };
         let kind = *page.get(hdr)?;
         let n = u16::from_be_bytes([*page.get(hdr + 3)?, *page.get(hdr + 4)?]) as usize;
         match kind {
             0x0d => {
                 for i in 0..n {
-                    if out.len() >= limit {
+                    if out.len() >= limit || self.kept >= MAX_KEEP_BYTES {
                         break;
                     }
                     let cp = u16::from_be_bytes([*page.get(hdr + 8 + 2 * i)?, *page.get(hdr + 9 + 2 * i)?]) as usize;
                     let (size, a) = varint(page.get(cp..)?)?;
                     let (rowid, b) = varint(page.get(cp + a..)?)?;
-                    if size as usize > 1 << 20 {
+                    if size > 1 << 20 {
                         continue;
                     }
-                    let data = self.payload(&page, cp + a + b, size as usize)?;
+                    let Some(data) = self.payload(&page, cp + a + b, size as usize) else {
+                        // sin presupuesto de lectura: se queda lo que hay
+                        if self.spent() {
+                            break;
+                        }
+                        return None;
+                    };
                     if let Some(vals) = self.record(&data) {
+                        self.kept += data.len();
                         out.push((rowid as i64, vals));
                     }
                 }
@@ -290,7 +321,7 @@ pub fn read(path: &Path) -> Result<Vec<(String, Table)>, String> {
         let (mut cols, rowid_col) = columns(&sql);
         let mut rows = Vec::new();
         db.walk(*root as u64, MAX_ROWS + 1, &mut rows, 0);
-        let truncated = rows.len() > MAX_ROWS;
+        let truncated = rows.len() > MAX_ROWS || db.kept >= MAX_KEEP_BYTES;
         rows.truncate(MAX_ROWS);
         let width = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(cols.len()).min(MAX_COLS);
         while cols.len() < width {
@@ -330,5 +361,70 @@ mod tests {
         let (c, r) = columns("CREATE TABLE t (id INTEGER PRIMARY KEY, \"nombre\" TEXT, x NUMERIC(10,2), PRIMARY KEY(id))");
         assert_eq!(c, ["id", "nombre", "x"]);
         assert_eq!(r, Some(0));
+    }
+
+    fn put_varint(out: &mut Vec<u8>, v: u64) {
+        let mut g = Vec::new();
+        let mut x = v;
+        loop {
+            g.push((x & 0x7F) as u8);
+            x >>= 7;
+            if x == 0 {
+                break;
+            }
+        }
+        for (i, b) in g.iter().rev().enumerate() {
+            out.push(if i + 1 < g.len() { b | 0x80 } else { *b });
+        }
+    }
+
+    /// Página 1 con 5 000 celdas que apuntan a la misma celda de 1 MB cuyo desbordamiento
+    /// es una página que se apunta a sí misma.
+    #[test]
+    fn aliased_cells_and_overflow_cycle_are_budgeted() {
+        let ps = 65536usize;
+        let mut f = vec![0u8; ps * 3];
+        f[..16].copy_from_slice(b"SQLite format 3\0");
+        f[16..18].copy_from_slice(&1u16.to_be_bytes()); // 1 = 65 536
+        f[56..60].copy_from_slice(&1u32.to_be_bytes());
+        let n = 5000u16;
+        f[100] = 0x0d;
+        f[103..105].copy_from_slice(&n.to_be_bytes());
+        let cp = 20_000usize;
+        for i in 0..n as usize {
+            f[108 + 2 * i..110 + 2 * i].copy_from_slice(&(cp as u16).to_be_bytes());
+        }
+        let total = 1u64 << 20;
+        let mut cell = Vec::new();
+        put_varint(&mut cell, total);
+        put_varint(&mut cell, 1);
+        // registro: cabecera de 5 bytes con un texto que ocupa el resto
+        let mut rec = Vec::new();
+        rec.push(5);
+        put_varint(&mut rec, 2 * (total - 5) + 13);
+        assert_eq!(rec.len(), 5);
+        rec.resize(8199, b'a');
+        cell.extend_from_slice(&rec);
+        cell.extend_from_slice(&3u32.to_be_bytes());
+        f[cp..cp + cell.len()].copy_from_slice(&cell);
+        // la página 3 de desbordamiento apunta a sí misma
+        f[2 * ps..2 * ps + 4].copy_from_slice(&3u32.to_be_bytes());
+        for b in &mut f[2 * ps + 4..] {
+            *b = b'b';
+        }
+        let dir = std::env::temp_dir().join(format!("fb-sqlite-budget-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("x.sqlite");
+        std::fs::write(&p, &f).unwrap();
+        let t = std::time::Instant::now();
+        let mut db = Db::open(&p).unwrap();
+        let mut out = Vec::new();
+        assert!(db.walk(1, 5000, &mut out, 0).is_some());
+        assert!(db.read <= MAX_READ_BYTES);
+        assert!(!out.is_empty() && out.len() <= MAX_KEEP_BYTES / (1 << 20) + 1, "{}", out.len());
+        // la lectura completa termina y no encuentra tablas
+        assert!(read(&p).is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

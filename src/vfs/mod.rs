@@ -37,15 +37,24 @@ pub fn split_paths(_v: &std::ffi::OsStr) -> std::vec::IntoIter<PathBuf> {
     Vec::new().into_iter()
 }
 
-/// Número de proceso (en el navegador no hay: sirve un número fijo).
+/// Número de proceso (en el navegador no hay: uno al azar por pestaña, para que dos pestañas no
+/// elijan los mismos nombres temporales).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pid() -> u32 {
     std::process::id()
 }
 #[cfg(target_arch = "wasm32")]
 pub fn pid() -> u32 {
-    1
+    thread_local! {
+        static PID: u32 = (js_sys::Math::random() * f64::from(u32::MAX)) as u32 | 1;
+    }
+    PID.with(|p| *p)
 }
+
+/// Primer carácter de los nombres temporales junto a los archivos (reemplazar, renombrar en lote).
+/// En escritorio, «.» (ocultos). En el navegador, «~»: el servidor no deja crear ni mover nombres que
+/// empiecen por «.» (salvo `--hidden`), y así no hace falta abrirle ninguna excepción.
+pub const TMP_LEAD: &str = if WEB { "~" } else { "." };
 
 /// Los métodos de `Path` que tocan el disco, con nombre propio para no caer en los de `std`
 /// (que en el navegador siempre fallan).

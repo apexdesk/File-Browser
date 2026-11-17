@@ -835,8 +835,8 @@ impl Slide<'_> {
                 } else if let Some(a) = pchild("buAutoNum") {
                     let kind = a.attr("type").unwrap_or("arabicPeriod").to_string();
                     let start = a.num("startAt").map_or(1, |v| v as i32);
-                    let n = counters.entry((lvl, kind.clone())).or_insert(start - 1);
-                    *n += 1;
+                    let n = counters.entry((lvl, kind.clone())).or_insert(start.saturating_sub(1));
+                    *n = n.saturating_add(1);
                     Some(auto_number(*n, &kind))
                 } else {
                     None

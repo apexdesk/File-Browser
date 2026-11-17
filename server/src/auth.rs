@@ -56,6 +56,7 @@ pub fn read_password(file: Option<&str>) -> Result<String, String> {
     let p = if let Some(f) = file {
         std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?
     } else if let Ok(v) = std::env::var("FB_PASSWORD") {
+        scrub_env();
         v
     } else {
         prompt()?
@@ -67,11 +68,30 @@ pub fn read_password(file: Option<&str>) -> Result<String, String> {
     Ok(p)
 }
 
+/// Saca `FB_PASSWORD` del entorno una vez leída: no la heredan procesos hijos ni la ve quien lea el
+/// entorno del proceso. Se llama al arrancar, con un solo hilo.
+fn scrub_env() {
+    // En Linux `/proc/<pid>/environ` lee el bloque original de la pila, que `remove_var` no toca: se
+    // sobrescribe antes el valor en su sitio (getenv devuelve un puntero a ese bloque).
+    #[cfg(target_os = "linux")]
+    // SAFETY: un solo hilo; se sobrescriben exactamente los `strlen` bytes del valor, sin cambiar su tamaño
+    unsafe {
+        let v = libc::getenv(c"FB_PASSWORD".as_ptr());
+        if !v.is_null() {
+            std::ptr::write_bytes(v.cast::<u8>(), b'x', libc::strlen(v));
+        }
+    }
+    // SAFETY: al arrancar, antes de crear ningún hilo
+    unsafe { std::env::remove_var("FB_PASSWORD") };
+}
+
 fn prompt() -> Result<String, String> {
     eprint!("Contraseña para entrar por web: ");
     let _ = io::stderr().flush();
     #[cfg(unix)]
     let _echo = NoEcho::new();
+    #[cfg(windows)]
+    let _echo = crate::win::NoEcho::new();
     let mut l = String::new();
     io::stdin().lock().read_line(&mut l).map_err(|e| e.to_string())?;
     eprintln!();
@@ -121,5 +141,13 @@ mod tests {
         assert!(c.check(Some("BASIC YW5hOnMzY3JldDpwYXNz")));
         assert!(!c.check(Some("Bearer x")));
         assert!(!c.check(None));
+    }
+
+    #[test]
+    fn la_variable_de_la_contrasena_no_se_queda_en_el_entorno() {
+        // SAFETY: ninguna otra prueba usa esta variable
+        unsafe { std::env::set_var("FB_PASSWORD", "una-clave-larga") };
+        assert_eq!(read_password(None).unwrap(), "una-clave-larga");
+        assert!(std::env::var_os("FB_PASSWORD").is_none());
     }
 }

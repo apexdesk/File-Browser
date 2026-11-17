@@ -16,9 +16,23 @@ use std::time::{Duration};
 use web_time::{SystemTime, UNIX_EPOCH};
 
 const NO_PARENT: u32 = u32::MAX;
-const MAGIC: &[u8; 8] = b"FBIDX001";
+/// 002: un byte de marcas por entrada (carpeta, oculto, sin recorrer) en vez de «es carpeta».
+const MAGIC: &[u8; 8] = b"FBIDX002";
+/// Marcas de cada entrada.
+const F_DIR: u8 = 1;
+/// Oculto: empieza por punto o (Windows) tiene el atributo «oculto».
+const F_HIDDEN: u8 = 2;
+/// Carpeta cuyo contenido no está (montaje de red o virtual, ilegible o tope alcanzado):
+/// buscar dentro de ella exige recorrer el disco.
+const F_UNWALKED: u8 = 4;
 /// Pasado este tiempo desde el último recorrido, se vuelve a indexar en segundo plano.
 const STALE_SECS: u64 = 20 * 60;
+/// Topes de memoria: con ellos el índice ocupa como mucho unos 175 MB aunque el disco sea enorme
+/// (lo que no cabe simplemente no se indexa; la búsqueda normal sigue encontrándolo).
+const MAX_ENTRIES: usize = 4_000_000;
+const MAX_ARENA: usize = 128 << 20;
+/// Las ventanas que no indexan miran cada tanto si la que indexa ha guardado algo más nuevo.
+const RELOAD_CHECK_SECS: u64 = 60;
 
 #[derive(Default)]
 struct Index {
@@ -26,7 +40,8 @@ struct Index {
     off: Vec<u32>,
     len: Vec<u16>,
     parent: Vec<u32>,
-    dir: Vec<bool>,
+    /// Marcas `F_*`.
+    flags: Vec<u8>,
     /// Segundos Unix en los que terminó el recorrido.
     built: u64,
 }
@@ -41,7 +56,16 @@ impl Index {
         std::str::from_utf8(&self.arena[o..o + self.len[i] as usize]).unwrap_or("")
     }
 
-    fn push(&mut self, name: &str, parent: u32, dir: bool) -> u32 {
+    /// ¿Se ha llegado al tope de entradas o de memoria?
+    fn full(&self) -> bool {
+        self.off.len() >= MAX_ENTRIES || self.arena.len() >= MAX_ARENA
+    }
+
+    fn is_dir(&self, i: usize) -> bool {
+        self.flags[i] & F_DIR != 0
+    }
+
+    fn push(&mut self, name: &str, parent: u32, flags: u8) -> u32 {
         let id = self.off.len() as u32;
         let b = name.as_bytes();
         let b = &b[..b.len().min(u16::MAX as usize)];
@@ -49,7 +73,7 @@ impl Index {
         self.len.push(b.len() as u16);
         self.arena.extend_from_slice(b);
         self.parent.push(parent);
-        self.dir.push(dir);
+        self.flags.push(flags);
         id
     }
 
@@ -75,7 +99,8 @@ impl Index {
         out
     }
 
-    /// Busca la carpeta `path` descendiendo desde las raíces indexadas.
+    /// Busca la carpeta `path` descendiendo desde las raíces indexadas. `None` también si su
+    /// contenido no se indexó (montaje de red, tope…): entonces hay que recorrer el disco.
     fn find_dir(&self, path: &Path) -> Option<u32> {
         let mut best: Option<(u32, usize)> = None;
         for i in 0..self.count() {
@@ -92,14 +117,14 @@ impl Index {
             let want = c.as_os_str().to_str()?;
             let mut found = None;
             for i in 0..self.count() {
-                if self.parent[i] == cur && self.dir[i] && self.name(i) == want {
+                if self.parent[i] == cur && self.is_dir(i) && self.name(i) == want {
                     found = Some(i as u32);
                     break;
                 }
             }
             cur = found?;
         }
-        Some(cur)
+        (self.flags[cur as usize] & F_UNWALKED == 0).then_some(cur)
     }
 
     fn save(&self, file: &Path) {
@@ -118,14 +143,23 @@ impl Index {
         for v in &self.parent {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        b.extend(self.dir.iter().map(|&d| d as u8));
+        b.extend_from_slice(&self.flags);
         if let Some(d) = file.parent() {
             crate::fsys::private_dir(d);
         }
-        let tmp = file.with_extension("tmp");
-        if crate::vfs::fs::write(&tmp, &b).is_ok() {
-            let _ = crate::vfs::fs::rename(&tmp, file);
+        // otras ventanas leen este archivo: se sustituye de golpe (temporal propio + rename)
+        let tmp = file.with_extension(format!("{}.tmp", crate::vfs::pid()));
+        if crate::vfs::fs::write(&tmp, &b).is_ok() && crate::vfs::fs::rename(&tmp, file).is_err() {
+            let _ = crate::vfs::fs::remove_file(&tmp);
         }
+    }
+
+    /// Fecha de construcción de un índice guardado, leyendo sólo la cabecera.
+    fn built_on_disk(file: &Path) -> Option<u64> {
+        use std::io::Read;
+        let mut h = [0u8; 16];
+        crate::vfs::fs::File::open(file).ok()?.read_exact(&mut h).ok()?;
+        (&h[..8] == MAGIC).then(|| u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]))
     }
 
     fn load(file: &Path) -> Option<Index> {
@@ -150,7 +184,7 @@ impl Index {
         o += n * 2;
         let parent: Vec<u32> = (0..n).map(|i| u32_at(o + i * 4)).collect();
         o += n * 4;
-        let dir: Vec<bool> = b[o..o + n].iter().map(|&x| x != 0).collect();
+        let flags: Vec<u8> = b[o..o + n].to_vec();
         // comprobación de coherencia: evita pánicos con un fichero dañado
         if (0..n).any(|i| off[i] as usize + len[i] as usize > alen || (parent[i] != NO_PARENT && parent[i] as usize >= n)) {
             return None;
@@ -166,7 +200,7 @@ impl Index {
                 cur = parent[cur] as usize;
             }
         }
-        Some(Index { arena, off, len, parent, dir, built })
+        Some(Index { arena, off, len, parent, flags, built })
     }
 }
 
@@ -199,6 +233,51 @@ pub fn mark_dirty() {
     DIRTY.store(now_ms().max(1), AO::Relaxed);
 }
 
+/// Carpetas con cambios aún no recogidos por un recorrido (milisegundos del cambio, carpeta).
+/// Las búsquedas las completan leyendo el disco: un archivo recién creado se encuentra ya.
+static CHANGED: Mutex<Vec<(u64, PathBuf)>> = Mutex::new(Vec::new());
+/// Milisegundos del último desbordamiento (demasiados cambios para apuntarlos uno a uno); 0 = ninguno.
+static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+const MAX_CHANGED: usize = 512;
+
+/// Como `mark_dirty`, apuntando además la carpeta en la que cambió algo.
+#[cfg_attr(not(any(target_os = "linux", windows, target_os = "macos")), allow(dead_code))]
+fn mark_changed(dir: PathBuf) {
+    let t = now_ms().max(1);
+    DIRTY.store(t, AO::Relaxed);
+    let mut g = CHANGED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.iter_mut().find(|e| e.1 == dir) {
+        e.0 = t;
+    } else if g.len() < MAX_CHANGED {
+        g.push((t, dir));
+    } else {
+        OVERFLOW.store(t, AO::Relaxed);
+    }
+}
+
+/// Cambios sin carpeta conocida (la cola de avisos del sistema se desbordó).
+#[cfg_attr(not(any(target_os = "linux", windows, target_os = "macos")), allow(dead_code))]
+fn mark_overflow() {
+    let t = now_ms().max(1);
+    DIRTY.store(t, AO::Relaxed);
+    OVERFLOW.store(t, AO::Relaxed);
+}
+
+/// Olvida los cambios anteriores a `started`: el recorrido que empezó entonces ya los recoge.
+fn forget_changes(started: u64) {
+    CHANGED.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 >= started);
+    if OVERFLOW.load(AO::Relaxed) < started {
+        OVERFLOW.store(0, AO::Relaxed);
+    }
+}
+
+/// Nombres de temporales que se crean y desaparecen solos (guardados atómicos, descargas…).
+#[cfg_attr(not(any(target_os = "linux", windows, target_os = "macos")), allow(dead_code))]
+fn temp_name(n: &str) -> bool {
+    n.ends_with(".tmp") || n.ends_with('~') || n.ends_with(".swp") || n.ends_with(".swx") || n.ends_with(".part")
+        || n.ends_with(".crdownload") || n.starts_with(".goutputstream-") || n.starts_with(".#")
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Status {
     Off,
@@ -220,6 +299,235 @@ fn cache_file() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(crate::vfs::temp_dir).join("filebrowser").join("index.bin")
 }
 
+// ---------------------------------------------------------------------------
+// Un solo indexador para todas las ventanas
+// ---------------------------------------------------------------------------
+
+/// Cerrojo que tiene la ventana (proceso) que recorre el disco y vigila los cambios; las demás
+/// sólo cargan el índice que esa guarda. Si se cierra, otra lo toma en su siguiente `tick`.
+/// `Some(None)`: sin cerrojo posible (sistema de archivos que no lo admite); se indexa igual.
+#[cfg(not(target_arch = "wasm32"))]
+static INDEXER: Mutex<Option<Option<std::fs::File>>> = Mutex::new(None);
+/// Última comprobación (segundos) del índice guardado por otra ventana.
+static LAST_CHECK: AtomicU64 = AtomicU64::new(0);
+
+/// ¿Tiene este proceso el cerrojo de indexador?
+fn is_indexer() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        INDEXER.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+}
+
+/// ¿Es este proceso el indexador? Intenta serlo si nadie lo es.
+fn become_indexer() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut g = INDEXER.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            return true;
+        }
+        let f = cache_file().with_extension("lock");
+        if let Some(d) = f.parent() {
+            crate::fsys::private_dir(d);
+        }
+        // sin cerrojo posible, cada ventana se las arregla sola, como antes
+        let Ok(h) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&f) else {
+            *g = Some(None);
+            return true;
+        };
+        match h.try_lock() {
+            Ok(()) => {
+                *g = Some(Some(h));
+                true
+            }
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(_)) => {
+                *g = Some(None);
+                true
+            }
+        }
+    }
+}
+
+fn release_indexer() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        *INDEXER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Carga en segundo plano el índice guardado por otra ventana si es más nuevo que el que hay.
+fn reload_shared(roots: Vec<PathBuf>, ctx: egui::Context) {
+    if LOADING.swap(true, AO::SeqCst) {
+        return;
+    }
+    let gener = GENERATION.load(AO::SeqCst);
+    crate::vfs::thread::spawn(move || {
+        if let Some(idx) = Index::load(&cache_file()) {
+            let newer = current().map(|c| idx.built > c.built).unwrap_or(true);
+            if newer && idx.roots() == roots && GENERATION.load(AO::SeqCst) == gener {
+                PROGRESS.store(idx.count(), AO::Relaxed);
+                if let Ok(mut g) = CURRENT.write() {
+                    *g = Some(Arc::new(idx));
+                }
+            }
+        }
+        LOADING.store(false, AO::SeqCst);
+        ctx.request_repaint();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Qué no se recorre
+// ---------------------------------------------------------------------------
+
+/// Tipos de sistema de archivos que no se indexan: de red (lentos, y cada ventana los recorrería
+/// por la red) y virtuales del sistema.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn skip_fstype(t: &str) -> bool {
+    const NET: &[&str] = &["nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "ceph", "glusterfs", "9p", "davfs", "lustre", "gpfs"];
+    const PSEUDO: &[&str] = &[
+        "proc", "sysfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "securityfs", "debugfs", "tracefs", "pstore", "bpf", "mqueue",
+        "hugetlbfs", "configfs", "fusectl", "autofs", "binfmt_misc", "efivarfs", "rpc_pipefs", "nsfs", "ramfs", "tmpfs", "squashfs", "overlay",
+    ];
+    // FUSE en espacio de usuario (sshfs, rclone, gvfs, portal, appimage…); `fuseblk` (NTFS, exFAT) es local
+    NET.contains(&t) || PSEUDO.contains(&t) || t.starts_with("fuse.") || t == "fuse"
+}
+
+/// Punto de montaje de /proc/self/mountinfo: los espacios y similares vienen como `\ooo` (octal).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn unescape_mount(s: &str) -> PathBuf {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = u32::from(b[i + 1] - b'0') * 64 + u32::from(b[i + 2] - b'0') * 8 + u32::from(b[i + 3] - b'0');
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(out))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+/// Puntos de montaje que no se deben recorrer, a partir del texto de /proc/self/mountinfo.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn skipped_mounts_from(info: &str) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    for l in info.lines() {
+        // id padre mayor:menor raíz punto opciones [campos opcionales] - tipo origen opciones
+        let Some((a, b)) = l.split_once(" - ") else { continue };
+        let (Some(mp), Some(ty)) = (a.split(' ').nth(4), b.split(' ').next()) else { continue };
+        let mp = unescape_mount(mp);
+        if mp != Path::new("/") && skip_fstype(ty) {
+            out.insert(mp);
+        }
+    }
+    out
+}
+
+pub(crate) fn skipped_mounts() -> std::collections::HashSet<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        crate::vfs::fs::read_to_string("/proc/self/mountinfo").map(|t| skipped_mounts_from(&t)).unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut out = std::collections::HashSet::new();
+        // SAFETY: getmntinfo devuelve un vector propio de la biblioteca con `n` elementos válidos
+        unsafe {
+            let mut p: *mut libc::statfs = std::ptr::null_mut();
+            let n = libc::getmntinfo(&mut p, libc::MNT_NOWAIT);
+            if n > 0 && !p.is_null() {
+                for m in std::slice::from_raw_parts(p, n as usize) {
+                    let ty = std::ffi::CStr::from_ptr(m.f_fstypename.as_ptr()).to_string_lossy();
+                    let local = m.f_flags & (libc::MNT_LOCAL as u32) != 0;
+                    if !local || matches!(&*ty, "devfs" | "autofs" | "nullfs") {
+                        use std::os::unix::ffi::OsStrExt;
+                        let mp = std::ffi::CStr::from_ptr(m.f_mntonname.as_ptr());
+                        let mp = PathBuf::from(std::ffi::OsStr::from_bytes(mp.to_bytes()));
+                        if mp != Path::new("/") {
+                            out.insert(mp);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        Default::default()
+    }
+}
+
+/// Raíces que de verdad se indexan: fuera las de red o virtuales.
+fn effective_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetDriveTypeW(root: *const u16) -> u32;
+        }
+        use std::os::windows::ffi::OsStrExt;
+        roots
+            .into_iter()
+            .filter(|r| {
+                let w: Vec<u16> = r.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+                // 4 = DRIVE_REMOTE (unidad de red)
+                unsafe { GetDriveTypeW(w.as_ptr()) != 4 }
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let skip = skipped_mounts();
+        roots.into_iter().filter(|r| !skip.contains(r)).collect()
+    }
+}
+
+/// Prioridad baja para el hilo actual (CPU y disco): el índice no debe notarse.
+fn low_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // en Linux la prioridad es por hilo (who = 0: el hilo que llama)
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13); // IOPRIO_WHO_PROCESS, clase «idle»
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(h: isize, prio: i32) -> i32;
+        }
+        // THREAD_MODE_BACKGROUND_BEGIN: baja también la prioridad de E/S
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), 0x0001_0000);
+        }
+    }
+}
+
 pub fn status() -> Status {
     if BUILDING.load(AO::Relaxed) || LOADING.load(AO::Relaxed) {
         return Status::Building(PROGRESS.load(AO::Relaxed));
@@ -235,9 +543,16 @@ pub fn ready() -> bool {
 }
 
 /// Libera el índice de memoria y borra el fichero guardado.
+/// Deja de vigilar la unidad `root` (Windows: antes de expulsarla). En otros sistemas no hace nada.
+#[cfg(windows)]
+pub fn release_drive(root: &Path) {
+    watch::release(root);
+}
+
 pub fn disable() {
     GENERATION.fetch_add(1, AO::SeqCst);
     watch::stop();
+    release_indexer();
     if let Ok(mut g) = CURRENT.write() {
         *g = None;
     }
@@ -257,19 +572,26 @@ pub fn start(roots: Vec<PathBuf>, ctx: egui::Context) {
     crate::vfs::thread::spawn(move || {
         // no compite con el arranque: el primer fotograma y el listado inicial van antes
         crate::vfs::thread::sleep(Duration::from_millis(2500));
+        let eff = effective_roots(roots.clone());
+        let indexer = become_indexer();
         if let Some(idx) = Index::load(&cache_file()) {
-            if idx.roots() == roots && GENERATION.load(AO::SeqCst) == gener {
+            if idx.roots() == eff && GENERATION.load(AO::SeqCst) == gener {
                 PROGRESS.store(idx.count(), AO::Relaxed);
                 let idx = Arc::new(idx);
                 if let Ok(mut g) = CURRENT.write() {
                     *g = Some(idx.clone());
                 }
-                watch::restart(idx);
+                // sólo vigila cambios la ventana que indexa
+                if indexer {
+                    watch::restart(idx);
+                }
             }
         }
         LOADING.store(false, AO::SeqCst);
         ctx.request_repaint();
-        if GENERATION.load(AO::SeqCst) == gener && current().map(|i| now().saturating_sub(i.built) > STALE_SECS).unwrap_or(true) {
+        // la que no indexa sólo construye si aún no hay nada guardado que cargar
+        let stale = current().map(|i| now().saturating_sub(i.built) > STALE_SECS).unwrap_or(true);
+        if GENERATION.load(AO::SeqCst) == gener && stale && (indexer || current().is_none()) {
             rebuild(roots, ctx);
         }
     });
@@ -279,6 +601,30 @@ pub fn start(roots: Vec<PathBuf>, ctx: egui::Context) {
 pub fn tick(roots: Vec<PathBuf>, ctx: &egui::Context) {
     if BUILDING.load(AO::Relaxed) || LOADING.load(AO::Relaxed) {
         return;
+    }
+    if !cfg!(target_arch = "wasm32") && !is_indexer() {
+        // las ventanas que no indexan recogen de vez en cuando lo que guarda la que sí
+        let t = now();
+        if t.saturating_sub(LAST_CHECK.load(AO::Relaxed)) < RELOAD_CHECK_SECS {
+            return;
+        }
+        LAST_CHECK.store(t, AO::Relaxed);
+        if become_indexer() {
+            // la ventana que indexaba se cerró: ésta toma el relevo
+            match current() {
+                Some(i) => watch::restart(i),
+                None => {
+                    rebuild(roots, ctx.clone());
+                    return;
+                }
+            }
+        } else {
+            let disk = Index::built_on_disk(&cache_file());
+            if disk.is_some_and(|b| current().is_none_or(|c| b > c.built)) {
+                reload_shared(effective_roots(roots), ctx.clone());
+            }
+            return;
+        }
     }
     if let Some(i) = current() {
         let age = now().saturating_sub(i.built);
@@ -306,6 +652,11 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
     if cfg!(target_arch = "wasm32") {
         return;
     }
+    // otra ventana ya indexa: se recoge lo que ella guarda en vez de recorrer el disco otra vez
+    if !become_indexer() {
+        reload_shared(effective_roots(roots), ctx);
+        return;
+    }
     if BUILDING.swap(true, AO::SeqCst) {
         return;
     }
@@ -313,10 +664,12 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
     PROGRESS.store(0, AO::Relaxed);
     let started = now_ms();
     crate::vfs::thread::spawn(move || {
+        let roots = effective_roots(roots);
+        let skip = Arc::new(skipped_mounts());
         let mut idx = Index::default();
         let mut stack = Vec::new();
         for r in &roots {
-            let id = idx.push(&r.to_string_lossy(), NO_PARENT, true);
+            let id = idx.push(&r.to_string_lossy(), NO_PARENT, F_DIR);
             stack.push((id, r.clone()));
         }
         let shared = Arc::new((Mutex::new(Work { stack, active: 0 }), Condvar::new()));
@@ -324,8 +677,11 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
         let threads = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 4);
         let hs: Vec<_> = (0..threads)
             .map(|_| {
-                let (shared, idx, ctx) = (shared.clone(), idx.clone(), ctx.clone());
-                crate::vfs::thread::spawn(move || worker(&shared, &idx, gener, &ctx))
+                let (shared, idx, ctx, skip) = (shared.clone(), idx.clone(), ctx.clone(), skip.clone());
+                crate::vfs::thread::spawn(move || {
+                    low_priority();
+                    worker(&shared, &idx, gener, &ctx, &skip)
+                })
             })
             .collect();
         for h in hs {
@@ -338,7 +694,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
             idx.off.shrink_to_fit();
             idx.len.shrink_to_fit();
             idx.parent.shrink_to_fit();
-            idx.dir.shrink_to_fit();
+            idx.flags.shrink_to_fit();
             idx.save(&cache_file());
             let idx = Arc::new(idx);
             if let Ok(mut g) = CURRENT.write() {
@@ -348,6 +704,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
             if DIRTY.load(AO::Relaxed) < started {
                 DIRTY.store(0, AO::Relaxed);
             }
+            forget_changes(started);
             watch::restart(idx);
         }
         BUILDING.store(false, AO::SeqCst);
@@ -355,7 +712,7 @@ pub fn rebuild(roots: Vec<PathBuf>, ctx: egui::Context) {
     });
 }
 
-fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: &egui::Context) {
+fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: &egui::Context, skip: &std::collections::HashSet<PathBuf>) {
     let (lock, cv) = shared;
     let mut last = web_time::Instant::now();
     loop {
@@ -376,32 +733,71 @@ fn worker(shared: &(Mutex<Work>, Condvar), idx: &Mutex<Index>, gener: u64, ctx: 
                 w = cv.wait_timeout(w, Duration::from_millis(50)).unwrap().0;
             }
         };
-        let mut kids: Vec<(OsString, bool)> = Vec::new();
-        if let Ok(rd) = crate::vfs::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let is_dir = e.file_type().map(|t| t.v_is_dir()).unwrap_or(false);
-                kids.push((e.file_name(), is_dir));
+        let mut kids: Vec<(OsString, u8)> = Vec::new();
+        let read = match crate::vfs::fs::read_dir(&dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let is_dir = e.file_type().map(|t| t.v_is_dir()).unwrap_or(false);
+                    // el atributo «oculto» de Windows viene con la entrada: no cuesta otra llamada
+                    let hid = crate::fsys::is_hidden_entry(&e);
+                    kids.push((e.file_name(), if is_dir { F_DIR } else { 0 } | if hid { F_HIDDEN } else { 0 }));
+                }
+                true
             }
-        }
+            Err(_) => false,
+        };
         let mut subdirs = Vec::new();
+        let full;
         {
             let mut ix = idx.lock().unwrap();
-            for (name, is_dir) in &kids {
+            let mut cut = !read;
+            for (name, fl) in &kids {
+                if ix.full() {
+                    cut = true;
+                    break;
+                }
                 let n = name.to_string_lossy();
-                let nid = ix.push(&n, id, *is_dir);
-                if *is_dir {
-                    let p = dir.join(name);
-                    if !crate::tools::pseudo_fs(&p) {
-                        subdirs.push((nid, p));
-                    }
+                let mut fl = *fl;
+                let p = (fl & F_DIR != 0).then(|| dir.join(name));
+                // ni sistemas virtuales ni montajes de red o FUSE: quedan marcadas como no recorridas
+                // /run es tmpfs, pero dentro están los discos extraíbles (/run/media): sí se entra
+                let walk = p.as_ref().is_some_and(|p| !crate::tools::pseudo_fs(p) && (!skip.contains(p) || p == Path::new("/run")));
+                if p.is_some() && !walk {
+                    fl |= F_UNWALKED;
+                }
+                let nid = ix.push(&n, id, fl);
+                if let (true, Some(p)) = (walk, p) {
+                    subdirs.push((nid, p));
+                }
+            }
+            if cut {
+                ix.flags[id as usize] |= F_UNWALKED;
+            }
+            full = ix.full();
+            if full {
+                for (nid, _) in &subdirs {
+                    ix.flags[*nid as usize] |= F_UNWALKED;
                 }
             }
             PROGRESS.store(ix.count(), AO::Relaxed);
         }
-        {
+        let left = {
             let mut w = lock.lock().unwrap();
-            w.stack.extend(subdirs);
+            let left = if full {
+                // tope alcanzado: se termina con lo que hay
+                std::mem::take(&mut w.stack)
+            } else {
+                w.stack.extend(subdirs);
+                Vec::new()
+            };
             w.active -= 1;
+            left
+        };
+        if !left.is_empty() {
+            let mut ix = idx.lock().unwrap();
+            for (nid, _) in left {
+                ix.flags[nid as usize] |= F_UNWALKED;
+            }
         }
         cv.notify_all();
         if last.elapsed().as_millis() > 300 {
@@ -430,6 +826,27 @@ mod watch {
         matches!(name, ".git" | "node_modules" | "target" | ".cache" | ".cargo" | ".rustup")
     }
 
+    /// Zonas del sistema y de configuración que cambian sin parar (incluida la propia configuración
+    /// y caché de esta aplicación): sin vigilarlas, la actividad normal no provoca recorridos.
+    /// Lo nuevo en ellas se recoge en el recorrido periódico.
+    fn quiet_roots() -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = ["/tmp", "/var", "/proc", "/sys", "/dev", "/snap"].iter().map(PathBuf::from).collect();
+        if let Some(h) = dirs::home_dir() {
+            for d in [".config", ".cache", ".local/share", ".local/state", ".var", ".mozilla", ".thunderbird"] {
+                v.push(h.join(d));
+            }
+        }
+        v.extend(dirs::config_dir());
+        v.extend(dirs::cache_dir());
+        v.extend(dirs::data_dir());
+        v
+    }
+
+    fn quiet(p: &Path, q: &[PathBuf]) -> bool {
+        // /run es del sistema, salvo los discos extraíbles de /run/media
+        (p.starts_with("/run") && !p.starts_with("/run/media") && p != Path::new("/run")) || q.iter().any(|r| p.starts_with(r))
+    }
+
     pub fn restart(idx: Arc<Index>) {
         let gen_id = WATCH_GEN.fetch_add(1, AO::SeqCst) + 1;
         crate::vfs::thread::spawn(move || run(idx, gen_id));
@@ -440,8 +857,8 @@ mod watch {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(8192);
-        // dejamos la mitad del cupo del usuario para el resto de programas
-        let budget = (limit / 2).min(100_000);
+        // como mucho una cuarta parte del cupo del usuario (y sólo vigila la ventana que indexa)
+        let budget = (limit / 4).min(50_000);
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return;
@@ -451,7 +868,8 @@ mod watch {
         let mut depth = vec![u8::MAX; n];
         let mut dirs: Vec<(u8, u32)> = Vec::new();
         for i in 0..n {
-            if !idx.dir[i] {
+            // las no recorridas (montajes de red, virtuales) no se vigilan
+            if !idx.is_dir(i) || idx.flags[i] & F_UNWALKED != 0 {
                 continue;
             }
             let (mut d, mut cur, mut skip) = (0u32, i, false);
@@ -470,6 +888,8 @@ mod watch {
         }
         dirs.sort_unstable();
         let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+        let q = quiet_roots();
+        let mut wds: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
         let mut added = 0usize;
         for (_, id) in dirs {
             if WATCH_GEN.load(AO::SeqCst) != gen_id {
@@ -480,12 +900,14 @@ mod watch {
                 break;
             }
             let p = idx.path_of(id as usize);
-            if crate::tools::pseudo_fs(&p) {
+            if crate::tools::pseudo_fs(&p) || quiet(&p, &q) {
                 continue;
             }
             use std::os::unix::ffi::OsStrExt;
             let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { continue };
-            if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) } >= 0 {
+            let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) };
+            if wd >= 0 {
+                wds.insert(wd, id);
                 added += 1;
             } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSPC) {
                 break;
@@ -498,16 +920,48 @@ mod watch {
             if r > 0 {
                 let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if got > 0 {
-                    mark_dirty();
+                    on_events(&buf[..got as usize], &idx, &wds);
                 }
             }
         }
         unsafe { libc::close(fd) };
     }
+
+    /// Recorre los `inotify_event` leídos: apunta la carpeta de cada cambio que interesa.
+    fn on_events(b: &[u8], idx: &Index, wds: &std::collections::HashMap<i32, u32>) {
+        let mut off = 0usize;
+        // cabecera: wd (i32), mask, cookie, len (u32); luego `len` bytes de nombre terminado en NUL
+        while off + 16 <= b.len() {
+            let wd = i32::from_ne_bytes(b[off..off + 4].try_into().unwrap());
+            let mask = u32::from_ne_bytes(b[off + 4..off + 8].try_into().unwrap());
+            let len = u32::from_ne_bytes(b[off + 12..off + 16].try_into().unwrap()) as usize;
+            let end = (off + 16 + len).min(b.len());
+            let raw = &b[off + 16..end];
+            let name = String::from_utf8_lossy(&raw[..raw.iter().position(|&c| c == 0).unwrap_or(raw.len())]);
+            off = off + 16 + len;
+            if mask & libc::IN_Q_OVERFLOW != 0 {
+                mark_overflow();
+                continue;
+            }
+            if mask & libc::IN_IGNORED != 0 || temp_name(&name) || noisy(&name) {
+                continue;
+            }
+            let Some(&id) = wds.get(&wd) else { continue };
+            let dir = idx.path_of(id as usize);
+            if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                // la propia carpeta desapareció: el cambio está en su padre
+                if let Some(p) = dir.parent() {
+                    mark_changed(p.to_path_buf());
+                }
+            } else {
+                mark_changed(dir);
+            }
+        }
+    }
 }
 
 /// Rutas del sistema o de herramientas que cambian sin parar y no interesan para buscar.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos"))]
 fn noisy_path(p: &str) -> bool {
     let p = p.replace('\\', "/");
     const BAD: &[&str] = &[
@@ -530,16 +984,31 @@ mod watch {
     };
     use windows::Win32::System::IO::CancelIoEx;
 
-    static HANDLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+    static HANDLES: Mutex<Vec<(PathBuf, isize)>> = Mutex::new(Vec::new());
 
     pub fn stop() {
-        let hs: Vec<isize> = std::mem::take(&mut *HANDLES.lock().unwrap());
-        for h in hs {
+        let hs: Vec<(PathBuf, isize)> = std::mem::take(&mut *HANDLES.lock().unwrap());
+        for (_, h) in hs {
             // despierta al hilo bloqueado en ReadDirectoryChangesW: sale y cierra el manejador
             unsafe {
                 let _ = CancelIoEx(HANDLE(h as *mut _), None);
             }
         }
+    }
+
+    /// Suelta la vigilancia de las unidades bajo `root` (antes de expulsarla: un manejador
+    /// abierto haría que Windows la diera por «en uso»).
+    pub fn release(root: &Path) {
+        let mut hs = HANDLES.lock().unwrap();
+        hs.retain(|(r, h)| {
+            if !r.starts_with(root) && !root.starts_with(r) {
+                return true;
+            }
+            unsafe {
+                let _ = CancelIoEx(HANDLE(*h as *mut _), None);
+            }
+            false
+        });
     }
 
     /// Las unidades no cambian entre recorridos: si ya se vigilan, no se hace nada.
@@ -562,7 +1031,7 @@ mod watch {
             };
             let Ok(h) = h else { continue };
             let raw = h.0 as isize;
-            HANDLES.lock().unwrap().push(raw);
+            HANDLES.lock().unwrap().push((root.clone(), raw));
             let base = root.to_string_lossy().into_owned();
             crate::vfs::thread::spawn(move || {
                 let h = HANDLE(raw as *mut _);
@@ -586,7 +1055,7 @@ mod watch {
                     }
                     if got == 0 {
                         // desbordó el búfer: hubo cambios, no sabemos cuáles
-                        mark_dirty();
+                        mark_overflow();
                         continue;
                     }
                     let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, got as usize) };
@@ -597,8 +1066,10 @@ mod watch {
                         if off + 12 + len <= bytes.len() {
                             let w: Vec<u16> = bytes[off + 12..off + 12 + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                             let rel = String::from_utf16_lossy(&w);
-                            if !noisy_path(&format!("{base}{rel}")) {
-                                mark_dirty();
+                            let full = PathBuf::from(format!("{base}{rel}"));
+                            let tmp = full.file_name().is_some_and(|n| temp_name(&n.to_string_lossy()));
+                            if !tmp && !noisy_path(&full.to_string_lossy()) {
+                                mark_changed(full.parent().map(Path::to_path_buf).unwrap_or(full));
                             }
                         }
                         if next == 0 {
@@ -638,8 +1109,10 @@ mod watch {
             while WATCH_GEN.load(AO::SeqCst) == gen_id {
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(ev) => {
-                        if !noisy_path(&ev.path) {
-                            mark_dirty();
+                        let full = PathBuf::from(&ev.path);
+                        let tmp = full.file_name().is_some_and(|n| temp_name(&n.to_string_lossy()));
+                        if !tmp && !noisy_path(&ev.path) {
+                            mark_changed(full.parent().map(Path::to_path_buf).unwrap_or(full));
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -662,19 +1135,43 @@ mod watch {
 // Búsqueda
 // ---------------------------------------------------------------------------
 
-/// Busca en el índice. Devuelve `None` si no hay índice o la carpeta no está en él
-/// (el llamador debe entonces recorrer el disco como siempre).
+/// Busca en el índice. Devuelve `None` sólo si no hay índice (el llamador recorre el disco).
+/// Si la carpeta pedida no está indexada (montaje de red, tope…) o ha cambiado desde el último
+/// recorrido, el propio hilo de la búsqueda recorre el disco: nada de eso se hace en la interfaz.
 pub fn spawn_search(scope: Option<PathBuf>, needle: String, hidden: bool, ctx: egui::Context) -> Option<Arc<Search>> {
     let idx = current()?;
-    let scope_id = match &scope {
-        Some(p) => Some(idx.find_dir(p)?),
-        None => None,
-    };
     let st = Arc::new(Search::default());
     st.scanned.store(idx.count() as u64, AO::Relaxed);
     let s = st.clone();
     crate::vfs::thread::spawn(move || {
-        let needle = needle.to_lowercase();
+        let needle = crate::tools::fold(&needle);
+        let (changed, overflow) = pending_changes();
+        // carpetas que cambiaron desde el último recorrido: se leen del disco además del índice
+        let mut extra: Vec<PathBuf> = match &scope {
+            Some(p) => changed.into_iter().filter(|c| c.starts_with(p)).collect(),
+            None => changed,
+        };
+        let scope_id = match &scope {
+            Some(p) => {
+                // otras ventanas no reciben avisos: basta con que la carpeta sea más nueva que el índice
+                if newer_than(p, idx.built) && !extra.contains(p) {
+                    extra.push(p.clone());
+                }
+                // demasiados cambios sin apuntar: mejor recorrer la carpeta entera
+                match idx.find_dir(p).filter(|_| !overflow) {
+                    Some(id) => Some(id),
+                    None => {
+                        s.scanned.store(0, AO::Relaxed);
+                        if crate::tools::live_search(&s, vec![p.clone()], &needle, hidden, &ctx) {
+                            s.done.store(true, AO::Release);
+                            ctx.request_repaint();
+                        }
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
         let n = idx.count();
         let threads = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
         let chunk = n.div_ceil(threads).max(1);
@@ -685,7 +1182,7 @@ pub fn spawn_search(scope: Option<PathBuf>, needle: String, hidden: bool, ctx: e
                     sc.spawn(move || {
                         let (a, b) = ((t * chunk).min(n), ((t + 1) * chunk).min(n));
                         (a..b)
-                            .filter(|&i| idx.parent[i] != NO_PARENT && crate::fsys::contains_ci(idx.name(i), needle))
+                            .filter(|&i| idx.parent[i] != NO_PARENT && crate::tools::name_matches(idx.name(i), needle))
                             .map(|i| i as u32)
                             .collect::<Vec<u32>>()
                     })
@@ -694,6 +1191,7 @@ pub fn spawn_search(scope: Option<PathBuf>, needle: String, hidden: bool, ctx: e
             hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
         });
         let mut found = 0usize;
+        let mut seen = std::collections::HashSet::new();
         'o: for i in hits.into_iter().flatten() {
             if s.cancel.load(AO::Relaxed) {
                 break;
@@ -711,24 +1209,74 @@ pub fn spawn_search(scope: Option<PathBuf>, needle: String, hidden: bool, ctx: e
                 if p == NO_PARENT {
                     break;
                 }
-                if idx.name(cur).starts_with('.') {
+                if idx.flags[cur] & F_HIDDEN != 0 {
                     hid = true;
                 }
                 cur = p as usize;
             }
+            // lo oculto se descarta antes de contar: no gasta el tope de resultados
             if scope_id == Some(i) || !inside || (hid && !hidden) {
                 continue;
             }
-            s.results.lock().unwrap().push((idx.path_of(i as usize), idx.dir[i as usize]));
+            let path = idx.path_of(i as usize);
+            if !extra.is_empty() {
+                seen.insert(path.clone());
+            }
+            s.results.lock().unwrap().push((path, idx.is_dir(i as usize)));
             found += 1;
             if found >= MAX_RESULTS {
                 break 'o;
+            }
+        }
+        // lo creado desde el último recorrido; las subcarpetas nuevas o cambiadas también se leen
+        let mut budget = 2000usize;
+        while let Some(dir) = extra.pop() {
+            if found >= MAX_RESULTS || budget == 0 || s.cancel.load(AO::Relaxed) {
+                break;
+            }
+            budget -= 1;
+            let below = scope.as_deref().and_then(|sc| dir.strip_prefix(sc).ok()).unwrap_or(&dir);
+            if !hidden && below.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+                continue;
+            }
+            let Ok(rd) = crate::vfs::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                if found >= MAX_RESULTS {
+                    break;
+                }
+                if !hidden && crate::fsys::is_hidden_entry(&e) {
+                    continue;
+                }
+                let p = e.path();
+                let d = e.file_type().map(|t| t.v_is_dir()).unwrap_or(false);
+                if d && !crate::tools::pseudo_fs(&p) && newer_than(&p, idx.built) {
+                    extra.push(p.clone());
+                }
+                if crate::tools::name_matches(&e.file_name().to_string_lossy(), &needle) && seen.insert(p.clone()) {
+                    s.results.lock().unwrap().push((p, d));
+                    found += 1;
+                }
             }
         }
         s.done.store(true, AO::Release);
         ctx.request_repaint();
     });
     Some(st)
+}
+
+/// ¿Se modificó la carpeta `p` en el segundo `built` o después?
+fn newer_than(p: &Path, built: u64) -> bool {
+    crate::vfs::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|d| d.as_secs() >= built)
+}
+
+/// Carpetas con cambios sin recoger y si hubo un desbordamiento (cambios sin carpeta conocida).
+fn pending_changes() -> (Vec<PathBuf>, bool) {
+    let v = CHANGED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.1.clone()).collect();
+    (v, OVERFLOW.load(AO::Relaxed) != 0)
 }
 
 #[cfg(test)]
@@ -743,10 +1291,10 @@ mod tests {
         crate::vfs::fs::write(d.join("a/b/Informe.txt"), "x").unwrap();
         crate::vfs::fs::write(d.join(".oculta/informe2.txt"), "x").unwrap();
         let mut ix = Index::default();
-        let r = ix.push(&d.to_string_lossy(), NO_PARENT, true);
-        let a = ix.push("a", r, true);
-        let b = ix.push("b", a, true);
-        ix.push("Informe.txt", b, false);
+        let r = ix.push(&d.to_string_lossy(), NO_PARENT, F_DIR);
+        let a = ix.push("a", r, F_DIR);
+        let b = ix.push("b", a, F_DIR);
+        ix.push("Informe.txt", b, 0);
         let f = d.join("idx.bin");
         ix.save(&f);
         let l = Index::load(&f).unwrap();
@@ -754,6 +1302,63 @@ mod tests {
         assert_eq!(l.path_of(3), d.join("a/b/Informe.txt"));
         assert_eq!(l.find_dir(&d.join("a/b")), Some(2));
         assert_eq!(l.find_dir(&d.join("zz")), None);
+        crate::vfs::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn unwalked_dirs_are_not_found() {
+        let mut ix = Index::default();
+        let r = ix.push("/", NO_PARENT, F_DIR);
+        let m = ix.push("mnt", r, F_DIR);
+        ix.push("nas", m, F_DIR | F_UNWALKED);
+        assert_eq!(ix.find_dir(Path::new("/mnt")), Some(m));
+        assert_eq!(ix.find_dir(Path::new("/mnt/nas")), None);
+        assert_eq!(ix.find_dir(Path::new("/mnt/nas/docs")), None);
+        #[cfg(target_os = "linux")]
+        {
+            use crate::tools::pseudo_fs;
+            assert!(!pseudo_fs(Path::new("/run")) && !pseudo_fs(Path::new("/run/media")));
+            assert!(pseudo_fs(Path::new("/run/user")) && pseudo_fs(Path::new("/proc")));
+        }
+    }
+
+    #[test]
+    fn search_folds_accents_and_finds_new_files() {
+        let d = crate::vfs::temp_dir().join(format!("fbidxs{}", crate::vfs::pid()));
+        let _ = crate::vfs::fs::remove_dir_all(&d);
+        crate::vfs::fs::create_dir_all(d.join("a")).unwrap();
+        let set = |built: u64| {
+            let mut ix = Index::default();
+            let r = ix.push(&d.to_string_lossy(), NO_PARENT, F_DIR);
+            let a = ix.push("a", r, F_DIR);
+            ix.push("Canción.txt", a, 0);
+            ix.push("cancio\u{301}n2.txt", a, 0);
+            ix.push(".oculta", a, F_DIR | F_HIDDEN);
+            ix.built = built;
+            *CURRENT.write().unwrap() = Some(Arc::new(ix));
+        };
+        set(now() + 5);
+        let run = |scope: &Path, q: &str| {
+            let s = spawn_search(Some(scope.to_path_buf()), q.into(), false, egui::Context::default()).unwrap();
+            while !s.done.load(AO::Acquire) {
+                crate::vfs::thread::sleep(Duration::from_millis(2));
+            }
+            let mut v: Vec<String> = s.results.lock().unwrap().iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(run(&d, "CANCION"), ["Canción.txt", "cancio\u{301}n2.txt"]);
+        assert!(run(&d, "oculta").is_empty());
+        // archivo nuevo en una carpeta modificada después del índice: se lee del disco
+        crate::vfs::fs::write(d.join("a/canción3.txt"), "x").unwrap();
+        set(1);
+        assert_eq!(run(&d, "canción"), ["Canción.txt", "cancio\u{301}n2.txt", "canción3.txt"]);
+        // carpeta fuera del índice: recorrido en vivo
+        set(now() + 5);
+        crate::vfs::fs::create_dir_all(d.join("a/nueva")).unwrap();
+        crate::vfs::fs::write(d.join("a/nueva/cancion4.txt"), "x").unwrap();
+        assert_eq!(run(&d.join("a/nueva"), "canción"), ["cancion4.txt"]);
+        *CURRENT.write().unwrap() = None;
         crate::vfs::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -780,11 +1385,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn watcher_marks_dirty() {
-        let d = crate::vfs::temp_dir().join(format!("fbwatch{}", crate::vfs::pid()));
+        // no en /tmp: allí no se vigila (cambia sin parar)
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("fbwatch{}", crate::vfs::pid()));
         crate::vfs::fs::create_dir_all(d.join("sub")).unwrap();
         let mut ix = Index::default();
-        let r = ix.push(&d.to_string_lossy(), NO_PARENT, true);
-        ix.push("sub", r, true);
+        let r = ix.push(&d.to_string_lossy(), NO_PARENT, F_DIR);
+        ix.push("sub", r, F_DIR);
         DIRTY.store(0, AO::Relaxed);
         watch::restart(Arc::new(ix));
         crate::vfs::thread::sleep(Duration::from_millis(500));
@@ -796,5 +1402,49 @@ mod tests {
         watch::stop();
         crate::vfs::fs::remove_dir_all(&d).unwrap();
         assert!(DIRTY.load(AO::Relaxed) != 0);
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    #[test]
+    fn network_and_pseudo_mounts_are_skipped() {
+        let info = "\
+22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+23 22 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+40 22 0:35 / /mnt/nas rw,relatime shared:20 - nfs4 nas:/vol rw
+41 22 0:36 / /mnt/my\\040share rw,relatime - cifs //srv/s rw
+42 22 0:37 / /run/user/1000/gvfs rw,nosuid - fuse.gvfsd-fuse gvfsd-fuse rw
+43 22 8:17 / /media/usb rw,relatime - fuseblk /dev/sdb1 rw
+44 22 8:3 / /home rw,relatime - btrfs /dev/sda3 rw
+45 22 0:40 / /tmp rw - tmpfs tmpfs rw
+";
+        let s = skipped_mounts_from(info);
+        for p in ["/proc", "/mnt/nas", "/mnt/my share", "/run/user/1000/gvfs", "/tmp"] {
+            assert!(s.contains(Path::new(p)), "{p}");
+        }
+        for p in ["/", "/media/usb", "/home"] {
+            assert!(!s.contains(Path::new(p)), "{p}");
+        }
+        assert!(skip_fstype("fuse.sshfs") && skip_fstype("smb3") && !skip_fstype("ext4") && !skip_fstype("fuseblk"));
+    }
+
+    #[test]
+    fn index_has_a_cap_and_header_is_readable() {
+        let mut ix = Index::default();
+        assert!(!ix.full());
+        ix.arena.resize(MAX_ARENA, b'a');
+        assert!(ix.full());
+        let mut ix = Index::default();
+        ix.push("/r", NO_PARENT, F_DIR);
+        ix.built = 12345;
+        let n = web_time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let f = crate::vfs::temp_dir().join(format!("fbw1-idx-{}-{n:x}.bin", crate::vfs::pid()));
+        ix.save(&f);
+        assert_eq!(Index::built_on_disk(&f), Some(12345));
+        let _ = crate::vfs::fs::remove_file(&f);
+        assert_eq!(Index::built_on_disk(&f), None);
     }
 }

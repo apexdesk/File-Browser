@@ -13,6 +13,8 @@ use std::sync::Arc;
 const MAX_W: u32 = 2800;
 /// Los documentos grandes no se abren para las miniaturas.
 const THUMB_MAX_BYTES: u64 = 30 << 20;
+/// plazo para dibujar una miniatura de documento
+const THUMB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Coincidencias que se guardan como máximo en una búsqueda.
 const MAX_HITS: usize = 5000;
 
@@ -59,7 +61,8 @@ pub trait Pages {
     }
 }
 
-type Opener = Arc<dyn Fn() -> Result<Box<dyn Pages>, String> + Send + Sync>;
+/// Abre el documento; el argumento dice si ya no hace falta (se abandona lo que se pueda).
+type Opener = Arc<dyn Fn(&dyn Fn() -> bool) -> Result<Box<dyn Pages>, String> + Send + Sync>;
 
 struct ApexPages(apex_view::Document);
 
@@ -98,26 +101,45 @@ pub fn open_doc(p: &Path) -> Result<apex_view::Document, apex_view::Error> {
 fn opener_for(path: &Path) -> Opener {
     let p = path.to_path_buf();
     if p.extension().and_then(|e| e.to_str()).map(crate::comic::is_comic_ext).unwrap_or(false) {
-        return Arc::new(move || crate::comic::open(&p).map(|c| Box::new(c) as Box<dyn Pages>));
+        return Arc::new(move |cancel: &dyn Fn() -> bool| crate::comic::open_cancel(&p, cancel).map(|c| Box::new(c) as Box<dyn Pages>));
     }
-    Arc::new(move || {
+    Arc::new(move |_: &dyn Fn() -> bool| {
         open_doc(&p).map(|d| Box::new(ApexPages(d)) as Box<dyn Pages>).map_err(|e| err_text(&e))
     })
 }
 
 /// Miniatura de la primera página.
 pub fn thumb(path: &Path, max: u32) -> Option<Decoded> {
+    thumb_cancel(path, max, &|| false)
+}
+
+/// Como `thumb`, pero se abandona cuando `cancel` dice que sí o se pasa del plazo.
+pub fn thumb_cancel(path: &Path, max: u32, cancel: &dyn Fn() -> bool) -> Option<Decoded> {
     if crate::vfs::fs::metadata(path).ok()?.len() > THUMB_MAX_BYTES {
         return None;
     }
+    let end = web_time::Instant::now() + THUMB_DEADLINE;
+    let stop = || cancel() || web_time::Instant::now() >= end;
     let mut doc = open_doc(path).ok()?;
-    let (w, h) = doc.page_size(0).ok()?;
-    if w <= 0.0 || h <= 0.0 {
+    if stop() {
         return None;
     }
-    let width = if h > w { (max as f32 * w / h).round().max(8.0) as u32 } else { max };
-    let img = doc.render_page(0, width, &|| false).ok()?;
+    let (w, h) = doc.page_size(0).ok()?;
+    if !(w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let width = if h > w { (max as f32 * w / h).round().clamp(8.0, max.max(8) as f32) as u32 } else { max };
+    let img = doc.render_page(0, width, &stop).ok()?;
     Some(Decoded { w: img.width as usize, h: img.height as usize, rgba: img.rgba })
+}
+
+/// Respuesta vacía a una petición de texto cuando el hilo ya no puede atenderla.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn text_empty(req: &TextReq) -> Resp {
+    match req {
+        TextReq::Runs { page } => Resp::Runs { page: *page, runs: Vec::new() },
+        TextReq::Search { id, .. } => Resp::Hits { id: *id, hits: Vec::new(), scanned: 0, done: true },
+    }
 }
 
 enum Req {
@@ -176,7 +198,14 @@ pub struct DocView {
     find_seq: u64,
     pub count: usize,
     pub page: usize,
+    /// no se pudo abrir el documento
     pub error: Option<String>,
+    /// no se pudo dibujar una página (otra página puede salir bien)
+    page_error: Option<(usize, String)>,
+    /// se suelta el visor: el hilo deja de abrir/extraer en cuanto puede
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// cómic: sus páginas no tienen texto (no se abre un segundo hilo que lo vuelva a extraer)
+    no_text: bool,
     opened: bool,
     tex: Option<(egui::TextureHandle, usize, u32)>,
     /// (página, ancho) que se está dibujando ahora
@@ -261,10 +290,11 @@ impl DocView {
         let (tx, req_rx) = channel::<Req>();
         let (resp_tx, rx) = channel::<Resp>();
         let latest = Arc::new(AtomicU64::new(0));
-        let (l, ctx2, op, rt) = (latest.clone(), ctx.clone(), opener.clone(), resp_tx.clone());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (l, ctx2, op, rt, cn) = (latest.clone(), ctx.clone(), opener.clone(), resp_tx.clone(), cancel.clone());
         let _ = &l;
         let start = move || -> Option<Box<dyn Pages>> {
-            let doc = match op() {
+            let doc = match op(&|| cn.load(Ordering::Relaxed)) {
                 Ok(d) => d,
                 Err(m) => {
                     let _ = rt.send(Resp::Failed(m));
@@ -279,15 +309,27 @@ impl DocView {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (l, rt, ctx2) = (l.clone(), resp_tx.clone(), ctx.clone());
-            crate::vfs::thread::spawn(move || {
-                let Some(mut doc) = start() else { return };
+            crate::thumbs::spawn_decoder("documento", move || {
+                // un pánico del lector deja el documento a medias: se avisa y se termina el hilo
+                let broken = |rt: &Sender<Resp>| {
+                    let _ = rt.send(Resp::Failed(crate::i18n::t("No se pudo mostrar el documento").to_string()));
+                    ctx2.request_repaint();
+                };
+                let Some(mut doc) = crate::thumbs::guarded(start).unwrap_or_else(|| {
+                    broken(&rt);
+                    None
+                }) else {
+                    return;
+                };
                 while let Ok(mut req) = req_rx.recv() {
                     // sólo importa la última petición
                     while let Ok(r) = req_rx.try_recv() {
                         req = r;
                     }
-                    if !render_one(&mut *doc, req, &l, &rt, &ctx2) {
-                        return;
+                    match crate::thumbs::guarded(|| render_one(&mut *doc, req, &l, &rt, &ctx2)) {
+                        Some(true) => {}
+                        Some(false) => return,
+                        None => return broken(&rt),
                     }
                 }
             });
@@ -313,6 +355,9 @@ impl DocView {
             count: 0,
             page: 0,
             error: None,
+            page_error: None,
+            cancel,
+            no_text: path.extension().and_then(|e| e.to_str()).map(crate::comic::is_comic_ext).unwrap_or(false),
             opened: false,
             tex: None,
             pending: None,
@@ -328,18 +373,33 @@ impl DocView {
             let (tx, rx) = channel::<TextReq>();
             let (op, rt, ctx, lf) = (self.opener.clone(), self.resp_tx.clone(), self.ctx.clone(), self.latest_find.clone());
             #[cfg(not(target_arch = "wasm32"))]
-            crate::vfs::thread::spawn(move || {
-                let Ok(mut doc) = op() else { return };
+            crate::thumbs::spawn_decoder("texto", move || {
+                // tras un pánico (o si no abre) se contesta vacío para que la vista no espere siempre
+                let mut doc = crate::thumbs::guarded(|| op(&|| false).ok()).flatten();
                 while let Ok(req) = rx.recv() {
-                    if !text_one(&mut *doc, req, &rt, &ctx, &lf) {
+                    let ok = match doc.as_mut() {
+                        Some(d) => {
+                            let empty = text_empty(&req);
+                            match crate::thumbs::guarded(|| text_one(&mut **d, req, &rt, &ctx, &lf)) {
+                                Some(ok) => ok,
+                                None => {
+                                    doc = None;
+                                    rt.send(empty).is_ok()
+                                }
+                            }
+                        }
+                        None => rt.send(text_empty(&req)).is_ok(),
+                    };
+                    if !ok {
                         return;
                     }
+                    ctx.request_repaint();
                 }
             });
             #[cfg(target_arch = "wasm32")]
             {
                 let _ = (&rt, &ctx, &lf);
-                self.w_text = op().ok().map(|d| (d, rx));
+                self.w_text = op(&|| false).ok().map(|d| (d, rx));
             }
             self.text_tx = Some(tx);
         }
@@ -390,8 +450,10 @@ impl DocView {
                 }
                 Resp::PageFailed { id, msg } => {
                     if id == self.next_id {
-                        self.pending = None;
-                        self.error = Some(msg);
+                        // sólo esa página: las demás se siguen pudiendo ver
+                        if let Some((page, _)) = self.pending.take() {
+                            self.page_error = Some((page, msg));
+                        }
                     }
                 }
                 Resp::Runs { page, runs } => {
@@ -426,6 +488,15 @@ impl DocView {
         if self.count > 0 {
             self.page = page.min(self.count - 1);
         }
+        // al cambiar de página se vuelve a intentar
+        if self.page_error.as_ref().is_some_and(|e| e.0 != self.page) {
+            self.page_error = None;
+        }
+    }
+
+    /// Error que hay que mostrar ahora: el del documento o el de la página actual.
+    pub fn shown_error(&self) -> Option<String> {
+        self.error.clone().or_else(|| self.page_error.as_ref().filter(|e| e.0 == self.page).map(|e| e.1.clone()))
     }
 
     pub fn step(&mut self, d: isize) {
@@ -434,7 +505,7 @@ impl DocView {
 
     /// Pide la página actual al ancho dado si aún no la tenemos (o no se está dibujando ya).
     pub fn want(&mut self, width_px: f32) {
-        if !self.opened || self.count == 0 || self.error.is_some() {
+        if !self.opened || self.count == 0 || self.error.is_some() || self.page_error.as_ref().is_some_and(|e| e.0 == self.page) {
             return;
         }
         let width = ((width_px / 200.0).ceil() as u32 * 200).clamp(400, MAX_W);
@@ -464,7 +535,7 @@ impl DocView {
 
     /// Texto de la página actual, si ya llegó (lo pide la primera vez).
     pub fn runs(&mut self) -> Option<&[Run]> {
-        if !self.opened || self.count == 0 {
+        if !self.opened || self.count == 0 || self.no_text {
             return None;
         }
         let page = self.page;
@@ -480,7 +551,7 @@ impl DocView {
         self.find_seq += 1;
         let id = self.find_seq;
         self.latest_find.store(id, Ordering::Relaxed);
-        if query.trim().is_empty() {
+        if query.trim().is_empty() || self.no_text {
             self.find = Some(Find { query: query.to_string(), id, hits: Vec::new(), cur: 0, scanned: 0, done: true });
             return;
         }
@@ -509,6 +580,15 @@ impl DocView {
     pub fn page_text(&mut self) -> String {
         let Some(runs) = self.runs() else { return String::new() };
         join_runs(runs.iter(), None)
+    }
+}
+
+impl Drop for DocView {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        // que el dibujo en curso también se abandone
+        self.latest.store(u64::MAX, Ordering::Relaxed);
+        self.latest_find.store(0, Ordering::Relaxed);
     }
 }
 

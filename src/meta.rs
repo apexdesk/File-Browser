@@ -57,7 +57,8 @@ fn audio(path: &Path, size: u64) -> Rows {
     use symphonia::core::meta::{MetadataOptions, StandardTagKey as K};
     use symphonia::core::probe::Hint;
     let mut rows = Rows::new();
-    let Ok(file) = crate::vfs::fs::File::open(path) else { return rows };
+    // sólo archivos normales: un FIFO dejaría bloqueado el hilo
+    let Some(file) = crate::thumbs::open_regular(path) else { return rows };
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(e) = path.extension().and_then(|e| e.to_str()) {
@@ -187,7 +188,7 @@ fn children(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
         let ty = [b[i + 4], b[i + 5], b[i + 6], b[i + 7]];
         let mut head = 8;
         if size == 1 && i + 16 <= b.len() {
-            size = be64(&b[i + 8..]) as usize;
+            size = usize::try_from(be64(&b[i + 8..])).unwrap_or(usize::MAX);
             head = 16;
         } else if size == 0 {
             size = b.len() - i;
@@ -359,7 +360,7 @@ fn ebml(b: &[u8]) -> Vec<(u64, &[u8])> {
         let Some((size, s)) = vint(&b[i + a..], false) else { break };
         let start = i + a + s;
         let unknown = size == (1u64 << (7 * s)) - 1;
-        let end = if unknown { b.len() } else { (start + size as usize).min(b.len()) };
+        let end = if unknown { b.len() } else { usize::try_from(size).map_or(b.len(), |z| start.saturating_add(z).min(b.len())) };
         out.push((id, &b[start.min(end)..end]));
         i = end;
     }
@@ -488,5 +489,18 @@ mod tests {
         let c = children(&m);
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].1, &[7]);
+    }
+
+    #[test]
+    fn huge_sizes_do_not_wrap() {
+        // tamaño EBML de 8 bytes casi máximo: no puede dar la vuelta (en 32 bits tampoco)
+        let b = [0x44, 0x89, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 1, 2];
+        let e = ebml(&b);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1, &[1, 2]);
+        // caja MP4 de 64 bits cuyo tamaño truncado a 32 bits parecería válido
+        let mut m = vec![0, 0, 0, 1, b'f', b'r', b'e', b'e', 0, 0, 0, 1, 0, 0, 0, 16];
+        m.extend([0; 8]);
+        assert!(children(&m).is_empty());
     }
 }

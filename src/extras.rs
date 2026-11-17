@@ -12,45 +12,29 @@ use std::sync::{Arc, Mutex};
 // Abrir con…
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct App {
     pub name: String,
     /// Línea de órden (Linux: campo Exec; macOS: nombre de la app; Windows: vacío).
     pub exec: String,
+    /// Linux: campo Icon (para `%i`).
+    pub icon: String,
+    /// Linux: el propio archivo .desktop (para `%k`).
+    pub desktop: PathBuf,
+    /// Identificador estable: id del .desktop (Linux), ruta del ejecutable o del manejador (Windows),
+    /// ruta del paquete .app (macOS).
+    pub id: String,
+    /// Texto secundario (GenericName o Comment del .desktop).
+    pub generic: String,
+    /// Linux: `Terminal=true` (se ejecuta dentro del terminal del sistema).
+    pub terminal: bool,
+    /// Es la aplicación predeterminada para el tipo del archivo consultado.
+    pub default: bool,
 }
 
-/// Aplicaciones candidatas para abrir `path`.
+/// Aplicaciones registradas para abrir `path` (la predeterminada primero). Bloquea.
 pub fn apps_for(path: &Path) -> Vec<App> {
-    #[cfg(target_os = "linux")]
-    {
-        linux_apps(path)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = path;
-        let mut v = Vec::new();
-        for dir in ["/Applications", "/System/Applications"] {
-            if let Ok(rd) = fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    if let Some(app) = n.strip_suffix(".app") {
-                        v.push(App { name: app.to_string(), exec: app.to_string() });
-                    }
-                }
-            }
-        }
-        v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        v
-    }
-    #[cfg(windows)]
-    {
-        windows_apps(path)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = path;
-        Vec::new()
-    }
+    crate::sysapps::choices_for(path).recommended
 }
 
 /// Valores de texto de una clave del registro (`reg query`): (nombre, dato). El nombre «(Default)»
@@ -121,7 +105,7 @@ fn expand_env(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_apps(path: &Path) -> Vec<App> {
+pub(crate) fn windows_apps(path: &Path) -> Vec<App> {
     let Some(ext) = path.extension().map(|e| e.to_string_lossy().to_lowercase()) else { return Vec::new() };
     if ext.is_empty() || ext.contains(['"', '\\', ' ']) {
         return Vec::new();
@@ -166,18 +150,18 @@ fn windows_apps(path: &Path) -> Vec<App> {
             add(name, expand_env(&c));
         }
     }
-    cmds.into_iter().map(|(name, exec)| App { name, exec }).collect()
+    cmds.into_iter().map(|(name, exec)| App { name, exec, ..Default::default() }).collect()
 }
 
 /// Lanza una línea de órden del registro sustituyendo %1/%L por el archivo.
 #[cfg(windows)]
-fn launch_registry_cmd(line: &str, path: &Path) {
+fn launch_registry_cmd(line: &str, path: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let line = line.trim();
     let (exe, rest) = if let Some(r) = line.strip_prefix('"') {
         match r.find('"') {
             Some(i) => (r[..i].to_string(), r[i + 1..].to_string()),
-            None => return,
+            None => return Err(crate::i18n::t("orden mal formada").into()),
         }
     } else {
         match line.find(' ') {
@@ -212,159 +196,201 @@ fn launch_registry_cmd(line: &str, path: &Path) {
         args.push(' ');
         args.push_str(&q);
     }
-    let _ = std::process::Command::new(exe).raw_arg(args.trim()).creation_flags(0x0800_0000).spawn();
+    std::process::Command::new(exe).raw_arg(args.trim()).creation_flags(0x0800_0000).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn mime_of(path: &Path) -> Option<String> {
-    let o = std::process::Command::new("xdg-mime").args(["query", "filetype"]).arg(path).output().ok()?;
-    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
-#[cfg(target_os = "linux")]
-fn app_dirs() -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Some(d) = dirs::data_dir() {
-        v.push(d.join("applications"));
+/// Convierte el campo Exec de un .desktop en la lista de argumentos, según la especificación
+/// Desktop Entry: primero los escapes generales (`\s`, `\n`, `\t`, `\r`, `\\`), luego las
+/// comillas dobles (dentro, `\"`, `` \` ``, `\$` y `\\` son literales) y por último los códigos
+/// de campo fuera de comillas: `%f %F %u %U` → la ruta (siempre un argumento propio, sin pasar por
+/// ningún intérprete), `%i` → `--icon Icon`, `%c` → el nombre, `%k` → el .desktop, `%%` → `%`.
+/// Los obsoletos (`%d %D %n %N %v %m`) y los que caen dentro de comillas se quitan. Si no hay
+/// código de archivo, la ruta se añade al final. `None` si la línea está mal formada o vacía.
+#[cfg_attr(any(windows, target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn exec_argv(exec: &str, path: &Path, name: &str, icon: &str, desktop: &Path) -> Option<Vec<std::ffi::OsString>> {
+    use std::ffi::OsString;
+    // 1) escapes generales de los valores de tipo cadena
+    let mut line = String::with_capacity(exec.len());
+    let mut it = exec.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('s') => line.push(' '),
+                Some('n') => line.push('\n'),
+                Some('t') => line.push('\t'),
+                Some('r') => line.push('\r'),
+                Some('\\') => line.push('\\'),
+                Some(o) => {
+                    line.push('\\');
+                    line.push(o);
+                }
+                None => line.push('\\'),
+            }
+        } else {
+            line.push(c);
+        }
     }
-    v.push("/usr/local/share/applications".into());
-    v.push("/usr/share/applications".into());
-    v.push("/var/lib/flatpak/exports/share/applications".into());
-    if let Some(h) = dirs::home_dir() {
-        v.push(h.join(".local/share/flatpak/exports/share/applications"));
-    }
-    v
-}
-
-#[cfg(target_os = "linux")]
-fn linux_apps(path: &Path) -> Vec<App> {
-    let Some(mime) = mime_of(path) else { return Vec::new() };
-    let mut ids: Vec<String> = Vec::new();
-    for d in app_dirs() {
-        if let Ok(txt) = fs::read_to_string(d.join("mimeinfo.cache")) {
-            for l in txt.lines() {
-                if let Some((m, list)) = l.split_once('=') {
-                    if m == mime {
-                        for id in list.split(';').filter(|x| !x.is_empty()) {
-                            if !ids.iter().any(|x| x == id) {
-                                ids.push(id.to_string());
-                            }
-                        }
+    // 2) palabras, comillas y códigos de campo
+    let mut out: Vec<OsString> = Vec::new();
+    let mut word = OsString::new();
+    let mut has_word = false;
+    let mut in_q = false;
+    let mut used = false;
+    let mut it = line.chars();
+    while let Some(c) = it.next() {
+        if in_q {
+            match c {
+                '"' => in_q = false,
+                '\\' => match it.next() {
+                    Some(e @ ('"' | '`' | '$' | '\\')) => word.push(e.to_string()),
+                    Some(o) => {
+                        word.push("\\");
+                        word.push(o.to_string());
+                    }
+                    None => return None,
+                },
+                // dentro de comillas los códigos de campo no valen: se quitan (salvo `%%`)
+                '%' => {
+                    if it.clone().next() == Some('%') {
+                        it.next();
+                        word.push("%");
+                    } else {
+                        it.next();
                     }
                 }
+                o => word.push(o.to_string()),
+            }
+            continue;
+        }
+        match c {
+            ' ' | '\t' | '\n' | '\r' => {
+                if has_word {
+                    out.push(std::mem::take(&mut word));
+                    has_word = false;
+                }
+            }
+            '"' => {
+                in_q = true;
+                has_word = true;
+            }
+            '%' => match it.next() {
+                Some('f' | 'F' | 'u' | 'U') => {
+                    word.push(path.as_os_str());
+                    has_word = true;
+                    used = true;
+                }
+                Some('%') => {
+                    word.push("%");
+                    has_word = true;
+                }
+                Some('c') => {
+                    word.push(name);
+                    has_word = true;
+                }
+                Some('k') => {
+                    word.push(desktop.as_os_str());
+                    has_word = true;
+                }
+                Some('i') => {
+                    // sólo como argumento propio y si hay icono
+                    if !has_word && !icon.is_empty() {
+                        out.push("--icon".into());
+                        out.push(icon.into());
+                    }
+                }
+                // obsoletos o desconocidos: se quitan
+                _ => {}
+            },
+            o => {
+                word.push(o.to_string());
+                has_word = true;
             }
         }
     }
-    let mut out = Vec::new();
-    for id in ids {
-        for d in app_dirs() {
-            let f = d.join(&id);
-            let Ok(txt) = fs::read_to_string(&f) else { continue };
-            let (mut name, mut exec, mut hide) = (None, None, false);
-            let mut in_entry = false;
-            for l in txt.lines() {
-                if l.starts_with('[') {
-                    in_entry = l == "[Desktop Entry]";
-                } else if in_entry {
-                    if let Some(v) = l.strip_prefix("Name=") {
-                        name.get_or_insert(v.to_string());
-                    } else if let Some(v) = l.strip_prefix("Exec=") {
-                        exec.get_or_insert(v.to_string());
-                    } else if l == "NoDisplay=true" || l == "Hidden=true" {
-                        hide = true;
-                    }
-                }
-            }
-            if let (Some(name), Some(exec), false) = (name, exec, hide) {
-                out.push(App { name, exec });
-            }
-            break;
-        }
+    if in_q {
+        return None;
     }
-    out
+    if has_word {
+        out.push(word);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if !used {
+        out.push(path.as_os_str().to_os_string());
+    }
+    Some(out)
 }
 
-fn sh_quote(p: &Path) -> String {
-    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+/// Lanza un programa sin heredar la consola y recoge su estado al terminar (sin zombis); devuelve
+/// el error de arranque (programa inexistente, sin permiso…).
+/// `quiet`: sin entrada ni salida heredadas (no para un shell en consola nueva de Windows).
+pub(crate) fn spawn_detached(mut cmd: std::process::Command, quiet: bool) -> Result<(), String> {
+    use std::process::Stdio;
+    if quiet {
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let _ = crate::vfs::thread::Builder::new().name("reap".into()).spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Lanza `app` (o el comando personalizado `custom`) sobre `path`.
 pub fn launch(app: Option<&App>, custom: &str, path: &Path) {
-    #[cfg(unix)]
-    {
-        let line = match app {
-            Some(a) => {
-                #[cfg(target_os = "macos")]
-                {
-                    format!("open -a {} {}", sh_quote(Path::new(&a.exec)), sh_quote(path))
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let q = sh_quote(path);
-                    let raw = path.display().to_string();
-                    let mut s = String::new();
-                    let mut it = a.exec.chars().peekable();
-                    let mut used = false;
-                    let (mut in_dq, mut in_sq) = (false, false);
-                    while let Some(c) = it.next() {
-                        if c == '%' {
-                            match it.next() {
-                                Some('f' | 'F' | 'u' | 'U') => {
-                                    // la ruta se cita según el contexto en que cae (un nombre con `$(…)` no debe ejecutarse)
-                                    if in_dq {
-                                        for ch in raw.chars() {
-                                            if matches!(ch, '\\' | '$' | '`' | '"') {
-                                                s.push('\\');
-                                            }
-                                            s.push(ch);
-                                        }
-                                    } else if in_sq {
-                                        s.push_str(&raw.replace('\'', "'\\''"));
-                                    } else {
-                                        s.push_str(&q);
-                                    }
-                                    used = true;
-                                }
-                                Some('%') => s.push('%'),
-                                _ => {}
-                            }
-                        } else {
-                            match c {
-                                '"' if !in_sq => in_dq = !in_dq,
-                                '\'' if !in_dq => in_sq = !in_sq,
-                                _ => {}
-                            }
-                            s.push(c);
-                        }
-                    }
-                    if !used {
-                        s.push(' ');
-                        s.push_str(&q);
-                    }
-                    s
-                }
-            }
-            None => format!("{} {}", custom, sh_quote(path)),
-        };
-        let _ = std::process::Command::new("sh").arg("-c").arg(format!("{line} >/dev/null 2>&1 &")).spawn();
-    }
+    let _ = launch_app(app, custom, path, "");
+}
+
+/// Como `launch`, devolviendo el error de arranque. `sys_term`: terminal del sistema configurado
+/// (para las aplicaciones con `Terminal=true`). Nunca pasa por `sh -c`: la orden personalizada se
+/// parte en argumentos como un campo Exec (`%f` marca dónde va el archivo; si no, va al final).
+pub fn launch_app(app: Option<&App>, custom: &str, path: &Path, sys_term: &str) -> Result<(), String> {
+    let _ = sys_term;
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         if let Some(a) = app {
-            launch_registry_cmd(&a.exec, path);
-            return;
+            if a.exec.is_empty() && !a.id.is_empty() {
+                return crate::sysapps::win_invoke(&a.id, path);
+            }
+            return launch_registry_cmd(&a.exec, path);
         }
         if custom.trim().is_empty() {
-            let _ = std::process::Command::new("rundll32.exe")
-                .arg("shell32.dll,OpenAs_RunDLL")
-                .arg(path)
-                .creation_flags(0x0800_0000)
-                .spawn();
-        } else {
-            let _ = std::process::Command::new(custom.trim()).arg(path).creation_flags(0x0800_0000).spawn();
+            return crate::sysapps::win_open_with_dialog(path);
         }
+        use std::os::windows::process::CommandExt;
+        let argv = crate::systerm::split_words(custom.trim()).filter(|v| !v.is_empty()).ok_or(crate::i18n::t("orden vacía"))?;
+        let mut c = std::process::Command::new(&argv[0]);
+        c.args(&argv[1..]).arg(path).creation_flags(0x0800_0000);
+        return spawn_detached(c, true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(a) = app {
+            let mut c = std::process::Command::new("open");
+            c.arg("-a").arg(if a.id.is_empty() { &a.exec } else { &a.id }).arg(path);
+            return spawn_detached(c, true);
+        }
+    }
+    #[cfg(not(any(windows, target_arch = "wasm32")))]
+    {
+        let argv = match app {
+            #[cfg(not(target_os = "macos"))]
+            Some(a) => exec_argv(&a.exec, path, &a.name, &a.icon, &a.desktop),
+            _ => exec_argv(custom.trim(), path, "", "", Path::new("")),
+        };
+        let argv = argv.ok_or(crate::i18n::t("orden vacía o mal formada"))?;
+        let dir = path.parent().filter(|d| d.is_dir()).map(|d| d.to_path_buf()).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"));
+        if app.is_some_and(|a| a.terminal) {
+            return crate::systerm::run_in(sys_term, &dir, &argv);
+        }
+        let l = crate::systerm::Launch { program: argv[0].clone(), args: argv[1..].to_vec(), cwd: dir, new_console: false };
+        return crate::systerm::spawn(&l);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (app, custom, path);
+        Err(crate::i18n::t("no disponible").into())
     }
 }
 
@@ -398,7 +424,7 @@ pub fn trash_delete(p: &Path) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = p;
-        Err("la papelera no está disponible en la web".into())
+        Err(crate::i18n::t("la papelera no está disponible en la web").into())
     }
     #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
     {
@@ -461,8 +487,8 @@ mod mac_trash {
     }
 
     pub fn list() -> Result<Vec<TrashRow>, String> {
-        let dir = trash_dir().ok_or("sin carpeta personal")?;
-        let rd = fs::read_dir(&dir).map_err(|e| format!("{e} (¿falta el permiso de acceso a la papelera?)"))?;
+        let dir = trash_dir().ok_or(crate::i18n::t("sin carpeta personal"))?;
+        let rd = fs::read_dir(&dir).map_err(|e| crate::i18n::tf("{} (¿falta el permiso de acceso a la papelera?)", &[&e]))?;
         // registros: nombre → (hora, ruta original), el más reciente primero
         let mut recs: Vec<(u64, String, PathBuf)> = log_path()
             .and_then(|f| fs::read_to_string(f).ok())
@@ -582,12 +608,85 @@ pub fn trash_list() -> Result<Vec<TrashRow>, String> {
 }
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn trash_list() -> Result<Vec<TrashRow>, String> {
-    Err("no soportado".into())
+    Err(crate::i18n::t("no soportado").into())
 }
 
 #[cfg(any(target_os = "linux", windows))]
 pub fn trash_restore(rows: &[TrashRow]) -> Result<(), String> {
-    trash::os_limited::restore_all(rows.iter().map(|r| r.item.clone())).map_err(|e| e.to_string())
+    // «gemelos» (misma ruta original): `restore_all` no restaura ninguno si los hay juntos. Primero
+    // el más reciente de cada ruta y después los demás, que chocarán y irán con otro nombre.
+    let mut sorted: Vec<&TrashRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| b.time.cmp(&a.time));
+    let mut seen = std::collections::HashSet::new();
+    let (mut first, mut later) = (Vec::new(), Vec::new());
+    for r in sorted {
+        if seen.insert(r.item.original_path()) {
+            first.push(r.item.clone());
+        } else {
+            later.push(r.item.clone());
+        }
+    }
+    let mut errs = Vec::new();
+    restore_items(first, &mut errs);
+    for it in later {
+        restore_items(vec![it], &mut errs);
+    }
+    if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) }
+}
+
+/// Restaura `items`; uno que choque con algo que ya existe se restaura con un nombre libre
+/// («x (2)», como en macOS) y se sigue con los demás.
+#[cfg(any(target_os = "linux", windows))]
+fn restore_items(mut items: Vec<trash::TrashItem>, errs: &mut Vec<String>) {
+    while !items.is_empty() {
+        match trash::os_limited::restore_all(items) {
+            Ok(()) => return,
+            Err(trash::Error::RestoreCollision { path, mut remaining_items }) => {
+                // los anteriores al que choca ya están restaurados; `remaining_items` empieza por él
+                let k = remaining_items.iter().position(|it| it.original_path() == path).unwrap_or(0);
+                if k < remaining_items.len() {
+                    let it = remaining_items.remove(k);
+                    if let Err(e) = restore_renamed(&it) {
+                        errs.push(e);
+                    }
+                }
+                items = remaining_items;
+            }
+            Err(trash::Error::RestoreTwins { items: twins, .. }) => {
+                // no debería pasar (se separan antes): uno a uno
+                for it in twins {
+                    restore_items(vec![it], errs);
+                }
+                return;
+            }
+            Err(e) => {
+                errs.push(e.to_string());
+                return;
+            }
+        }
+    }
+}
+
+/// Restaura un elemento de la papelera junto a su sitio original, con un nombre libre.
+#[cfg(target_os = "linux")]
+fn restore_renamed(it: &trash::TrashItem) -> Result<(), String> {
+    // papelera freedesktop: `id` es el .trashinfo; el contenido está en «files» con el mismo nombre
+    let info = Path::new(&it.id);
+    let (Some(dir), Some(stem)) = (info.parent().and_then(Path::parent), info.file_stem()) else {
+        return Err(crate::i18n::tf("{}: ya existe", &[&it.original_path().display()]));
+    };
+    let file = dir.join("files").join(stem);
+    let _ = fs::create_dir_all(&it.original_parent);
+    let dst = crate::fsys::unique_path_os(&it.original_parent, &it.name);
+    fs::rename(&file, &dst).map_err(|e| format!("{}: {e}", it.name.to_string_lossy()))?;
+    let _ = fs::remove_file(info);
+    Ok(())
+}
+
+/// Windows: la papelera del sistema sólo restaura a la ruta original; si está ocupada, se avisa.
+#[cfg(windows)]
+fn restore_renamed(it: &trash::TrashItem) -> Result<(), String> {
+    Err(crate::i18n::tf("{}: ya existe", &[&it.original_path().display()]))
 }
 #[cfg(target_os = "macos")]
 pub fn trash_restore(rows: &[TrashRow]) -> Result<(), String> {
@@ -595,7 +694,7 @@ pub fn trash_restore(rows: &[TrashRow]) -> Result<(), String> {
 }
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn trash_restore(_rows: &[TrashRow]) -> Result<(), String> {
-    Err("no soportado".into())
+    Err(crate::i18n::t("no soportado").into())
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -608,7 +707,7 @@ pub fn trash_purge(rows: &[TrashRow]) -> Result<(), String> {
 }
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 pub fn trash_purge(_rows: &[TrashRow]) -> Result<(), String> {
-    Err("no soportado".into())
+    Err(crate::i18n::t("no soportado").into())
 }
 
 /// Restaura de la papelera los elementos cuya ruta original está en `items` (el más reciente de cada ruta).
@@ -625,7 +724,7 @@ pub fn restore_paths(items: &[PathBuf]) -> Result<(), String> {
         }
     }
     if pick.is_empty() {
-        return Err("no encontrado en la papelera".into());
+        return Err(crate::i18n::t("no encontrado en la papelera").into());
     }
     let rows: Vec<TrashRow> = pick.into_values().collect();
     trash_restore(&rows)
@@ -661,7 +760,7 @@ pub fn spawn_hash(path: PathBuf, ctx: egui::Context) -> Arc<HashJob> {
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 if j.cancel.load(Ordering::Relaxed) {
-                    return Err("cancelado".into());
+                    return Err(crate::i18n::t("cancelado").into());
                 }
                 let n = f.read(&mut buf).map_err(|e| e.to_string())?;
                 if n == 0 {
@@ -695,7 +794,11 @@ pub struct DupJob {
     pub groups: Mutex<Vec<(u64, Vec<PathBuf>)>>,
 }
 
-fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, j: &DupJob, ctx: &egui::Context) {
+/// Identidad de un archivo en disco (dispositivo, nodo): dos enlaces duros al mismo archivo no
+/// son duplicados (borrar uno no libera nada).
+type FileId = (u64, u64);
+
+fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, seen: &mut std::collections::HashSet<FileId>, j: &DupJob, ctx: &egui::Context) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         if j.cancel.load(Ordering::Relaxed) {
@@ -704,9 +807,19 @@ fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, j: &DupJob, ctx: &egui
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.v_is_dir() {
-            walk(&p, out, j, ctx);
+            walk(&p, out, seen, j, ctx);
         } else if ft.v_is_file() {
             if let Ok(md) = e.metadata() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if md.nlink() > 1 && !seen.insert((md.dev(), md.ino())) {
+                        continue;
+                    }
+                }
+                // en Windows la identidad pide abrir el archivo: se mira después, sólo entre los del mismo tamaño
+                #[cfg(not(unix))]
+                let _ = &seen;
                 if md.len() > 0 {
                     out.entry(md.len()).or_default().push(p);
                 }
@@ -716,6 +829,27 @@ fn walk(dir: &Path, out: &mut HashMap<u64, Vec<PathBuf>>, j: &DupJob, ctx: &egui
             }
         }
     }
+}
+
+/// Quita de `files` los enlaces duros a un archivo ya visto (`id_of` da la identidad sólo si el
+/// archivo tiene más de un enlace).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn drop_hard_links(files: Vec<PathBuf>, seen: &mut std::collections::HashSet<FileId>, id_of: impl Fn(&Path) -> Option<FileId>) -> Vec<PathBuf> {
+    files.into_iter().filter(|p| id_of(p).is_none_or(|id| seen.insert(id))).collect()
+}
+
+/// Windows: (número de serie del volumen, índice del archivo) si el archivo tiene más de un enlace duro.
+#[cfg(windows)]
+fn win_link_id(p: &Path) -> Option<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    // sin pedir lectura (sólo atributos) y compartido: sirve aunque otro lo tenga abierto
+    let f = std::fs::OpenOptions::new().access_mode(0).share_mode(7).open(p).ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut info) }.ok()?;
+    (info.nNumberOfLinks > 1).then(|| (info.dwVolumeSerialNumber as u64, ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
 }
 
 fn quick_hash(p: &Path, full: bool) -> Option<[u8; 32]> {
@@ -742,10 +876,17 @@ pub fn spawn_dups(root: PathBuf, ctx: egui::Context) -> Arc<DupJob> {
     let j = job.clone();
     crate::vfs::thread::spawn(move || {
         let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-        walk(&root, &mut by_size, &j, &ctx);
+        walk(&root, &mut by_size, &mut Default::default(), &j, &ctx);
+        #[cfg(windows)]
+        let mut seen_win = std::collections::HashSet::new();
         for (size, files) in by_size.into_iter().filter(|(_, v)| v.len() > 1) {
             if j.cancel.load(Ordering::Relaxed) {
                 break;
+            }
+            #[cfg(windows)]
+            let files = drop_hard_links(files, &mut seen_win, win_link_id);
+            if files.len() < 2 {
+                continue;
             }
             // 1) prefijo de 64 KB, 2) archivo completo
             let mut by_head: HashMap<[u8; 32], Vec<PathBuf>> = HashMap::new();
@@ -772,9 +913,108 @@ pub fn spawn_dups(root: PathBuf, ctx: egui::Context) -> Arc<DupJob> {
                 }
             }
         }
-        j.groups.lock().unwrap().sort_by(|a, b| (b.0 * b.1.len() as u64).cmp(&(a.0 * a.1.len() as u64)));
+        j.groups.lock().unwrap().sort_by_key(|g| std::cmp::Reverse(g.0.saturating_mul(g.1.len() as u64)));
         j.finished.store(true, Ordering::Release);
         ctx.request_repaint();
     });
     job
+}
+
+#[cfg(test)]
+mod exec_dup_tests {
+    use super::*;
+
+    fn argv(exec: &str, path: &str) -> Vec<String> {
+        exec_argv(exec, Path::new(path), "Mi App", "mi-icono", Path::new("/usr/share/applications/mi.desktop"))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn exec_field_codes() {
+        assert_eq!(argv("gedit %U", "/t/a b.txt"), ["gedit", "/t/a b.txt"]);
+        assert_eq!(argv("vlc --started-from-file %f", "/x"), ["vlc", "--started-from-file", "/x"]);
+        assert_eq!(argv("app", "/x"), ["app", "/x"], "sin código: la ruta al final");
+        assert_eq!(argv("app --file=%f", "/x"), ["app", "--file=/x"]);
+        assert_eq!(argv("app %i %c %k %f", "/x"), ["app", "--icon", "mi-icono", "Mi App", "/usr/share/applications/mi.desktop", "/x"]);
+        assert_eq!(argv("app 100%% %d %D %n %N %v %m %F", "/x"), ["app", "100%", "/x"]);
+        assert_eq!(argv("  app\t\t%f  ", "/x"), ["app", "/x"]);
+    }
+
+    #[test]
+    fn exec_quoting_and_escapes() {
+        // comillas y comillas escapadas (tal y como quedan tras leer el .desktop: `\\"` → `\"`)
+        assert_eq!(argv(r#""/opt/My App/bin" --title "say \\"hi\\"" %f"#, "/x"), ["/opt/My App/bin", "--title", "say \"hi\"", "/x"]);
+        assert_eq!(argv(r#"sh -c "echo \\$HOME \\`id\\` \\\\" %f"#, "/x"), ["sh", "-c", "echo $HOME `id` \\", "/x"]);
+        // escapes generales: se aplican antes de partir en palabras (`\s` fuera de comillas separa)
+        assert_eq!(argv(r"app\sname %f", "/x"), ["app", "name", "/x"]);
+        assert_eq!(argv(r#""my\sapp" %f"#, "/x"), ["my app", "/x"]);
+        // argumento vacío
+        assert_eq!(argv(r#"app "" %f"#, "/x"), ["app", "", "/x"]);
+        // dentro de comillas los códigos de campo se quitan (la ruta no se cuela en un argumento de shell)
+        assert_eq!(argv(r#"sh -c "open %f" %f"#, "/x"), ["sh", "-c", "open ", "/x"]);
+        // mal formado
+        assert!(exec_argv(r#"app "abierta"#, Path::new("/x"), "", "", Path::new("")).is_none());
+        assert!(exec_argv("   ", Path::new("/x"), "", "", Path::new("")).is_none());
+    }
+
+    #[test]
+    fn exec_hostile_names_are_single_args() {
+        for name in ["/t/$(rm -rf ~).txt", "/t/a\"b'c`d`.txt", "/t/; reboot", "/t/x %f y", "/t/-rf"] {
+            let v = argv("app %f", name);
+            assert_eq!(v, ["app", name], "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/t/caf\xe9");
+            let v = exec_argv("app %f", Path::new(raw), "", "", Path::new("")).unwrap();
+            assert_eq!(v, [std::ffi::OsString::from("app"), raw.to_os_string()]);
+        }
+    }
+
+    /// La parte común con Windows: la segunda ruta con la misma identidad sobra; sin identidad
+    /// (un solo enlace) nunca se quita nada.
+    #[test]
+    fn drop_hard_links_by_id() {
+        let ids = |p: &Path| match p.file_name().and_then(|n| n.to_str()) {
+            Some("a" | "a_link" | "a_link2") => Some((7, 1)),
+            Some("b") => Some((8, 1)),
+            Some("b_otro_volumen") => Some((9, 1)),
+            _ => None,
+        };
+        let mut seen = std::collections::HashSet::new();
+        let v: Vec<PathBuf> = ["a", "x", "a_link", "y", "a_link2"].iter().map(PathBuf::from).collect();
+        assert_eq!(drop_hard_links(v, &mut seen, ids), ["a", "x", "y"].iter().map(PathBuf::from).collect::<Vec<_>>());
+        // otro grupo de tamaño: comparte el conjunto, pero el volumen distingue
+        let v: Vec<PathBuf> = ["b", "b_otro_volumen"].iter().map(PathBuf::from).collect();
+        assert_eq!(drop_hard_links(v, &mut seen, ids).len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicates_skip_hard_links() {
+        let n = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let d = crate::vfs::temp_dir().join(format!("fbw1-dups-{}-{n:x}", crate::vfs::pid()));
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("a.bin"), b"mismo contenido").unwrap();
+        fs::hard_link(d.join("a.bin"), d.join("sub/a_link.bin")).unwrap();
+        fs::write(d.join("c.bin"), b"otro contenido!").unwrap();
+        fs::hard_link(d.join("c.bin"), d.join("c_link.bin")).unwrap();
+        fs::write(d.join("c_copy.bin"), b"otro contenido!").unwrap();
+        let j = spawn_dups(d.clone(), egui::Context::default());
+        let t0 = web_time::Instant::now();
+        while !j.finished.load(Ordering::Acquire) {
+            assert!(t0.elapsed().as_secs() < 30);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let g = j.groups.lock().unwrap().clone();
+        let _ = fs::remove_dir_all(&d);
+        // a.bin y su enlace duro no son duplicados; c.bin (o su enlace) y c_copy.bin sí
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].1.len(), 2, "{g:?}");
+        assert!(g[0].1.iter().any(|p| p.ends_with("c_copy.bin")));
+    }
 }

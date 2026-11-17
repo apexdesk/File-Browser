@@ -31,17 +31,21 @@ pub fn json_str(s: &str) -> String {
     o
 }
 
-pub fn list_json(comps: &[String], rows: &[Row], truncated: bool) -> String {
+pub fn list_json(comps: &[String], rows: &[Row], mut truncated: bool) -> String {
     let path: Vec<String> = comps.iter().map(|c| json_str(c)).collect();
-    let mut o = format!("{{\"path\":[{}],\"truncated\":{truncated},\"entries\":[", path.join(","));
+    // mismo tope de bytes que el listado HTML
+    let mut e = String::new();
     for (i, r) in rows.iter().enumerate() {
-        if i > 0 {
-            o.push(',');
+        if e.len() > crate::page::MAX_PAGE {
+            truncated = true;
+            break;
         }
-        o.push_str(&format!("{{\"n\":{},\"d\":{},\"s\":{},\"m\":{}}}", json_str(&r.name), r.is_dir, r.size, r.mtime));
+        if i > 0 {
+            e.push(',');
+        }
+        e.push_str(&format!("{{\"n\":{},\"d\":{},\"s\":{},\"m\":{}}}", json_str(&r.name), r.is_dir, r.size, r.mtime));
     }
-    o.push_str("]}");
-    o
+    format!("{{\"path\":[{}],\"truncated\":{truncated},\"entries\":[{e}]}}", path.join(","))
 }
 
 #[cfg(test)]

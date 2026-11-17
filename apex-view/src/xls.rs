@@ -18,6 +18,9 @@ use crate::{Error, Fonts, Image, Limits, TextRun};
 
 const KEEP: usize = 4;
 const MAX_CELLS: usize = 200_000;
+/// Bytes of shared strings a sheet's cells may copy (one long string named
+/// by every cell would take gigabytes).
+const MAX_SHARED_TEXT: usize = 64 << 20;
 
 pub(crate) struct Doc {
     stream: Vec<u8>,
@@ -347,7 +350,7 @@ fn sst<'a>(parts: &[&'a [u8]]) -> Vec<String> {
             left -= take;
         }
         // Formatting runs and phonetic data, maybe in the next parts.
-        let mut skip = runs * 4 + ext;
+        let mut skip = (runs * 4).saturating_add(ext);
         while skip > 0 {
             let k = skip.min(c.left());
             c.p += k;
@@ -491,6 +494,7 @@ fn read_sheet(stream: &[u8], pos: usize, strings: &[String], biff5: bool, cp: u1
         }
     };
     let mut n = 0usize;
+    let mut shared_left = MAX_SHARED_TEXT;
     while let Some((ty, d)) = recs.next() {
         n += 1;
         if n > 2_000_000 {
@@ -526,8 +530,15 @@ fn read_sheet(stream: &[u8], pos: usize, strings: &[String], biff5: bool, cp: u1
             }
             0x00FD => {
                 if let (Some(row), Some(col), Some(xf), Some(i)) = (c.u16(), c.u16(), c.u16(), c.u32()) {
-                    let v = strings.get(i as usize).filter(|s| !s.is_empty()).map(|s| Val::Text(s.clone()));
-                    put(&mut sh, row, col, xf, v);
+                    // Past the budget, cells show no more shared text.
+                    if sh.cells.len() >= MAX_CELLS || u32::from(row) >= MAX_ROWS || u32::from(col) >= MAX_COLS {
+                        continue;
+                    }
+                    let s = strings.get(i as usize).filter(|s| !s.is_empty() && s.len() <= shared_left);
+                    let len = s.map_or(0, |s| s.len());
+                    if put(&mut sh, row, col, xf, s.map(|s| Val::Text(s.clone()))) {
+                        shared_left -= len;
+                    }
                 }
             }
             0x0204 | 0x00D6 => {
@@ -647,5 +658,26 @@ mod tests {
         assert_eq!(s, vec!["abc".to_string(), "déf".to_string()]);
         assert_eq!(rk(0x0000_0192), 100.0);
         assert_eq!(rk(0x3FF0_0001), 0.01);
+    }
+
+    fn record(ty: u16, body: &[u8]) -> Vec<u8> {
+        [&ty.to_le_bytes()[..], &(body.len() as u16).to_le_bytes(), body].concat()
+    }
+
+    #[test]
+    fn shared_text_stays_bounded() {
+        // Every cell names one long shared string.
+        let strings = vec!["x".repeat(65_535)];
+        let mut s = record(0x0809, &[0; 16]);
+        for i in 0..5_000u32 {
+            let row = (i / 50) as u16;
+            let col = (i % 50) as u16;
+            s.extend(record(0x00FD, &[&row.to_le_bytes()[..], &col.to_le_bytes(), &0u16.to_le_bytes(), &0u32.to_le_bytes()].concat()));
+        }
+        s.extend(record(0x000A, &[]));
+        let sh = read_sheet(&s, 0, &strings, false, 1252);
+        assert_eq!(sh.cells.len(), 5_000);
+        let text: usize = sh.cells.iter().map(|c| if let Some(Val::Text(t)) = &c.val { t.len() } else { 0 }).sum();
+        assert!(text > 0 && text <= MAX_SHARED_TEXT);
     }
 }

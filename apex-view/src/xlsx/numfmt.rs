@@ -123,7 +123,8 @@ pub fn date_to_serial(y: i64, m: i64, d: i64) -> f64 {
 }
 
 pub fn serial_to_date(serial: f64) -> (i64, u32, u32) {
-    civil_from_days(serial.floor() as i64 - EPOCH_OFFSET)
+    // Far past any calendar: held where the day count can't overflow.
+    civil_from_days(serial.clamp(-1e15, 1e15).floor() as i64 - EPOCH_OFFSET)
 }
 
 /// Serial date for a calendar date in Excel's 1900 system, which counts
@@ -304,6 +305,9 @@ impl NumFormat {
 
     pub fn parse(code: &str) -> Self {
         let code = code.trim();
+        // Excel keeps codes to 255 characters; a longer one from the file
+        // is cut (reading it looks ahead from each character).
+        let code = code.char_indices().nth(MAX_CODE_CHARS).map_or(code, |(i, _)| &code[..i]);
         if code.is_empty() || code.eq_ignore_ascii_case("general") || code.eq_ignore_ascii_case("estándar") {
             return Self::general();
         }
@@ -404,6 +408,12 @@ impl NumFormat {
         }
     }
 }
+
+/// Most digit placeholders (and decimals, elapsed-time width, thousands
+/// scalings) a section of a format keeps.
+const MAX_PLACES: usize = 64;
+/// Most characters of a format code read.
+const MAX_CODE_CHARS: usize = 1024;
 
 fn round_to(n: f64, dec: i32) -> f64 {
     let p = 10f64.powi(dec);
@@ -553,7 +563,7 @@ fn parse_section(s: &str) -> Section {
                     // Elapsed time: [h], [mm], [ss].
                     flush(&mut lit, &mut sec.toks);
                     let unit = inner.chars().next().unwrap_or('h').to_ascii_lowercase();
-                    sec.toks.push(Tok::Date(DatePart::Elapsed(unit, inner.chars().count())));
+                    sec.toks.push(Tok::Date(DatePart::Elapsed(unit, inner.chars().count().min(MAX_PLACES))));
                 }
                 i = end;
             }
@@ -702,12 +712,19 @@ fn parse_section(s: &str) -> Section {
         i += 1;
     }
     flush(&mut lit, &mut sec.toks);
+    // Codes from the file may have any number of placeholders: what is
+    // shown keeps to so many (formatting takes no more, and the counts
+    // stay small for the arithmetic on them).
+    sec.int_zeros = sec.int_zeros.min(MAX_PLACES);
+    sec.dec_zeros = sec.dec_zeros.min(MAX_PLACES);
+    sec.dec_hashes = sec.dec_hashes.min(MAX_PLACES - sec.dec_zeros);
+    sec.scale = sec.scale.min(MAX_PLACES as i32);
     // Only '?' placeholders (the zero section of accounting formats, like
     // `"-"??`): they stand for blank space.
     if q_marks > 0 && !digits {
         for t in &mut sec.toks {
             if *t == Tok::Number {
-                *t = Tok::Lit(" ".repeat(q_marks));
+                *t = Tok::Lit(" ".repeat(q_marks.min(MAX_PLACES)));
             }
         }
     }
@@ -750,10 +767,8 @@ fn format_fixed(n: f64, sec: &Section, loc: &Locale) -> String {
     let dec = sec.dec_zeros + sec.dec_hashes;
     let s = format!("{:.*}", dec, n);
     let (int, frac) = s.split_once('.').unwrap_or((&s, ""));
-    let mut int = int.trim_start_matches('0').to_string();
-    while int.len() < sec.int_zeros {
-        int.insert(0, '0');
-    }
+    let int = int.trim_start_matches('0');
+    let mut int = format!("{}{int}", "0".repeat(sec.int_zeros.saturating_sub(int.len())));
     if sec.thousands {
         int = group_thousands(&int, loc.thousands);
     }
@@ -937,4 +952,40 @@ pub(crate) fn builtin_numfmt(id: u32) -> Option<&'static str> {
         49 => "@",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_format_codes_stay_bounded() {
+        // Precision past what `format!` takes, and a long run of leading zeros.
+        let code = format!("0.{}", "0".repeat(70_000));
+        let (s, _) = NumFormat::parse(&code).format_number(1.5, &Locale::EN);
+        assert!(s.starts_with("1.") && s.len() <= MAX_PLACES + 2);
+        let code = "0".repeat(200_000);
+        let (s, _) = NumFormat::parse(&code).format_number(7.0, &Locale::EN);
+        assert_eq!(s.len(), MAX_PLACES);
+        let code = format!("0.{}E+00", "#".repeat(70_000));
+        let _ = NumFormat::parse(&code).format_number(1.5, &Locale::EN);
+        let code = format!("[{}]:mm", "h".repeat(70_000));
+        let _ = NumFormat::parse(&code).format_number(1.5, &Locale::EN);
+        let code = format!("0{}", ",".repeat(70_000));
+        let f = NumFormat::parse(&code);
+        let _ = f.format_number(1.5, &Locale::EN);
+        let _ = f.as_shown(1.5);
+        // Dates far past any calendar.
+        let f = NumFormat::parse("dd/mm/yyyy ddd");
+        for n in [1e300, -1e300, f64::MAX, 4e18] {
+            let _ = f.format_number(n, &Locale::EN);
+        }
+        let _ = serial_to_date(-1e300);
+        let _ = excel_date(f64::MIN);
+        // Escapes inside a number run: each looks ahead (cut, so linear).
+        let code = format!("0{}0", "\\a".repeat(500_000));
+        let t = std::time::Instant::now();
+        let _ = NumFormat::parse(&code).format_number(1.0, &Locale::EN);
+        assert!(t.elapsed().as_secs() < 5);
+    }
 }

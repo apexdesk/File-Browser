@@ -8,10 +8,97 @@ use std::io::{BufReader, Read};
 use std::process::{Command, Stdio};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 pub const THUMB: u32 = 160;
 const CACHE_CAP: usize = 700;
+/// Miniaturas fallidas que se recuerdan (pasado el tope se olvidan y se reintentan una vez).
+const FAILED_CAP: usize = 50_000;
+/// Plazo de una miniatura de documento (las demás no se pueden interrumpir).
+const THUMB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// Pila de los hilos que decodifican archivos ajenos: un desbordamiento de pila no se puede atrapar.
+pub const DECODE_STACK: usize = 16 << 20;
+
+// ---------------------------------------------------------------------------
+// Contención de fallos: un decodificador que entra en pánico con un archivo raro sólo pierde ese
+// archivo; la aplicación y el hilo siguen.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static GUARDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Ejecuta `f` (leer o decodificar un archivo ajeno) atrapando un pánico: `None` si falló.
+/// En la web (`panic = "abort"`) no atrapa nada.
+pub fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
+    install_panic_hook();
+    let _ = GUARDED.try_with(|g| g.set(g.get() + 1));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let _ = GUARDED.try_with(|g| g.set(g.get().saturating_sub(1)));
+    r.ok()
+}
+
+/// Gancho de pánico: dentro de `guarded` sólo deja una línea (unas pocas veces, sin inundar la
+/// salida); fuera, avisa como siempre y aborta, igual que con `panic = "abort"`.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if GUARDED.try_with(|g| g.get()).unwrap_or(0) > 0 {
+                static SHOWN: AtomicU32 = AtomicU32::new(0);
+                if SHOWN.fetch_add(1, Ordering::Relaxed) < 8 {
+                    use std::io::Write;
+                    let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+                    let _ = writeln!(std::io::stderr(), "File Browser: un archivo no se pudo decodificar ({at}); se omite");
+                }
+                return;
+            }
+            prev(info);
+            #[cfg(not(test))]
+            std::process::abort();
+        }));
+    });
+}
+
+/// Bloquea un mutex aunque otro hilo haya entrado en pánico con él cogido.
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lanza un hilo de decodificación con pila amplia.
+pub fn spawn_decoder<F: FnOnce() + Send + 'static>(name: &str, f: F) {
+    if let Err(e) = crate::vfs::thread::Builder::new().name(name.to_string()).stack_size(DECODE_STACK).spawn(f) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "File Browser: no se pudo lanzar el hilo {name}: {e}");
+    }
+}
+
+/// Abre sólo un archivo normal: una tubería con nombre o un dispositivo (p. ej. `x.md` que sea un
+/// FIFO) dejarían bloqueado para siempre el hilo que lo lee.
+pub fn open_regular(path: &Path) -> Option<File> {
+    if !crate::vfs::fs::metadata(path).map(|m| m.v_is_file()).unwrap_or(false) {
+        return None;
+    }
+    // sin bloquear al abrir: el archivo puede cambiar por un FIFO entre la comprobación y la apertura
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).ok()?
+    };
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    let f = File::open(path).ok()?;
+    f.metadata().ok().filter(|m| m.v_is_file()).map(|_| f)
+}
+
+/// Resultado de una miniatura.
+enum Out {
+    Done(Decoded),
+    Failed,
+    /// ya no se quería (se pedirá de nuevo si vuelve a verse)
+    Cancelled,
+}
 
 pub struct Decoded {
     pub w: usize,
@@ -28,6 +115,8 @@ pub struct Request {
 struct State {
     queue: Vec<Request>, // el último es el de mayor prioridad
     inflight: HashSet<u64>,
+    /// claves de la última petición (las que se están decodificando incluidas)
+    wanted: HashSet<u64>,
 }
 
 struct Shared {
@@ -37,13 +126,13 @@ struct Shared {
 
 pub struct Thumbs {
     shared: Arc<Shared>,
-    rx: Receiver<(u64, Option<Decoded>)>,
+    rx: Receiver<(u64, Out)>,
     cache: HashMap<u64, (egui::TextureHandle, u64)>,
     failed: HashSet<u64>,
     frame: u64,
     /// sin hilos (navegador): las miniaturas se decodifican aquí, unas pocas por fotograma
     #[cfg(target_arch = "wasm32")]
-    tx: Sender<(u64, Option<Decoded>)>,
+    tx: Sender<(u64, Out)>,
 }
 
 fn is_video_ext(e: &str) -> bool {
@@ -59,6 +148,7 @@ fn have_cmd(name: &'static str, cell: &'static OnceLock<bool>) -> bool {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 fn have_ffmpeg() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     have_cmd("ffmpeg", &C)
@@ -69,8 +159,12 @@ fn have_magick() -> bool {
     have_cmd("magick", &C)
 }
 
-fn run_capture(mut cmd: Command) -> Option<Vec<u8>> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+fn run_capture(cmd: Command) -> Option<Vec<u8>> {
+    run_capture_in(cmd, Stdio::null())
+}
+
+fn run_capture_in(mut cmd: Command, stdin: Stdio) -> Option<Vec<u8>> {
+    cmd.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -81,7 +175,9 @@ fn run_capture(mut cmd: Command) -> Option<Vec<u8>> {
     let mut so = child.stdout.take()?;
     let reader = crate::vfs::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut so, &mut buf);
+        let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut so, 64 << 20), &mut buf);
+        // lo que sobre se descarta para que el proceso no se quede bloqueado escribiendo
+        let _ = std::io::copy(&mut so, &mut std::io::sink());
         buf
     });
     let end = web_time::Instant::now() + std::time::Duration::from_secs(25);
@@ -132,15 +228,69 @@ fn ffmpeg_frame(path: &Path, max: u32, video: bool) -> Option<Decoded> {
     None
 }
 
+/// Formato de ImageMagick para las extensiones que de verdad lo necesitan. Las demás no se le pasan:
+/// adivinaría el formato por el contenido, y un «PNG» que fuera PostScript/MVG/MSL llegaría a sus
+/// delegados.
+fn magick_coder(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "tif" | "tiff" => "TIFF",
+        "psd" => "PSD",
+        "psb" => "PSB",
+        "heic" | "heif" => "HEIC",
+        "avif" => "AVIF",
+        "xcf" => "XCF",
+        "cr2" => "CR2",
+        "cr3" => "CR3",
+        "nef" => "NEF",
+        "nrw" => "NRW",
+        "arw" => "ARW",
+        "srf" => "SRF",
+        "sr2" => "SR2",
+        "dng" => "DNG",
+        "orf" => "ORF",
+        "rw2" => "RW2",
+        "pef" => "PEF",
+        "raf" => "RAF",
+        "srw" => "SRW",
+        "3fr" => "3FR",
+        "erf" => "ERF",
+        "kdc" => "KDC",
+        "mrw" => "MRW",
+        "x3f" => "X3F",
+        _ => return None,
+    })
+}
+
+/// Argumentos de `magick`: límites de recursos, formato fijado y la imagen por la entrada estándar
+/// (el nombre del archivo nunca se interpreta: ni `@lista`, ni comodines, ni `formato:`).
+fn magick_args(coder: &str, max: u32) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    for (k, v) in [("memory", "256MiB"), ("map", "512MiB"), ("disk", "1GiB"), ("area", "128MP"), ("width", "32768"), ("height", "32768"), ("time", "20"), ("thread", "2")] {
+        a.extend(["-limit".to_string(), k.to_string(), v.to_string()]);
+    }
+    a.push(format!("{coder}:-[0]"));
+    a.extend(["-auto-orient".to_string(), "-thumbnail".to_string(), format!("{max}x{max}>"), "png:-".to_string()]);
+    a
+}
+
 fn magick_frame(path: &Path, max: u32) -> Option<Decoded> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let coder = magick_coder(&ext)?;
     if !have_magick() {
         return None;
     }
+    let f = open_regular(path)?;
     let mut c = Command::new("magick");
-    let mut src = path.as_os_str().to_os_string();
-    src.push("[0]");
-    c.arg(src).args(["-auto-orient", "-thumbnail", &format!("{max}x{max}>"), "png:-"]);
-    from_png_bytes(&run_capture(c)?, max)
+    c.args(magick_args(coder, max));
+    #[cfg(not(target_arch = "wasm32"))]
+    let stdin = Stdio::from(f);
+    #[cfg(target_arch = "wasm32")]
+    let stdin = {
+        drop(f);
+        Stdio::null()
+    };
+    // sigue valiendo el plazo de 25 s de `run_capture_in`
+    from_png_bytes(&run_capture_in(c, stdin)?, max)
 }
 
 fn decode_svg(path: &Path, max: u32) -> Option<Decoded> {
@@ -172,7 +322,12 @@ fn exif_orientation(path: &Path) -> u8 {
     let mut buf = vec![0u8; 65536];
     let Ok(mut f) = File::open(path) else { return 1 };
     let n = f.read(&mut buf).unwrap_or(0);
-    let b = &buf[..n];
+    exif_orientation_in(&buf[..n])
+}
+
+/// Orientación EXIF a partir del principio de un JPEG.
+fn exif_orientation_in(b: &[u8]) -> u8 {
+    let n = b.len();
     if n < 12 || b[0] != 0xFF || b[1] != 0xD8 {
         return 1;
     }
@@ -190,20 +345,21 @@ fn exif_orientation(path: &Path) -> u8 {
             }
             let le = &b[t..t + 2] == b"II";
             let u16_at = |o: usize| -> Option<u16> {
-                let s = b.get(o..o + 2)?;
+                let s = b.get(o..o.checked_add(2)?)?;
                 Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
             };
             let u32_at = |o: usize| -> Option<u32> {
-                let s = b.get(o..o + 4)?;
+                let s = b.get(o..o.checked_add(4)?)?;
                 Some(if le { u32::from_le_bytes([s[0], s[1], s[2], s[3]]) } else { u32::from_be_bytes([s[0], s[1], s[2], s[3]]) })
             };
             let Some(ifd) = u32_at(t + 4) else { return 1 };
-            let base = t + ifd as usize;
+            // desplazamiento del archivo: en 32 bits (Android armv7, web) la suma desbordaría
+            let Some(base) = usize::try_from(ifd).ok().and_then(|v| t.checked_add(v)) else { return 1 };
             let Some(cnt) = u16_at(base) else { return 1 };
             for k in 0..cnt as usize {
-                let e = base + 2 + k * 12;
+                let Some(e) = base.checked_add(2 + k * 12) else { return 1 };
                 if u16_at(e) == Some(0x0112) {
-                    return u16_at(e + 8).filter(|v| (1..=8).contains(v)).map(|v| v as u8).unwrap_or(1);
+                    return e.checked_add(8).and_then(u16_at).filter(|v| (1..=8).contains(v)).map(|v| v as u8).unwrap_or(1);
                 }
             }
             return 1;
@@ -247,7 +403,16 @@ pub fn open_image(path: &Path) -> std::io::Result<image::ImageReader<BufReader<F
 }
 
 pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
+    decode_image_cancel(path, max, &|| false)
+}
+
+/// Como `decode_image`; `cancel` interrumpe lo que se puede interrumpir (documentos).
+pub fn decode_image_cancel(path: &Path, max: u32, cancel: &dyn Fn() -> bool) -> Option<Decoded> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    // una tubería con nombre o un dispositivo dejarían el hilo bloqueado
+    if !crate::vfs::fs::metadata(path).map(|m| m.v_is_file()).unwrap_or(false) {
+        return None;
+    }
     match ext.as_str() {
         "jpg" | "jpeg" | "jpe" => {
             if let Some(d) = decode_jpeg(path, max) {
@@ -255,7 +420,7 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
             }
         }
         "svg" => return decode_svg(path, max),
-        e if crate::docview::is_doc_ext(e) => return crate::docview::thumb(path, max),
+        e if crate::docview::is_doc_ext(e) => return crate::docview::thumb_cancel(path, max, cancel),
         e if crate::comic::is_comic_ext(e) => return crate::comic::thumb(path, max),
         "epub" => return crate::rich::epub_cover(path, max),
         e if is_video_ext(e) => return ffmpeg_frame(path, max, true),
@@ -267,11 +432,26 @@ pub fn decode_image(path: &Path, max: u32) -> Option<Decoded> {
     if md.len() > 256 * 1024 * 1024 {
         return None;
     }
-    let img = open_image(path).ok().and_then(|r| r.decode().ok());
-    let Some(img) = img else { return magick_frame(path, max) };
+    let Some(img) = decode_limited(path, max) else { return magick_frame(path, max) };
     let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
     let rgba = img.into_rgba8();
     Some(Decoded { w: rgba.width() as usize, h: rgba.height() as usize, rgba: rgba.into_raw() })
+}
+
+/// Imágenes grandes: de una en una entre todos los hilos (la memoria de 6 a la vez no cabe).
+pub(crate) static HEAVY: Mutex<()> = Mutex::new(());
+
+/// Decodifica con `image` acotando la memoria (menos para miniaturas que para la vista previa).
+fn decode_limited(path: &Path, max: u32) -> Option<image::DynamicImage> {
+    let (w, h) = open_image(path).ok()?.into_dimensions().ok()?;
+    let mut lim = image::Limits::default();
+    lim.max_image_width = Some(32768);
+    lim.max_image_height = Some(32768);
+    lim.max_alloc = Some(if max <= 1024 { 256 << 20 } else { 512 << 20 });
+    let _heavy = (w as u64 * h as u64 * 4 > 48 << 20).then(|| lock(&HEAVY));
+    let mut r = open_image(path).ok()?;
+    r.limits(lim);
+    r.decode().ok()
 }
 
 fn decode_jpeg(path: &Path, max: u32) -> Option<Decoded> {
@@ -324,6 +504,7 @@ pub fn decode_jpeg_from<R: std::io::Read>(r: R, max: u32, orientation: u8) -> Op
 
 impl Thumbs {
     pub fn new(ctx: &egui::Context) -> Self {
+        install_panic_hook();
         let shared = Arc::new(Shared { st: Mutex::new(State::default()), cv: Condvar::new() });
         let (tx, rx) = channel();
         let n = crate::vfs::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6);
@@ -334,19 +515,18 @@ impl Thumbs {
         };
         for _ in 0..n {
             let (sh, tx, ctx): (Arc<Shared>, Sender<_>, egui::Context) = (shared.clone(), tx.clone(), ctx.clone());
-            crate::vfs::thread::spawn(move || loop {
+            spawn_decoder("miniaturas", move || loop {
                 let req = {
-                    let mut st = sh.st.lock().unwrap();
+                    let mut st = lock(&sh.st);
                     loop {
                         if let Some(r) = st.queue.pop() {
                             st.inflight.insert(r.key);
                             break r;
                         }
-                        st = sh.cv.wait(st).unwrap();
+                        st = sh.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                     }
                 };
-                // los archivos de un servidor SFTP no se descargan sólo para la miniatura
-                let out = if crate::sftp::is_remote(&req.path) { None } else { decode_image(&req.path, THUMB) };
+                let out = thumb_job(&sh, &req);
                 if tx.send((req.key, out)).is_err() {
                     return;
                 }
@@ -364,16 +544,20 @@ impl Thumbs {
         let mut n = 0;
         while n < 24 {
             let Ok((key, out)) = self.rx.try_recv() else { break };
-            self.shared.st.lock().unwrap().inflight.remove(&key);
+            lock(&self.shared.st).inflight.remove(&key);
             match out {
-                Some(d) => {
+                Out::Done(d) => {
                     let img = color_image(ctx, d.w, d.h, &d.rgba);
                     let tex = ctx.load_texture("t", img, egui::TextureOptions::LINEAR);
                     self.cache.insert(key, (tex, self.frame));
                 }
-                None => {
+                Out::Failed => {
+                    if self.failed.len() >= FAILED_CAP {
+                        self.failed.clear();
+                    }
                     self.failed.insert(key);
                 }
+                Out::Cancelled => {}
             }
             n += 1;
         }
@@ -395,15 +579,15 @@ impl Thumbs {
     fn decode_some(&mut self, ctx: &egui::Context) {
         for _ in 0..2 {
             let req = {
-                let mut st = self.shared.st.lock().unwrap();
+                let mut st = lock(&self.shared.st);
                 let Some(r) = st.queue.pop() else { return };
                 st.inflight.insert(r.key);
                 r
             };
             // una imagen grande habría que bajarla entera para una miniatura
             let big = crate::vfs::fs::metadata(&req.path).map(|m| m.len() > 4 << 20).unwrap_or(true);
-            let out = if big { None } else { decode_image(&req.path, THUMB) };
-            let _ = self.tx.send((req.key, out));
+            let out = if big { None } else { guarded(|| decode_image(&req.path, THUMB)).flatten() };
+            let _ = self.tx.send((req.key, out.map(Out::Done).unwrap_or(Out::Failed)));
             ctx.request_repaint();
         }
     }
@@ -426,7 +610,9 @@ impl Thumbs {
 
     /// Sustituye la cola de pendientes. `wanted` ordenado de mayor a menor prioridad.
     pub fn set_wanted(&self, mut wanted: Vec<Request>) {
-        let mut st = self.shared.st.lock().unwrap();
+        let mut st = lock(&self.shared.st);
+        st.wanted.clear();
+        st.wanted.extend(wanted.iter().map(|r| r.key));
         wanted.retain(|r| !st.inflight.contains(&r.key));
         wanted.reverse();
         let had = st.queue.len();
@@ -434,6 +620,29 @@ impl Thumbs {
         if !st.queue.is_empty() || had > 0 {
             self.shared.cv.notify_all();
         }
+    }
+}
+
+/// Una miniatura en un hilo del grupo: con plazo, cancelable si deja de quererse y con los pánicos
+/// del decodificador contenidos (el archivo queda como fallido y no se reintenta).
+fn thumb_job(sh: &Shared, req: &Request) -> Out {
+    // los archivos de un servidor SFTP no se descargan sólo para la miniatura
+    if crate::sftp::is_remote(&req.path) {
+        return Out::Failed;
+    }
+    let key = req.key;
+    let end = web_time::Instant::now() + THUMB_DEADLINE;
+    let gone = || !lock(&sh.st).wanted.contains(&key);
+    let cancel = || web_time::Instant::now() > end || gone();
+    job_outcome(guarded(|| decode_image_cancel(&req.path, THUMB, &cancel)), gone)
+}
+
+/// Fallida si el decodificador falló o entró en pánico; cancelada si ya no se quería.
+fn job_outcome(r: Option<Option<Decoded>>, gone: impl Fn() -> bool) -> Out {
+    match r {
+        Some(Some(d)) => Out::Done(d),
+        Some(None) if gone() => Out::Cancelled,
+        _ => Out::Failed,
     }
 }
 
@@ -450,5 +659,103 @@ pub fn color_image(ctx: &egui::Context, w: usize, h: usize, rgba: &[u8]) -> egui
             egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw())
         }
         None => egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exif_ifd_offset_cannot_overflow() {
+        // JPEG con APP1 «Exif» cuyo IFD apunta casi al final del espacio de direcciones
+        for ifd in [0xFFFF_FFF0u32, 0xFFFF_FFFF, 0x7FFF_FFFF, 8] {
+            let mut b = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x20];
+            b.extend_from_slice(b"Exif\0\0II*\0");
+            b.extend_from_slice(&ifd.to_le_bytes());
+            b.resize(64, 0);
+            assert_eq!(exif_orientation_in(&b), 1);
+        }
+        // un IFD válido sí se lee: una entrada Orientation = 6
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x30];
+        b.extend_from_slice(b"Exif\0\0II*\0");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&[1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+        b.resize(80, 0);
+        assert_eq!(exif_orientation_in(&b), 6);
+    }
+
+    #[test]
+    fn magick_only_for_listed_formats_with_pinned_coder() {
+        for e in ["png", "jpg", "gif", "svg", "ps", "eps", "pdf", "mvg", "msl", "txt", "blend", "raw", ""] {
+            assert_eq!(magick_coder(e), None, "{e}");
+        }
+        assert_eq!(magick_coder("tif"), Some("TIFF"));
+        assert_eq!(magick_coder("heic"), Some("HEIC"));
+        let a = magick_args("TIFF", 160);
+        let input = a.iter().position(|x| x == "TIFF:-[0]").expect("entrada con formato fijado");
+        // los límites van antes de la entrada
+        let limits: Vec<&str> = a.iter().enumerate().filter(|(_, x)| *x == "-limit").map(|(i, _)| a[i + 1].as_str()).collect();
+        for k in ["memory", "map", "disk", "area", "width", "height", "time"] {
+            assert!(limits.contains(&k), "{k}");
+        }
+        assert!(a.iter().rposition(|x| x == "-limit").unwrap() < input);
+        assert_eq!(a.last().map(|s| s.as_str()), Some("png:-"));
+        assert!(a.contains(&"160x160>".to_string()));
+        // ningún argumento lleva una ruta
+        assert!(a.iter().all(|x| !x.contains('/')));
+    }
+
+    #[test]
+    fn panicking_job_is_failed_and_worker_survives() {
+        assert!(guarded(|| -> u8 { panic!("decodificador roto") }).is_none());
+        assert_eq!(guarded(|| 7), Some(7));
+        assert!(matches!(job_outcome(guarded(|| -> Option<Decoded> { panic!("x") }), || false), Out::Failed));
+        assert!(matches!(job_outcome(Some(None), || true), Out::Cancelled));
+        assert!(matches!(job_outcome(Some(None), || false), Out::Failed));
+        // un hilo de trabajo que recibe un trabajo que entra en pánico sigue con los siguientes
+        let (tx, rx) = channel::<u32>();
+        let (otx, orx) = channel::<(u32, bool)>();
+        spawn_decoder("prueba", move || {
+            while let Ok(j) = rx.recv() {
+                let r = guarded(|| if j % 2 == 0 { panic!("trabajo {j}") } else { j });
+                if otx.send((j, r.is_some())).is_err() {
+                    return;
+                }
+            }
+        });
+        for j in 0..6 {
+            tx.send(j).unwrap();
+        }
+        let got: Vec<(u32, bool)> = (0..6).map(|_| orx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()).collect();
+        assert_eq!(got, (0..6).map(|j| (j, j % 2 == 1)).collect::<Vec<_>>());
+        // un mutex envenenado por un pánico se sigue pudiendo usar
+        let m = Arc::new(Mutex::new(1));
+        let m2 = m.clone();
+        let _ = guarded(move || {
+            let _g = m2.lock().unwrap();
+            panic!("con el mutex cogido");
+        });
+        assert!(m.is_poisoned());
+        *lock(&m) += 1;
+        assert_eq!(*lock(&m), 2);
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("fb-thumbs-fifo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("x.png");
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let t = std::time::Instant::now();
+        assert!(open_regular(&p).is_none());
+        assert!(decode_image(&p, 64).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        let ok = dir.join("y.txt");
+        std::fs::write(&ok, b"hola").unwrap();
+        assert!(open_regular(&ok).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -197,9 +197,32 @@ fn is_rule(l: &str) -> bool {
     t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_'))
 }
 
-fn split_row(l: &str) -> Vec<String> {
+/// Topes de las tablas de Markdown: columnas, letras por celda, celdas por tabla y en total.
+const MAX_COLS: usize = 64;
+const MAX_CELL_CHARS: usize = 1000;
+const MAX_TABLE_CELLS: usize = 20_000;
+const MAX_DOC_CELLS: usize = 200_000;
+
+/// Celdas de una fila (como mucho `MAX_COLS`, cada una recortada); `true` si se ha recortado algo.
+fn split_row(l: &str) -> (Vec<String>, bool) {
     let t = l.trim().trim_start_matches('|').trim_end_matches('|');
-    t.split('|').map(|c| c.trim().to_string()).collect()
+    let mut cut = false;
+    let mut row = Vec::new();
+    for c in t.split('|') {
+        if row.len() >= MAX_COLS {
+            cut = true;
+            break;
+        }
+        let c = c.trim();
+        row.push(match c.char_indices().nth(MAX_CELL_CHARS) {
+            Some((k, _)) => {
+                cut = true;
+                format!("{}…", &c[..k])
+            }
+            None => c.to_string(),
+        });
+    }
+    (row, cut)
 }
 
 fn is_sep_row(l: &str) -> bool {
@@ -234,6 +257,7 @@ pub fn markdown(text: &str) -> Rich {
     let mut r = Rich::default();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
+    let mut doc_cells = 0usize;
     let mut para: Vec<String> = Vec::new();
     macro_rules! flush_para {
         () => {
@@ -313,15 +337,24 @@ pub fn markdown(text: &str) -> Rich {
         }
         if tr.contains('|') && i + 1 < lines.len() && is_sep_row(lines[i + 1]) {
             flush_para!();
-            let mut rows = vec![split_row(tr)];
+            let (head, cut) = split_row(tr);
+            r.truncated |= cut;
+            let mut cells = head.len();
+            let mut rows = vec![head];
             i += 2;
             while i < lines.len() && lines[i].contains('|') && !lines[i].trim().is_empty() {
-                // tope de filas: una tabla enorme cuenta como un solo bloque y congelaría el pintado
-                if rows.len() < 5000 {
-                    rows.push(split_row(lines[i]));
+                // topes de filas y celdas: una tabla enorme cuenta como un solo bloque y congelaría el pintado
+                if rows.len() < 5000 && cells < MAX_TABLE_CELLS && doc_cells + cells < MAX_DOC_CELLS {
+                    let (row, cut) = split_row(lines[i]);
+                    r.truncated |= cut;
+                    cells += row.len();
+                    rows.push(row);
+                } else {
+                    r.truncated = true;
                 }
                 i += 1;
             }
+            doc_cells += cells;
             r.blocks.push(Block::Table(rows));
             continue;
         }
@@ -489,7 +522,7 @@ fn html_into(out: &mut Rich, html: &str, base: &str, read: &mut dyn FnMut(&str) 
         read,
     };
     let mut skip = 0u32;
-    for tok in markup::tokens(html, true) {
+    for tok in markup::iter_tokens(html, true) {
         if cx.out.blocks.len() >= MAX_BLOCKS || cx.chars > MAX_CHARS {
             cx.out.truncated = true;
             break;
@@ -641,14 +674,14 @@ struct Opf {
 
 fn read_opf(pkg: &mut Pkg) -> Option<Opf> {
     let container = pkg.text("META-INF/container.xml")?;
-    let root = markup::tokens(&container, true).into_iter().find_map(|t| match t {
+    let root = markup::iter_tokens(&container, true).find_map(|t| match t {
         Tok::Open { name, attrs, .. } if markup::local(&name) == "rootfile" => markup::attr(&attrs, "full-path").map(|s| s.to_string()),
         _ => None,
     })?;
     let opf = pkg.text(&root)?;
     let mut o = Opf { base: root, title: String::new(), author: String::new(), items: Vec::new(), spine: Vec::new(), cover_id: None };
     let mut field = "";
-    for t in markup::tokens(&opf, true) {
+    for t in markup::iter_tokens(&opf, true) {
         match t {
             Tok::Open { name, attrs, .. } => {
                 let a = |k: &str| markup::attr(&attrs, k).unwrap_or("").to_string();
@@ -692,7 +725,7 @@ pub fn epub_cover(path: &Path, max: u32) -> Option<Decoded> {
     let mut pkg = Pkg::open(path)?;
     let o = read_opf(&mut pkg)?;
     let p = cover_path(&o)?;
-    crate::comic::decode_bytes(pkg.read(&p)?, max)
+    crate::comic::decode_fit(pkg.read(&p)?, max, max)
 }
 
 pub fn epub(path: &Path) -> Result<Rich, String> {
@@ -756,6 +789,68 @@ struct Layout {
     dark: bool,
     items: Vec<(f32, f32, Item)>,
     total: f32,
+    /// se agotó el presupuesto de maquetación y el final no se muestra
+    cut: bool,
+}
+
+/// Presupuesto de maquetación en el hilo de la interfaz: letras más ~20 por cada trozo de texto.
+const LAYOUT_BUDGET: usize = 1_000_000;
+const GALLEY_COST: usize = 20;
+
+/// Recorta los trozos al presupuesto que queda y lo descuenta.
+fn budget_spans<'a>(spans: &'a [Span], left: &mut usize, cut: &mut bool) -> std::borrow::Cow<'a, [Span]> {
+    let n: usize = spans.iter().map(|s| s.text.len()).sum::<usize>() + GALLEY_COST;
+    if n <= *left {
+        *left -= n;
+        return std::borrow::Cow::Borrowed(spans);
+    }
+    *cut = true;
+    let mut room = left.saturating_sub(GALLEY_COST);
+    *left = 0;
+    let mut out = Vec::new();
+    for s in spans {
+        if room == 0 {
+            break;
+        }
+        let mut s = s.clone();
+        if s.text.len() > room {
+            let mut k = room;
+            while !s.text.is_char_boundary(k) {
+                k -= 1;
+            }
+            s.text.truncate(k);
+            s.text.push('…');
+        }
+        room = room.saturating_sub(s.text.len());
+        out.push(s);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Líneas de código que caben en el presupuesto, ya unidas.
+fn budget_lines(lines: &[String], left: &mut usize, cut: &mut bool) -> String {
+    let mut room = left.saturating_sub(GALLEY_COST);
+    let mut s = String::new();
+    for l in lines {
+        if l.len() + 1 > room {
+            *cut = true;
+            let mut k = room;
+            while !l.is_char_boundary(k) {
+                k -= 1;
+            }
+            s.push_str(&l[..k]);
+            room = 0;
+            break;
+        }
+        room -= l.len() + 1;
+        s.push_str(l);
+        s.push('\n');
+    }
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    *left = if *cut { 0 } else { room };
+    s
 }
 
 pub struct RichView {
@@ -763,12 +858,24 @@ pub struct RichView {
     tex: Vec<Option<egui::TextureHandle>>,
     layout: Option<Layout>,
     pub scroll: f32,
+    /// posición (fracción del total) que se aplica al maquetar
+    want_frac: Option<f32>,
 }
 
 impl RichView {
     pub fn new(rich: Rich) -> RichView {
         let n = rich.images.len();
-        RichView { rich, tex: (0..n).map(|_| None).collect(), layout: None, scroll: 0.0 }
+        RichView { rich, tex: (0..n).map(|_| None).collect(), layout: None, scroll: 0.0, want_frac: None }
+    }
+
+    /// Fracción del documento que queda por encima de lo visible.
+    pub fn frac(&self) -> f32 {
+        self.layout.as_ref().map(|l| self.scroll / l.total.max(1.0)).unwrap_or(0.0)
+    }
+
+    /// Vuelve a una posición recordada con `frac`.
+    pub fn set_frac(&mut self, f: f32) {
+        self.want_frac = (f > 0.0).then_some(f);
     }
 
     fn build(&self, p: &egui::Painter, width: f32, pal: &Pal) -> Layout {
@@ -799,12 +906,19 @@ impl RichView {
             }
             j
         };
+        // un documento enorme se maqueta sólo hasta agotar el presupuesto (todo esto va en el hilo de la interfaz)
+        let (mut left, mut cut) = (LAYOUT_BUDGET, false);
         for b in &self.rich.blocks {
+            if cut || left == 0 {
+                cut = true;
+                break;
+            }
             match b {
                 Block::Heading(l, spans) => {
                     let size = [28.0, 24.0, 20.0, 17.5, 16.0, 15.0][(*l as usize).clamp(1, 6) - 1];
                     y += if *l <= 2 { 14.0 } else { 8.0 };
-                    let g = p.layout_job(job(spans, size, pal.text, width));
+                    let spans = budget_spans(spans, &mut left, &mut cut);
+                    let g = p.layout_job(job(&spans, size, pal.text, width));
                     let h = g.size().y;
                     items.push((y, h, Item::Text { galley: g, x: 0.0, marker: None, deco: Deco::None }));
                     y += h + 8.0;
@@ -814,20 +928,23 @@ impl RichView {
                     }
                 }
                 Block::Para(spans) => {
-                    let g = p.layout_job(job(spans, 15.0, body, width));
+                    let spans = budget_spans(spans, &mut left, &mut cut);
+                    let g = p.layout_job(job(&spans, 15.0, body, width));
                     let h = g.size().y;
                     items.push((y, h, Item::Text { galley: g, x: 0.0, marker: None, deco: Deco::None }));
                     y += h + 10.0;
                 }
                 Block::Quote(spans) => {
-                    let g = p.layout_job(job(spans, 15.0, pal.subtle, width - 22.0));
+                    let spans = budget_spans(spans, &mut left, &mut cut);
+                    let g = p.layout_job(job(&spans, 15.0, pal.subtle, width - 22.0));
                     let h = g.size().y;
                     items.push((y, h, Item::Text { galley: g, x: 22.0, marker: None, deco: Deco::Quote }));
                     y += h + 10.0;
                 }
                 Block::Item { depth, marker, spans } => {
                     let ind = 8.0 + *depth as f32 * 22.0;
-                    let g = p.layout_job(job(spans, 15.0, body, width - ind - 22.0));
+                    let spans = budget_spans(spans, &mut left, &mut cut);
+                    let g = p.layout_job(job(&spans, 15.0, body, width - ind - 22.0));
                     let m = p.layout_no_wrap(marker.clone(), FontId::proportional(15.0), pal.subtle);
                     let h = g.size().y;
                     items.push((y, h, Item::Text { galley: g, x: ind + 22.0, marker: Some(m), deco: Deco::None }));
@@ -836,7 +953,7 @@ impl RichView {
                 Block::Code(lines) => {
                     let mut j = LayoutJob::default();
                     j.wrap.max_width = f32::INFINITY;
-                    j.append(&lines.join("\n"), 0.0, TextFormat::simple(FontId::monospace(13.0), pal.text));
+                    j.append(&budget_lines(lines, &mut left, &mut cut), 0.0, TextFormat::simple(FontId::monospace(13.0), pal.text));
                     let g = p.layout_job(j);
                     let h = g.size().y + 16.0;
                     items.push((y, h, Item::Text { galley: g, x: 10.0, marker: None, deco: Deco::Code }));
@@ -848,7 +965,22 @@ impl RichView {
                 }
                 Block::Table(rows) => {
                     let ncol = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-                    let cells: Vec<Vec<Arc<Galley>>> = rows
+                    // filas que caben en el presupuesto
+                    let mut take = 0;
+                    for r in rows {
+                        let n = r.iter().map(|c| c.len()).sum::<usize>() + ncol * GALLEY_COST;
+                        if n > left {
+                            cut = true;
+                            left = 0;
+                            break;
+                        }
+                        left -= n;
+                        take += 1;
+                    }
+                    if take == 0 {
+                        break;
+                    }
+                    let cells: Vec<Vec<Arc<Galley>>> = rows[..take]
                         .iter()
                         .enumerate()
                         .map(|(ri, r)| {
@@ -880,6 +1012,7 @@ impl RichView {
                     y += h + 12.0;
                 }
                 Block::Image(idx) => {
+                    left = left.saturating_sub(GALLEY_COST);
                     let d = &self.rich.images[*idx];
                     let s = (width / d.w as f32).min(1.0).min(520.0 / d.h as f32).max(0.05);
                     let size = vec2(d.w as f32 * s, d.h as f32 * s);
@@ -888,20 +1021,32 @@ impl RichView {
                 }
             }
         }
-        Layout { width, dark, items, total: y + 20.0 }
+        Layout { width, dark, items, total: y + 20.0, cut }
     }
 
     /// Dibuja el documento en `area` con el desplazamiento propio; entrada de rueda y teclas incluida.
-    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool) {
+    /// `hot`: puntero encima; `active`: acepta el ratón; `keys`: el teclado es suyo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, ctx: &egui::Context, p: &egui::Painter, area: Rect, pal: &Pal, hot: bool, active: bool, keys: bool) {
         p.rect_filled(area, 10.0, pal.bg);
-        let col_w = (area.width() - 48.0).clamp(200.0, 820.0);
+        let mut col_w = (area.width() - 48.0).clamp(200.0, 820.0);
         let dark = pal.bg.r() < 128;
-        if self.layout.as_ref().map(|l| (l.width - col_w).abs() > 1.0 || l.dark != dark).unwrap_or(true) {
+        let stale = self.layout.as_ref().map(|l| (l.width - col_w).abs() > 1.0 || l.dark != dark).unwrap_or(true);
+        // mientras se arrastra el borde del panel se sigue con la maqueta de antes (se rehace al soltar)
+        let resizing = ctx.input(|i| i.pointer.any_down()) && self.layout.as_ref().is_some_and(|l| l.dark == dark);
+        if stale && resizing {
+            col_w = self.layout.as_ref().map(|l| l.width).unwrap_or(col_w);
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if stale {
+            // la misma posición relativa tras volver a maquetar
+            let f = self.want_frac.take().unwrap_or_else(|| self.frac());
             self.layout = Some(self.build(p, col_w, pal));
+            self.scroll = f * self.layout.as_ref().map(|l| l.total).unwrap_or(0.0);
         }
         let total = self.layout.as_ref().map(|l| l.total).unwrap_or(0.0);
-        scroll_input(ctx, area, total, &mut self.scroll, hot);
+        scroll_input(ctx, area, total, &mut self.scroll, hot, keys);
         let lay = self.layout.as_ref().unwrap();
+        let cut = lay.cut;
         let x0 = area.center().x - col_w / 2.0;
         let (top, bottom) = (self.scroll - 40.0, self.scroll + area.height() + 40.0);
         let cp = p.with_clip_rect(area);
@@ -960,45 +1105,111 @@ impl RichView {
                 }
             }
         }
-        scrollbar(p, area, total, self.scroll, pal);
-        if self.rich.truncated {
+        scrollbar(ctx, p, area, total, &mut self.scroll, pal, active);
+        if self.rich.truncated || cut {
             p.text(pos2(area.right() - 12.0, area.bottom() - 8.0), egui::Align2::RIGHT_BOTTOM, crate::i18n::t("(vista parcial)"), FontId::proportional(11.5), pal.subtle);
         }
     }
 }
 
-/// Rueda, Re Pág/Av Pág, Inicio y Fin sobre un contenido que mide `total` de alto.
-pub fn scroll_input(ctx: &egui::Context, area: Rect, total: f32, scroll: &mut f32, hot: bool) {
+/// Rueda, arrastre con el dedo, Re Pág/Av Pág, Inicio y Fin sobre un contenido que mide `total` de alto.
+/// `hot`: el puntero está encima; `keys`: el teclado es de este visor.
+pub fn scroll_input(ctx: &egui::Context, area: Rect, total: f32, scroll: &mut f32, hot: bool, keys: bool) {
     let max_scroll = (total - area.height()).max(0.0);
     if hot {
-        let dy = ctx.input(|i| i.smooth_scroll_delta.y);
-        *scroll = (*scroll - dy).clamp(0.0, max_scroll);
+        let (dy, drag) = ctx.input(|i| {
+            let touch = cfg!(target_os = "android") || i.any_touches();
+            // con el dedo, arrastrar desplaza (sin tocar la barra)
+            let on_bar = i.pointer.press_origin().is_some_and(|o| o.x > area.right() - 16.0);
+            let drag = touch && i.pointer.primary_down() && !crate::preview::edge_start(i) && !on_bar && i.pointer.press_origin().is_some_and(|o| area.contains(o));
+            (i.smooth_scroll_delta.y, if drag { i.pointer.delta().y } else { 0.0 })
+        });
+        *scroll -= dy + drag;
     }
-    let (pg, home, end) = ctx.input(|i| {
-        (
-            i.key_pressed(egui::Key::PageDown) as i32 - i.key_pressed(egui::Key::PageUp) as i32,
-            i.key_pressed(egui::Key::Home),
-            i.key_pressed(egui::Key::End),
-        )
-    });
-    *scroll = (*scroll + pg as f32 * area.height() * 0.9).clamp(0.0, max_scroll);
-    if home {
-        *scroll = 0.0;
+    if keys {
+        let (pg, home, end) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::PageDown) as i32 - i.key_pressed(egui::Key::PageUp) as i32,
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+            )
+        });
+        *scroll += pg as f32 * area.height() * 0.9;
+        if home {
+            *scroll = 0.0;
+        }
+        if end {
+            *scroll = max_scroll;
+        }
     }
-    if end {
-        *scroll = max_scroll;
-    }
+    *scroll = scroll.clamp(0.0, max_scroll);
 }
 
-pub fn scrollbar(p: &egui::Painter, area: Rect, total: f32, scroll: f32, pal: &Pal) {
-    if total <= area.height() {
-        return;
+/// Barra vertical en el borde derecho de `area`; se puede pulsar o arrastrar. `true` mientras se arrastra.
+pub fn scrollbar(ctx: &egui::Context, p: &egui::Painter, area: Rect, total: f32, scroll: &mut f32, pal: &Pal, active: bool) -> bool {
+    let track = Rect::from_min_max(pos2(area.right() - 13.0, area.top() + 4.0), pos2(area.right() - 1.0, area.bottom() - 4.0));
+    scrollbar_track(ctx, p, track, area.height(), total, scroll, pal, active, true)
+}
+
+/// Barra de desplazamiento en `track` (vertical u horizontal) para una vista de `view` sobre un contenido
+/// de `total`: pulsar en la guía salta ahí y arrastrar el cursor lo mueve.
+#[allow(clippy::too_many_arguments)]
+pub fn scrollbar_track(ctx: &egui::Context, p: &egui::Painter, track: Rect, view: f32, total: f32, scroll: &mut f32, pal: &Pal, active: bool, vertical: bool) -> bool {
+    if total <= view + 0.5 {
+        return false;
     }
-    let track = Rect::from_min_max(pos2(area.right() - 7.0, area.top() + 4.0), pos2(area.right() - 3.0, area.bottom() - 4.0));
-    let h = (track.height() * area.height() / total).max(24.0);
-    let f = scroll / (total - area.height()).max(1.0);
-    let y = track.top() + (track.height() - h) * f.clamp(0.0, 1.0);
-    p.rect_filled(Rect::from_min_size(pos2(track.left(), y), vec2(track.width(), h)), 2.0, pal.subtle.gamma_multiply(0.5));
+    let max = total - view;
+    let along = |q: egui::Pos2| if vertical { q.y } else { q.x };
+    let (t0, len) = if vertical { (track.top(), track.height()) } else { (track.left(), track.width()) };
+    let h = (len * view / total).clamp(24.0f32.min(len), len);
+    let at = |s: f32| t0 + (len - h) * (s / max).clamp(0.0, 1.0);
+    let id = egui::Id::new(("fb_scrollbar_grab", vertical));
+    let (pos, down, pressed, origin) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.pointer.primary_pressed(), i.pointer.press_origin()));
+    let hit = track.expand(3.0);
+    let mut dragging = false;
+    if active && down && origin.is_some_and(|o| hit.contains(o)) {
+        if let Some(q) = pos {
+            let y0 = at(*scroll);
+            let grab = if pressed {
+                // sobre el cursor se arrastra desde donde se cogió; en la guía, el cursor salta a esa posición
+                let g = if (y0..=y0 + h).contains(&along(q)) { along(q) - y0 } else { h / 2.0 };
+                ctx.data_mut(|d| d.insert_temp(id, g));
+                g
+            } else {
+                ctx.data(|d| d.get_temp::<f32>(id)).unwrap_or(h / 2.0)
+            };
+            *scroll = ((along(q) - grab - t0) / (len - h).max(1.0)).clamp(0.0, 1.0) * max;
+            dragging = true;
+        }
+    }
+    let hover = active && pos.is_some_and(|q| hit.contains(q));
+    let thick = if dragging || hover { 8.0 } else { 5.0 };
+    let a = at(*scroll);
+    let r = if vertical {
+        Rect::from_min_size(pos2(track.right() - 2.0 - thick, a), vec2(thick, h))
+    } else {
+        Rect::from_min_size(pos2(a, track.bottom() - 2.0 - thick), vec2(h, thick))
+    };
+    if dragging || hover {
+        let guide = if vertical { Rect::from_min_max(pos2(r.left(), track.top()), pos2(r.right(), track.bottom())) } else { Rect::from_min_max(pos2(track.left(), r.top()), pos2(track.right(), r.bottom())) };
+        p.rect_filled(guide, thick / 2.0, pal.subtle.gamma_multiply(0.12));
+    }
+    p.rect_filled(r, thick / 2.0, pal.subtle.gamma_multiply(if dragging || hover { 0.8 } else { 0.5 }));
+    dragging
+}
+
+/// Maqueta el documento en un contexto de egui sin ventana; `true` si se cortó por el presupuesto.
+#[cfg(test)]
+pub(crate) fn layout_for_test(rich: Rich, width: f32) -> bool {
+    let view = RichView::new(rich);
+    let ctx = egui::Context::default();
+    let mut cut = false;
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let p = ui.painter().clone();
+        cut = view.build(&p, width, &crate::theme::palette(true)).cut;
+    });
+    out.textures_delta.clear();
+    cut
 }
 
 #[cfg(test)]
@@ -1026,5 +1237,54 @@ mod tests {
     fn resolve_paths() {
         assert_eq!(resolve("OEBPS/text/ch1.xhtml", "../img/a%20b.png#x"), "OEBPS/img/a b.png");
         assert_eq!(resolve("content.opf", "ch.xhtml"), "ch.xhtml");
+    }
+
+    #[test]
+    fn markdown_table_caps() {
+        // 10 000 columnas y celdas de 5 000 letras en la cabecera
+        let wide = format!("|{}|\n|---|---|\n", "x|".repeat(10_000));
+        let r = markdown(&wide);
+        assert!(r.truncated);
+        assert!(matches!(&r.blocks[0], Block::Table(t) if t[0].len() == MAX_COLS));
+        let big = format!("| {} | b |\n|---|---|\n", "y".repeat(5_000));
+        let r = markdown(&big);
+        assert!(matches!(&r.blocks[0], Block::Table(t) if t[0][0].chars().count() == MAX_CELL_CHARS + 1));
+        // muchas filas anchas: el total de celdas queda acotado
+        let mut s = format!("|{}\n|{}\n", "a|".repeat(60), "-|".repeat(60));
+        for _ in 0..3000 {
+            s.push_str(&"1|".repeat(60));
+            s.push('\n');
+        }
+        let r = markdown(&s);
+        assert!(r.truncated);
+        let cells: usize = r.blocks.iter().map(|b| if let Block::Table(t) = b { t.iter().map(|r| r.len()).sum() } else { 0 }).sum();
+        assert!(cells <= MAX_TABLE_CELLS + MAX_COLS, "{cells}");
+        // y muchas tablas seguidas no pasan del tope del documento
+        let one = format!("|{}\n|{}\n{}\n", "a|".repeat(60), "-|".repeat(60), "1|".repeat(60));
+        let r = markdown(&one.repeat(10_000));
+        let cells: usize = r.blocks.iter().map(|b| if let Block::Table(t) = b { t.iter().map(|r| r.len()).sum() } else { 0 }).sum();
+        assert!(cells <= MAX_DOC_CELLS + MAX_TABLE_CELLS, "{cells}");
+    }
+
+    #[test]
+    fn layout_budget_cuts_huge_documents() {
+        let mut spans = vec![Span { text: "é".repeat(LAYOUT_BUDGET), ..Default::default() }];
+        let (mut left, mut cut) = (1000, false);
+        let c = budget_spans(&spans, &mut left, &mut cut);
+        assert!(cut && left == 0 && c.iter().map(|s| s.text.len()).sum::<usize>() <= 1000);
+        spans[0].text = "corto".into();
+        let (mut left, mut cut) = (1000, false);
+        assert_eq!(budget_spans(&spans, &mut left, &mut cut).len(), 1);
+        assert!(!cut && left == 1000 - 5 - GALLEY_COST);
+        let lines: Vec<String> = (0..1000).map(|i| format!("línea {i}")).collect();
+        let (mut left, mut cut) = (200, false);
+        assert!(budget_lines(&lines, &mut left, &mut cut).len() <= 200);
+        assert!(cut);
+        // maquetación real en un contexto de egui: se corta y no tarda
+        let doc = format!("{}\n\n", "palabra ".repeat(5_000)).repeat(400);
+        let t = std::time::Instant::now();
+        assert!(layout_for_test(markdown(&doc), 600.0));
+        assert!(!layout_for_test(markdown("# corto\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"), 600.0));
+        assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
     }
 }

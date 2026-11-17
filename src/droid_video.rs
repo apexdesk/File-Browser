@@ -50,7 +50,7 @@ impl Player {
             started: None,
             tex: None,
             has_audio: info.as_ref().map(|i| i.has_audio).unwrap_or(false),
-            error: if info.is_none() { Some("formato no admitido por el sistema".into()) } else { None },
+            error: if info.is_none() { Some(crate::i18n::t("formato no admitido por el sistema").into()) } else { None },
         }
     }
 
@@ -91,7 +91,8 @@ impl Player {
             }
             match res {
                 Ok(_) => {}
-                Err(e) => *shared.error.lock().unwrap() = Some(e),
+                // la marca NO_SURFACE se compara sin traducir; se traduce al mostrarla
+                Err(e) => *shared.error.lock().unwrap() = Some(if e == crate::droid::NO_SURFACE { crate::i18n::t(crate::droid::NO_SURFACE).into() } else { e }),
             }
             if alive() {
                 shared.ended.store(g, Ordering::SeqCst);

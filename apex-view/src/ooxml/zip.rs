@@ -8,15 +8,15 @@ use super::bad;
 use crate::Error;
 
 fn u16_at(b: &[u8], i: usize) -> Result<u16, Error> {
-    b.get(i..i + 2).map(|s| u16::from_le_bytes([s[0], s[1]])).ok_or_else(|| bad("truncated ZIP"))
+    b.get(i..i.checked_add(2).ok_or_else(|| bad("truncated ZIP"))?).map(|s| u16::from_le_bytes([s[0], s[1]])).ok_or_else(|| bad("truncated ZIP"))
 }
 
 fn u32_at(b: &[u8], i: usize) -> Result<u32, Error> {
-    b.get(i..i + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).ok_or_else(|| bad("truncated ZIP"))
+    b.get(i..i.checked_add(4).ok_or_else(|| bad("truncated ZIP"))?).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).ok_or_else(|| bad("truncated ZIP"))
 }
 
 fn u64_at(b: &[u8], i: usize) -> Result<u64, Error> {
-    b.get(i..i + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| bad("truncated ZIP"))
+    b.get(i..i.checked_add(8).ok_or_else(|| bad("truncated ZIP"))?).map(|s| u64::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| bad("truncated ZIP"))
 }
 
 const FULL32: u32 = 0xFFFF_FFFF;
@@ -64,8 +64,8 @@ impl<'a> ZipReader<'a> {
         if eocd >= 20 && u32_at(data, eocd - 20)? == 0x0706_4b50 {
             let z = usize::try_from(u64_at(data, eocd - 12)?).map_err(|_| bad("truncated ZIP"))?;
             if u32_at(data, z)? == 0x0606_4b50 {
-                count = u64_at(data, z + 32)?;
-                p = u64_at(data, z + 48)?;
+                count = u64_at(data, z.saturating_add(32))?;
+                p = u64_at(data, z.saturating_add(48))?;
             }
         }
         let mut p = usize::try_from(p).map_err(|_| bad("truncated ZIP"))?;
@@ -75,6 +75,11 @@ impl<'a> ZipReader<'a> {
         for _ in 0..count {
             if u32_at(data, p)? != 0x0201_4b50 {
                 return Err(bad("corrupt ZIP directory"));
+            }
+            // The record's fixed part is there (so `p + 46` and the
+            // lengths after it, all small, stay within the file's size).
+            if p.checked_add(46).is_none_or(|e| e > data.len()) {
+                return Err(bad("truncated ZIP"));
             }
             let method = u16_at(data, p + 10)?;
             let comp32 = u32_at(data, p + 20)?;
@@ -140,7 +145,9 @@ impl<'a> ZipReader<'a> {
         if u32_at(d, e.offset)? != 0x0403_4b50 {
             return Err(bad("corrupt ZIP header"));
         }
-        let start = e.offset + 30 + u16_at(d, e.offset + 26)? as usize + u16_at(d, e.offset + 28)? as usize;
+        // `offset` comes from the file: the header was read there, so
+        // `offset + 30` fits, and two u16 lengths more do too.
+        let start = e.offset.saturating_add(30).saturating_add(u16_at(d, e.offset.saturating_add(26))? as usize).saturating_add(u16_at(d, e.offset.saturating_add(28))? as usize);
         let raw = start.checked_add(e.comp_size).and_then(|end| d.get(start..end)).ok_or_else(|| bad("truncated ZIP"))?;
         Ok((e, raw))
     }
@@ -208,5 +215,81 @@ fn extra_field(mut extra: &[u8], id: u16) -> Option<&[u8]> {
         extra = &extra[4 + len..];
     }
     None
+}
+
+/// A package of stored (uncompressed) parts, for tests.
+#[cfg(test)]
+pub(crate) fn stored_zip(parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut dir = Vec::new();
+    for (name, data) in parts {
+        let off = out.len() as u32;
+        let head = |sig: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&sig.to_le_bytes());
+            if sig == 0x0201_4b50 {
+                out.extend_from_slice(&20u16.to_le_bytes());
+            }
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+        };
+        head(0x0403_4b50, &mut out);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        head(0x0201_4b50, &mut dir);
+        dir.extend_from_slice(&[0; 10]);
+        dir.extend_from_slice(&off.to_le_bytes());
+        dir.extend_from_slice(name.as_bytes());
+    }
+    let at = out.len() as u32;
+    out.extend_from_slice(&dir);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(dir.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&[0; 2]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_package_reads_back() {
+        let z = stored_zip(&[("a.xml", b"<a/>"), ("b/c.txt", b"hello")]);
+        let r = ZipReader::new(&z, &crate::Limits::default()).unwrap();
+        assert_eq!(r.read("b/c.txt").unwrap(), b"hello");
+        assert_eq!(r.read("a.xml").unwrap(), b"<a/>");
+    }
+
+    #[test]
+    fn hostile_offsets_fail_cleanly() {
+        // A Zip64 locator pointing at the last possible offset.
+        let mut z = b"PK\x03\x04".to_vec();
+        z.extend_from_slice(&[0; 60]);
+        z.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&u64::MAX.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes());
+        z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        z.extend_from_slice(&[0; 18]);
+        assert!(ZipReader::new(&z, &crate::Limits::default()).is_err());
+        assert_eq!(crate::sniff(&z), None);
+        // A directory said to be at the end of the address space.
+        let mut e = b"PK\x03\x04".to_vec();
+        e.extend_from_slice(&[0; 26]);
+        e.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        e.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 46, 0, 0, 0]);
+        e.extend_from_slice(&u32::MAX.to_le_bytes());
+        e.extend_from_slice(&[0, 0]);
+        assert!(ZipReader::new(&e, &crate::Limits::default()).is_err());
+        assert!(u32_at(&e, usize::MAX - 1).is_err());
+        assert!(u64_at(&e, usize::MAX).is_err());
+    }
 }
 

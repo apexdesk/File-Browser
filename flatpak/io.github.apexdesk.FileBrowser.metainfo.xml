@@ -4,7 +4,7 @@
   <name>File Browser</name>
   <summary>Fast, lightweight file manager</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT</project_license>
+  <project_license>LicenseRef-proprietary=https://polyformproject.org/licenses/strict/1.0.0/</project_license>
   <url type="homepage">https://github.com/apexdesk/File-Browser</url>
   <url type="bugtracker">https://github.com/apexdesk/File-Browser/issues</url>
   <description>

@@ -22,6 +22,8 @@ const MAX_SHAPES: usize = 5_000;
 const MAX_PARAS: usize = 2_000;
 /// Text units read of one text.
 const MAX_TEXT: usize = 65_536;
+/// Text units set on one slide (shapes may all name one long text).
+const MAX_SLIDE_TEXT: usize = 1 << 20;
 /// Master units (1/576 inch) and EMUs to points.
 const MU: f32 = 0.125;
 const EMU: f32 = 1.0 / 12_700.0;
@@ -941,7 +943,7 @@ impl Data {
             }
         }
         let empty = Vec::new();
-        let mut s = Slide { data: self, fonts, scheme, styles: &styles, texts: &empty, items: Vec::new(), text: Vec::new(), shapes: 0, master: false, background: None };
+        let mut s = Slide { data: self, fonts, scheme, styles: &styles, texts: &empty, items: Vec::new(), text: Vec::new(), shapes: 0, text_left: MAX_SLIDE_TEXT, master: false, background: None };
         // The background: the slide's own, else its masters'.
         let mut bg = None;
         for c in std::iter::once(slide).filter(|_| !follows(4)).chain(masters.iter().copied()) {
@@ -999,6 +1001,8 @@ struct Slide<'a> {
     items: Vec<Item>,
     text: Vec<TextRun>,
     shapes: usize,
+    /// Text units the slide may still set.
+    text_left: usize,
     /// Drawing a master: its placeholders are left out.
     master: bool,
     background: Option<Fill>,
@@ -1163,7 +1167,10 @@ impl Slide<'_> {
             Some(i) => self.texts.get(i as usize),
             None => local.first(),
         };
-        if let Some(t) = t.filter(|t| !t.units.is_empty()) {
+        if let Some(t) = t.filter(|t| !t.units.is_empty())
+            && let Some(left) = self.text_left.checked_sub(t.units.len().min(MAX_TEXT))
+        {
+            self.text_left = left;
             self.text_in(t, &o, x, y, w, h);
         }
     }
@@ -1197,7 +1204,9 @@ impl Slide<'_> {
         let mut start = 0;
         while start <= len && out.len() < MAX_PARAS {
             let end = units[start..].iter().position(|&u| u == 0x0D).map_or(len, |p| start + p);
-            let run = pfs.iter().find(|r| r.0 > start);
+            // Runs' ends only grow: found by halves (a long text with many
+            // runs would be quadratic).
+            let run = pfs.get(pfs.partition_point(|r| r.0 <= start));
             let level = run.map_or(0, |r| r.1 as usize).min(4);
             let (mut pf, mcf) = self.styles.level(&self.data.env, t.kind, level);
             pf.over(&rul[level]);
@@ -1223,7 +1232,7 @@ impl Slide<'_> {
             let mut p = start;
             let mut first_style = None;
             while p < end {
-                let ci = cfs.iter().position(|r| r.0 > p);
+                let ci = Some(cfs.partition_point(|r| r.0 <= p)).filter(|&i| i < cfs.len());
                 let stop = ci.map_or(end, |i| cfs[i].0.min(end)).max(p + 1);
                 let mut cf = mcf.clone();
                 if let Some(i) = ci {
@@ -1243,7 +1252,7 @@ impl Slide<'_> {
             }
             let st = first_style.unwrap_or_else(|| {
                 let mut cf = mcf.clone();
-                if let Some(r) = cfs.iter().find(|r| r.0 > start) {
+                if let Some(r) = cfs.get(cfs.partition_point(|r| r.0 <= start)) {
                     cf.over(&r.1);
                 }
                 Arc::new(style_of(&cf, self))

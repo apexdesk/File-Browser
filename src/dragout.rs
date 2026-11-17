@@ -43,6 +43,7 @@ impl DragOut {
 }
 
 /// `file:///ruta%20codificada` por archivo, separados por CRLF (text/uri-list).
+#[cfg_attr(not(all(unix, not(any(target_os = "macos", target_os = "android")))), allow(dead_code))]
 pub(crate) fn uri_list(paths: &[PathBuf]) -> Vec<u8> {
     let mut out = String::new();
     for p in paths {

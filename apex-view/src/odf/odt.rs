@@ -13,6 +13,9 @@ use crate::typeset::{Align, LineRule, Object, ParaFormat, Span, Style, Tab, TabA
 use crate::{Error, Fonts, Limits};
 
 const MAX_BLOCKS: usize = 200_000;
+/// Most blocks and spans the copies of repeated rows and cells may have in
+/// all (tables of repeated cells nest: each level would multiply them).
+const MAX_COPIES: usize = 2_000_000;
 
 pub(crate) fn open(data: Vec<u8>, limits: &Limits, fonts: &Fonts) -> Result<Doc, Error> {
     let pkg = Package::open(data, limits)?;
@@ -46,6 +49,8 @@ struct Reader {
     master: String,
     sections: Vec<Section>,
     page_start: Option<usize>,
+    /// What copies of repeated rows and cells may still take.
+    copies: usize,
 }
 
 fn read(pkg: &Package) -> Result<DocModel, Error> {
@@ -53,7 +58,7 @@ fn read(pkg: &Package) -> Result<DocModel, Error> {
     let st = Styles::read(styles.as_ref(), &content);
     let body = content.path(&["body", "text"]).ok_or_else(|| crate::ooxml::bad("the document has no text"))?;
     let mut base = Style { family: Arc::from("Liberation Serif"), size: 12.0, ..Style::default() };
-    let mut r = Reader { st, base: base.clone(), counters: HashMap::new(), blocks: 0, pending: Vec::new(), boxes: Vec::new(), master: String::new(), sections: Vec::new(), page_start: None };
+    let mut r = Reader { st, base: base.clone(), counters: HashMap::new(), blocks: 0, pending: Vec::new(), boxes: Vec::new(), master: String::new(), sections: Vec::new(), page_start: None, copies: MAX_COPIES };
     let defaults = r.st.props("paragraph", None, "text-properties");
     base = r.st.text_style(&defaults, &base);
     r.base = base;
@@ -146,7 +151,7 @@ impl Reader {
                 c[level] = match start {
                     Some(v) => v,
                     None if c[level] == 0 => begin,
-                    None => c[level] + 1,
+                    None => c[level].saturating_add(1),
                 };
                 for k in c.iter_mut().skip(level + 1) {
                     *k = 0;
@@ -299,7 +304,7 @@ impl Reader {
             && lvl.attr("num-format").is_some_and(|f| !f.is_empty())
         {
             let c = self.counters.entry("\u{0}outline".into()).or_insert([0; 10]);
-            c[level - 1] += 1;
+            c[level - 1] = c[level - 1].saturating_add(1);
             for k in c.iter_mut().skip(level) {
                 *k = 0;
             }
@@ -557,7 +562,7 @@ impl Reader {
                         if rows.len() > 5_000 {
                             return;
                         }
-                        rows.push(Row { cells: cells.iter().map(clone_cell).collect(), height, exact, header });
+                        rows.push(Row { cells: cells.iter().map(|c| clone_cell(c, &mut self.copies)).collect(), height, exact, header });
                     }
                     rows.push(Row { cells, height, exact, header });
                 }
@@ -630,7 +635,7 @@ impl Reader {
                     }
                 }
                 let _ = i;
-                cells.push(clone_cell(&cell));
+                cells.push(clone_cell(&cell, &mut self.copies));
                 col += span;
             }
         }
@@ -638,14 +643,20 @@ impl Reader {
     }
 }
 
-fn clone_cell(c: &Cell) -> Cell {
-    Cell { span: c.span, merged: c.merged, blocks: c.blocks.iter().map(clone_block).collect(), fill: c.fill, borders: c.borders, margins: c.margins, valign: c.valign }
+/// A copy of a cell, its contents charged to `left` (left out once it is
+/// spent).
+fn clone_cell(c: &Cell, left: &mut usize) -> Cell {
+    let blocks = if *left == 0 { Vec::new() } else { c.blocks.iter().map(|b| clone_block(b, left)).collect() };
+    Cell { span: c.span, merged: c.merged, blocks, fill: c.fill, borders: c.borders, margins: c.margins, valign: c.valign }
 }
 
-fn clone_block(b: &Block) -> Block {
+fn clone_block(b: &Block, left: &mut usize) -> Block {
     match b {
         Block::Para(p) => Block::Para(Para {
-            fmt: p.fmt.clone(),
+            fmt: {
+                *left = left.saturating_sub(1 + p.spans.len());
+                p.fmt.clone()
+            },
             spans: p.spans.clone(),
             before: p.before,
             after: p.after,
@@ -657,7 +668,10 @@ fn clone_block(b: &Block) -> Block {
             floats: Vec::new(),
             section_end: None,
         }),
-        Block::Table(t) => Block::Table(Table { cols: t.cols.clone(), rows: t.rows.iter().map(|r| Row { cells: r.cells.iter().map(clone_cell).collect(), height: r.height, exact: r.exact, header: r.header }).collect(), indent: t.indent, align: t.align }),
+        Block::Table(t) => {
+            *left = left.saturating_sub(1);
+            Block::Table(Table { cols: t.cols.clone(), rows: t.rows.iter().map(|r| Row { cells: r.cells.iter().map(|c| clone_cell(c, left)).collect(), height: r.height, exact: r.exact, header: r.header }).collect(), indent: t.indent, align: t.align })
+        }
     }
 }
 

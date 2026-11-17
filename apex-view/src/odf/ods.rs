@@ -173,6 +173,8 @@ fn read_table(r: &mut Reader, f: &mut Formats, default_xf: usize) -> Sheet {
     let mut row_repeat = 1u32;
     let mut row_cells_at = 0usize;
     let cell_limits = Limits::default();
+    // What the cells' copies of their text may take in all.
+    let mut text_left = sheet::SHEET_TEXT_BUDGET;
     loop {
         let ev = r.next();
         let empty = matches!(ev, Ev::Empty(_));
@@ -249,8 +251,8 @@ fn read_table(r: &mut Reader, f: &mut Formats, default_xf: usize) -> Sheet {
                         let xf = if covered { default_xf } else { f.xf(style.as_deref()) };
                         let number = matches!(kind.as_deref(), Some("float" | "percentage" | "currency" | "date" | "time"));
                         let val = (!text.is_empty()).then(|| match kind.as_deref() {
-                            Some("boolean") => Val::Text(text.clone()),
-                            _ => Val::Shown(text.clone(), number),
+                            Some("boolean") => Val::Text(sheet::cell_text_of(&text, &mut text_left)),
+                            _ => Val::Shown(sheet::cell_text_of(&text, &mut text_left), number),
                         });
                         if !covered && (cs > 1 || rs > 1) && sh.merges.len() < 10_000 {
                             sh.merges.push((row, col, row.saturating_add(rs - 1), col.saturating_add(cs - 1)));
@@ -262,7 +264,7 @@ fn read_table(r: &mut Reader, f: &mut Formats, default_xf: usize) -> Sheet {
                                 break;
                             }
                             if !covered && (val.is_some() || styled) && sh.cells.len() < 200_000 {
-                                sh.cells.push(Cell { row, col: c, xf, val: val.as_ref().map(clone_val) });
+                                sh.cells.push(Cell { row, col: c, xf, val: val.as_ref().map(|v| clone_val(v, &mut text_left)) });
                             }
                         }
                         col = col.saturating_add(n);
@@ -293,7 +295,7 @@ fn read_table(r: &mut Reader, f: &mut Formats, default_xf: usize) -> Sheet {
                             }
                             for i in row_cells_at..n {
                                 let c = &sh.cells[i];
-                                let copy = Cell { row: row + k, col: c.col, xf: c.xf, val: c.val.as_ref().map(clone_val) };
+                                let copy = Cell { row: row + k, col: c.col, xf: c.xf, val: c.val.as_ref().map(|v| clone_val(v, &mut text_left)) };
                                 sh.cells.push(copy);
                             }
                         }
@@ -323,13 +325,14 @@ fn skip_table(r: &mut Reader) {
     }
 }
 
-fn clone_val(v: &Val) -> Val {
+/// A copy of a cell's value, its text charged to `left`.
+fn clone_val(v: &Val, left: &mut usize) -> Val {
     match v {
         Val::Num(n) => Val::Num(*n),
-        Val::Text(s) => Val::Text(s.clone()),
+        Val::Text(s) => Val::Text(sheet::cell_text_of(s, left)),
         Val::Bool(b) => Val::Bool(*b),
-        Val::Err(s) => Val::Err(s.clone()),
-        Val::Shown(s, n) => Val::Shown(s.clone(), *n),
+        Val::Err(s) => Val::Err(sheet::cell_text_of(s, left)),
+        Val::Shown(s, n) => Val::Shown(sheet::cell_text_of(s, left), *n),
     }
 }
 

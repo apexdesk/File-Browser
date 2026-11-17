@@ -267,7 +267,7 @@ impl Font {
         let first = f.key_num(d, "FirstChar").unwrap_or(0.0) as u32;
         if let Obj::Array(ws) = f.key(d, "Widths") {
             for (i, w) in ws.iter().enumerate() {
-                font.widths.insert(first + i as u32, f.resolve(w).num().unwrap_or(0.0));
+                font.widths.insert(first.wrapping_add(i as u32), f.resolve(w).num().unwrap_or(0.0));
             }
         }
         // Type 3 glyphs not listed have no width (as in pdfium).
@@ -343,7 +343,7 @@ impl Font {
 
     fn cid(&self, code: u32) -> u32 {
         match &self.codes {
-            Codes::Cid { cids: CidMap::Ranges(r), .. } => r.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&code)).map_or(0, |(lo, _, c)| c + code - lo),
+            Codes::Cid { cids: CidMap::Ranges(r), .. } => r.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&code)).map_or(0, |(lo, _, c)| c.wrapping_add(code - lo)),
             _ => code,
         }
     }
@@ -738,12 +738,13 @@ fn truetype_chars(font: &[u8]) -> HashMap<u32, char> {
     let mut out = HashMap::new();
     // Codes looked at over every subtable: many overlapping ranges stop here.
     let mut work = 0usize;
-    let be16 = |p: usize| font.get(p..p + 2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]) as u32);
-    let be32 = |p: usize| font.get(p..p + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    // Offsets from the font may point anywhere (and past usize on 32 bits).
+    let be16 = |p: usize| font.get(p..p.saturating_add(2)).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]) as u32);
+    let be32 = |p: usize| font.get(p..p.saturating_add(4)).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     let n = be16(4) as usize;
     let Some(cmap) = (0..n).map(|i| 12 + i * 16).find(|&r| font.get(r..r + 4) == Some(b"cmap")).map(|r| be32(r + 8) as usize) else { return out };
     let count = be16(cmap + 2) as usize;
-    let mut subs: Vec<(u32, u32, usize)> = (0..count).map(|i| (be16(cmap + 4 + i * 8), be16(cmap + 6 + i * 8), cmap + be32(cmap + 8 + i * 8) as usize)).collect();
+    let mut subs: Vec<(u32, u32, usize)> = (0..count).map(|i| (be16(cmap + 4 + i * 8), be16(cmap + 6 + i * 8), cmap.saturating_add(be32(cmap + 8 + i * 8) as usize))).collect();
     // Unicode tables first.
     subs.sort_by_key(|&(p, e, _)| match (p, e) {
         (3, 10) => 0,

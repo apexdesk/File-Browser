@@ -28,6 +28,8 @@ fn wide(p: &Path) -> Vec<u16> {
 pub fn volume_label(root: &Path) -> Option<String> {
     let w = wide(root);
     let mut name = [0u16; 261];
+    // SAFETY: `w` es una cadena ancha terminada en NUL que vive durante la llamada; `name` es un
+    // búfer local con su longitud.
     unsafe {
         GetVolumeInformationW(PCWSTR(w.as_ptr()), Some(&mut name), None, None, None, None).ok()?;
     }
@@ -41,6 +43,8 @@ thread_local! {
     static OPEN: RefCell<Option<IContextMenu>> = const { RefCell::new(None) };
 }
 
+/// # Safety
+/// Sólo la llama Windows como procedimiento de la ventana registrada en `owner_window`.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
@@ -70,6 +74,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// Ventana oculta que hace de propietaria del menú (recibe los mensajes de los submenús).
+///
+/// # Safety
+/// Llamar desde el hilo que va a mostrar el menú (la ventana pertenece a ese hilo).
 unsafe fn owner_window() -> Option<HWND> {
     unsafe {
         let inst = GetModuleHandleW(None).ok()?;
@@ -87,10 +94,16 @@ pub fn context_menu(paths: &[PathBuf], background: bool) -> bool {
     if paths.is_empty() {
         return false;
     }
+    // SAFETY: se llama desde el hilo de la interfaz, que muestra el menú y es dueño de la ventana.
     unsafe { context_menu_inner(paths, background).is_some() }
 }
 
+/// # Safety
+/// Igual que `owner_window`: desde el hilo que muestra el menú.
 unsafe fn context_menu_inner(paths: &[PathBuf], background: bool) -> Option<()> {
+    // SAFETY: COM iniciado en este hilo (STA); los PIDL no nulos de SHParseDisplayName se liberan
+    // al final; los hijos de ILFindLastID apuntan dentro de esos PIDL, que siguen vivos mientras se
+    // usan; el menú se destruye tras TrackPopupMenuEx.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();

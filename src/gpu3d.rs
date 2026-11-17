@@ -41,6 +41,8 @@ pub struct Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        // SAFETY: objetos creados en `build` con este mismo contexto y borrados sólo aquí. El estado
+        // se suelta en el hilo de la interfaz, donde eframe (glow) tiene el contexto activo.
         unsafe {
             self.gl.delete_program(self.prog);
             self.gl.delete_buffer(self.vbo);
@@ -92,6 +94,8 @@ fn build(gl: &Arc<glow::Context>, m: &Mesh) -> Option<Gpu> {
         // GL 2.x / ES 2: sin derivadas ni VAO, lo dejamos al software
         _ => return None,
     };
+    // SAFETY: se llama desde la callback de pintado (contexto activo); los datos subidos son slices
+    // de Rust con su longitud en bytes.
     unsafe {
         let prog = gl.create_program().ok()?;
         let mut shaders = Vec::new();
@@ -163,6 +167,7 @@ pub fn callback(rect: egui::Rect, mesh: Arc<Mesh>, state: Shared, cam: Cam) -> e
                     None => State::Failed,
                 },
             };
+            #[cfg(feature = "selftest")]
             if std::env::var_os("FB_SHOT").is_some() {
                 eprintln!("[trace] visor 3D: {}", match &*st { State::Pbr(_) => "GPU (PBR)", State::Ready(_) => "GPU", _ => "software (GPU no disponible)" });
             }
@@ -177,6 +182,8 @@ pub fn callback(rect: egui::Rect, mesh: Arc<Mesh>, state: Shared, cam: Cam) -> e
             return;
         }
         let State::Ready(g) = &*st else { return };
+        // SAFETY: dentro de la callback de pintado de egui_glow (contexto activo); programa, búfer y
+        // VAO son de este contexto y el número de vértices dibujados es el que se subió en `build`.
         unsafe {
             gl.clear(glow::DEPTH_BUFFER_BIT);
             gl.enable(glow::DEPTH_TEST);
@@ -357,6 +364,7 @@ pub struct PbrGpu {
 
 impl Drop for PbrGpu {
     fn drop(&mut self) {
+        // SAFETY: como en `Gpu`: objetos propios del contexto, borrados una sola vez en el hilo de la interfaz.
         unsafe {
             for t in self.tex.iter().flatten() {
                 self.gl.delete_texture(*t);
@@ -397,6 +405,9 @@ fn build_pbr(gl: &Arc<glow::Context>, p: &crate::pbr::Pbr) -> Option<PbrGpu> {
     if idx.is_empty() {
         return None;
     }
+    // SAFETY: se llama desde la callback de pintado (contexto activo); los datos que se suben son
+    // slices de Rust con su longitud en bytes, y los índices se comprueban contra los vértices al
+    // construir la malla.
     unsafe {
         let prog = gl.create_program().ok()?;
         let mut shaders = Vec::new();
@@ -405,6 +416,7 @@ fn build_pbr(gl: &Arc<glow::Context>, p: &crate::pbr::Pbr) -> Option<PbrGpu> {
             gl.shader_source(sh, &format!("{head}{src}"));
             gl.compile_shader(sh);
             if !gl.get_shader_compile_status(sh) {
+                #[cfg(feature = "selftest")]
                 if std::env::var_os("FB_SHOT").is_some() {
                     eprintln!("[trace] shader PBR: {}", gl.get_shader_info_log(sh));
                 }
@@ -495,6 +507,8 @@ impl PbrGpu {
         let Some(p) = mesh.pbr.as_deref() else { return };
         let gl = &*self.gl;
         let (w, h) = size;
+        // SAFETY: dentro de la callback de pintado (contexto activo); los rangos dibujados son los
+        // que se subieron en `build_pbr`.
         unsafe {
             gl.clear(glow::DEPTH_BUFFER_BIT);
             gl.enable(glow::DEPTH_TEST);
